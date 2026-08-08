@@ -1,0 +1,43 @@
+# ── Node.js ──────────────────────────────
+node_modules/
+*.log
+npm-debug.log*
+
+# ── Flutter / Dart ───────────────────────
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.flutter-plugins-dependencies.macos
+.flutter-plugins-dependencies.linux
+.flutter-plugins-dependencies.windows
+.idea/
+*.iml
+*.iws
+*.ipr
+p2p_desktop/linux/flutter/ephemeral/
+p2p_desktop/macos/Flutter/ephemeral/
+p2p_desktop/windows/flutter/ephemeral/
+p2p_desktop/windows/flutter/generated_plugin_registrant.cc
+p2p_desktop/windows/flutter/generated_plugin_registrant.h
+p2p_desktop/windows/flutter/generated_plugins.cmake
+p2p_desktop/ios/Flutter/ephemeral/
+p2p_android/.gradle/
+p2p_android/local.properties
+p2p_android/android/.gradle/
+p2p_android/android/local.properties
+*.keystore
+*.jks
+p2p_android/android/app/*.jks
+
+# ── 运行数据（含用户信息，切勿提交） ────
+p2p-app/users.json
+p2p-app/tokens.json
+p2p-app/.pair-code
+
+# ── Office 临时文件 ──────────────────────
+~$*
+
+# ── 系统文件 ─────────────────────────────
+Thumbs.db
+.DS_Store

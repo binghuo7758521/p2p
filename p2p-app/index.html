@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>P2P 文件存取</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+    .container { max-width: 500px; margin: 0 auto; padding: 16px; }
+    h1 { text-align: center; color: #38bdf8; margin-bottom: 20px; font-size: 1.3em; }
+    .card { background: #1e293b; border-radius: 12px; padding: 16px; margin: 12px 0; border: 1px solid #334155; }
+    .card-title { font-weight: bold; color: #7dd3fc; margin-bottom: 10px; font-size: 0.9em; }
+    .mode-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .mode-btn { padding: 20px; border-radius: 10px; border: 2px solid #334155; background: #0f172a; color: #e2e8f0; cursor: pointer; text-align: center; transition: all 0.2s; }
+    .mode-btn:hover, .mode-btn.active { border-color: #38bdf8; background: #1e3a5f; }
+    .mode-btn .icon { font-size: 2em; margin-bottom: 6px; }
+    .mode-btn .label { font-weight: bold; font-size: 0.95em; }
+    .mode-btn .desc { font-size: 0.75em; color: #94a3b8; margin-top: 4px; }
+    label { display: block; margin: 8px 0 4px; color: #94a3b8; font-size: 0.85em; }
+    input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: 1em; }
+    button { padding: 10px 20px; border-radius: 8px; border: none; font-weight: bold; cursor: pointer; font-size: 0.9em; transition: all 0.2s; }
+    .btn-primary { background: #2563eb; color: white; width: 100%; }
+    .btn-primary:hover { background: #3b82f6; }
+    .btn-primary:disabled { background: #475569; cursor: not-allowed; }
+    .btn-sm { padding: 6px 14px; font-size: 0.8em; }
+    .btn-green { background: #16a34a; color: white; }
+    .btn-red { background: #dc2626; color: white; }
+    .pair-code { font-size: 2.5em; font-weight: bold; color: #fbbf24; text-align: center; letter-spacing: 8px; padding: 16px; background: #0f172a; border-radius: 8px; margin: 12px 0; font-family: monospace; }
+    .status { text-align: center; padding: 10px; border-radius: 8px; margin: 10px 0; font-weight: bold; font-size: 0.9em; }
+    .status-wait { background: #78350f; color: #fde68a; }
+    .status-ok { background: #166534; color: #bbf7d0; }
+    .status-err { background: #7f1d1d; color: #fecaca; }
+    .status-info { background: #1e3a5f; color: #93c5fd; }
+    .file-list { list-style: none; max-height: 400px; overflow-y: auto; }
+    .file-item { display: flex; align-items: center; padding: 10px; border-bottom: 1px solid #334155; gap: 10px; }
+    .file-item:hover { background: #0f172a; }
+    .file-icon { font-size: 1.5em; flex-shrink: 0; }
+    .file-info { flex: 1; min-width: 0; }
+    .file-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .file-size { font-size: 0.8em; color: #94a3b8; }
+    .file-actions { flex-shrink: 0; }
+    .progress-bar { height: 8px; background: #334155; border-radius: 4px; overflow: hidden; margin: 6px 0; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #2563eb, #38bdf8); transition: width 0.2s; border-radius: 4px; }
+    .transfer-item { padding: 10px; margin: 8px 0; background: #0f172a; border-radius: 8px; border: 1px solid #334155; }
+    .transfer-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+    .transfer-name { font-weight: 500; font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%; }
+    .transfer-status { font-size: 0.8em; }
+    .transfer-detail { font-size: 0.8em; color: #94a3b8; display: flex; justify-content: space-between; }
+    .empty-state { text-align: center; padding: 30px; color: #64748b; }
+    .hidden { display: none !important; }
+    .dir-picker { display: flex; gap: 8px; align-items: center; }
+    .dir-picker button { flex-shrink: 0; }
+    .dir-path { flex: 1; padding: 8px 12px; background: #0f172a; border-radius: 6px; font-size: 0.85em; color: #94a3b8; border: 1px solid #334155; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .breadcrumb { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; font-size: 0.85em; }
+    .breadcrumb span { color: #64748b; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
+    .breadcrumb span:hover { background: #334155; color: #e2e8f0; }
+    .breadcrumb span.current { color: #38bdf8; cursor: default; }
+    .upload-zone { border: 2px dashed #475569; border-radius: 10px; padding: 24px; text-align: center; cursor: pointer; transition: all 0.2s; margin: 10px 0; }
+    .upload-zone:hover { border-color: #38bdf8; background: #1e3a5f; }
+    .upload-zone input { display: none; }
+    .tab-bar { display: flex; gap: 0; margin-bottom: 12px; }
+    .tab { flex: 1; padding: 10px; text-align: center; background: #0f172a; border: 1px solid #334155; cursor: pointer; font-size: 0.85em; font-weight: 500; transition: all 0.2s; }
+    .tab:first-child { border-radius: 8px 0 0 8px; }
+    .tab:last-child { border-radius: 0 8px 8px 0; }
+    .tab.active { background: #1e3a5f; border-color: #38bdf8; color: #38bdf8; }
+    .download-card { background: #166534; border-radius: 10px; padding: 16px; text-align: center; margin: 12px 0; }
+    .download-card a { display: inline-block; padding: 10px 28px; background: #22c55e; color: white; border-radius: 8px; text-decoration: none; font-weight: bold; margin-top: 8px; }
+  </style>
+</head>
+<body>
+<div class="container" id="app">
+  <h1>P2P 文件存取</h1>
+
+  <!-- ═══ 模式选择 ═══ -->
+  <div class="card" v-if="!mode">
+    <div class="card-title">选择你的设备</div>
+    <div class="mode-btns">
+      <div class="mode-btn" @click="selectMode('host')">
+        <div class="icon">💻</div>
+        <div class="label">电脑端</div>
+        <div class="desc">提供文件给手机存取</div>
+      </div>
+      <div class="mode-btn" @click="selectMode('client')">
+        <div class="icon">📱</div>
+        <div class="label">手机端</div>
+        <div class="desc">存取电脑上的文件</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 电脑端: 等待连接 ═══ -->
+  <div class="card" v-if="mode==='host' && !peerConnected">
+    <div class="card-title">配对码</div>
+    <div class="pair-code">{{ pairCode || '---' }}</div>
+    <div :class="['status', clientConnected ? 'status-ok' : 'status-wait']">
+      {{ clientConnected ? '✅ ' + clientInfo.name + ' 已连接，正在建立P2P...' : '等待手机连接...' }}
+    </div>
+  </div>
+
+  <!-- ═══ 手机端: 输入配对码 ═══ -->
+  <div class="card" v-if="mode==='client' && !peerConnected">
+    <div class="card-title">输入配对码</div>
+    <label>配对码</label>
+    <input type="text" v-model="inputCode" maxlength="10" placeholder="10位数字/字母"
+      style="text-align:center;font-size:1.5em;letter-spacing:6px" @keyup.enter="joinRoom">
+    <button class="btn-primary" style="margin-top:12px" @click="joinRoom" :disabled="inputCode.length!==10">连接</button>
+    <div class="status status-err" v-if="joinError" style="margin-top:10px">{{ joinError }}</div>
+    <div class="status status-info" v-if="connecting" style="margin-top:10px">正在连接...</div>
+  </div>
+
+  <!-- ═══ 电脑端: 主界面 ═══ -->
+  <template v-if="mode==='host' && peerConnected">
+    <div class="status status-ok">🔗 已连接 {{ clientInfo?.name }}</div>
+
+    <!-- 共享目录 -->
+    <div class="card">
+      <div class="card-title">共享目录</div>
+      <div class="dir-picker">
+        <div class="dir-path">{{ dirHandle ? dirHandle.name : '未选择' }}</div>
+        <button class="btn-primary btn-sm" @click="pickDirectory" style="width:auto">选择目录</button>
+      </div>
+    </div>
+
+    <!-- 文件列表 -->
+    <div class="card" v-if="dirHandle">
+      <div class="card-title">文件列表</div>
+      <div class="breadcrumb">
+        <span @click="navigateTo([])">📁 根目录</span>
+        <template v-for="(seg, i) in currentPath" :key="i">
+          <span style="color:#475569">/</span>
+          <span :class="{current: i===currentPath.length-1}" @click="navigateTo(currentPath.slice(0, i+1))">{{ seg }}</span>
+        </template>
+      </div>
+      <div v-if="files.length===0" class="empty-state">此目录为空</div>
+      <ul class="file-list">
+        <li class="file-item" v-for="f in files" :key="f.name">
+          <span class="file-icon">{{ f.kind === 'directory' ? '📁' : '📄' }}</span>
+          <div class="file-info">
+            <div class="file-name">{{ f.name }}</div>
+            <div class="file-size" v-if="f.kind==='file'">{{ formatSize(f.size) }}</div>
+          </div>
+          <div class="file-actions">
+            <button class="btn-primary btn-sm" v-if="f.kind==='directory'" @click="openDir(f)">打开</button>
+          </div>
+        </li>
+      </ul>
+    </div>
+
+    <!-- 传输列表 -->
+    <div class="card">
+      <div class="card-title">传输记录</div>
+      <div v-if="transfers.length===0" class="empty-state" style="padding:16px">暂无传输</div>
+      <div class="transfer-item" v-for="t in transfers" :key="t.id">
+        <div class="transfer-header">
+          <span class="transfer-name">{{ t.direction === 'upload' ? '⬆️' : '⬇️' }} {{ t.fileName }}</span>
+          <span class="transfer-status" :style="{color: t.status==='done'?'#4ade80':t.status==='error'?'#f87171':'#fbbf24'}">
+            {{ t.status === 'done' ? '✅ 完成' : t.status === 'error' ? '❌ 失败' : '⏳ ' + t.progress + '%' }}
+          </span>
+        </div>
+        <div class="progress-bar" v-if="t.status==='transferring'">
+          <div class="progress-fill" :style="{width: t.progress + '%'}"></div>
+        </div>
+        <div class="transfer-detail">
+          <span>{{ formatSize(t.transferred) }} / {{ formatSize(t.total) }}</span>
+          <span v-if="t.speed">{{ t.speed }} MB/s</span>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ═══ 手机端: 主界面 ═══ -->
+  <template v-if="mode==='client' && peerConnected">
+    <div class="status status-ok">🔗 已连接 {{ hostInfo?.name }}</div>
+
+    <div class="tab-bar">
+      <div :class="['tab', clientTab==='browse'?'active':'']" @click="browseTab()">📂 浏览文件</div>
+      <div :class="['tab', clientTab==='upload'?'active':'']" @click="clientTab='upload'">⬆️ 上传文件</div>
+    </div>
+
+    <!-- 浏览文件 -->
+    <div class="card" v-if="clientTab==='browse'">
+      <div class="breadcrumb">
+        <span @click="requestFileList([])">📁 根目录</span>
+        <template v-for="(seg, i) in clientPath" :key="i">
+          <span style="color:#475569">/</span>
+          <span :class="{current: i===clientPath.length-1}" @click="requestFileList(clientPath.slice(0, i+1))">{{ seg }}</span>
+        </template>
+      </div>
+      <div v-if="remoteFiles.length===0" class="empty-state">
+        {{ !dirReady ? '加载中...' : (listError || '此目录为空') }}
+      </div>
+      <ul class="file-list">
+        <li class="file-item" v-for="f in remoteFiles" :key="f.name">
+          <span class="file-icon">{{ f.type === 'directory' ? '📁' : '📄' }}</span>
+          <div class="file-info">
+            <div class="file-name">{{ f.name }}</div>
+            <div class="file-size" v-if="f.type!=='directory'">{{ formatSize(f.size) }}</div>
+          </div>
+          <div class="file-actions">
+            <button class="btn-primary btn-sm" v-if="f.type==='directory'" @click="requestFileList([...clientPath, f.name])">打开</button>
+            <button class="btn-green btn-sm" v-else @click="downloadFile(f)">下载</button>
+          </div>
+        </li>
+      </ul>
+      <!-- 下载完成 -->
+      <div class="download-card" v-if="downloadBlob">
+        <div>✅ {{ downloadName }} ({{ formatSize(downloadBlob.size) }})</div>
+        <a :href="downloadUrl" :download="downloadName">💾 保存到手机</a>
+      </div>
+    </div>
+
+    <!-- 上传文件 -->
+    <div class="card" v-if="clientTab==='upload'">
+      <div class="upload-zone" @click="$refs.fileInput.click()">
+        <input type="file" ref="fileInput" @change="onFileSelected" multiple style="display:none">
+        <div style="font-size:2em;margin-bottom:8px">📎</div>
+        <div>点击选择要上传的文件</div>
+      </div>
+      <div v-if="uploadFiles.length > 0">
+        <div class="transfer-item" v-for="(f, i) in uploadFiles" :key="i">
+          <div class="transfer-header">
+            <span class="transfer-name">📄 {{ f.name }}</span>
+            <span class="file-size">{{ formatSize(f.size) }}</span>
+          </div>
+        </div>
+        <button class="btn-green" style="width:100%;margin-top:10px" @click="startUpload" :disabled="uploading">
+          {{ uploading ? '上传中...' : '开始上传' }}
+        </button>
+      </div>
+    </div>
+
+    <!-- 传输列表 -->
+    <div class="card">
+      <div class="card-title">传输记录</div>
+      <div v-if="transfers.length===0" class="empty-state" style="padding:16px">暂无传输</div>
+      <div class="transfer-item" v-for="t in transfers" :key="t.id">
+        <div class="transfer-header">
+          <span class="transfer-name">{{ t.direction === 'upload' ? '⬆️' : '⬇️' }} {{ t.fileName }}</span>
+          <span class="transfer-status" :style="{color: t.status==='done'?'#4ade80':t.status==='error'?'#f87171':'#fbbf24'}">
+            {{ t.status === 'done' ? '✅' : t.status === 'error' ? '❌' : t.progress + '%' }}
+          </span>
+        </div>
+        <div class="progress-bar" v-if="t.status==='transferring'">
+          <div class="progress-fill" :style="{width: t.progress + '%'}"></div>
+        </div>
+        <div class="transfer-detail">
+          <span>{{ formatSize(t.transferred) }} / {{ formatSize(t.total) }}</span>
+          <span v-if="t.speed">{{ t.speed }} MB/s</span>
+        </div>
+      </div>
+    </div>
+  </template>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://unpkg.com/simple-peer@9/simplepeer.min.js"></script>
+<script>
+const { createApp, reactive, ref, computed } = Vue;
+
+createApp({
+  setup() {
+    // ── 状态 ─────────────────────────────────────────────
+    const mode = ref(null);
+    const pairCode = ref('');
+    const inputCode = ref('');
+    const peerConnected = ref(false);
+    const clientConnected = ref(false);
+    const clientInfo = ref(null);
+    const hostInfo = ref(null);
+    const joinError = ref('');
+    const connecting = ref(false);
+
+    // 电脑端
+    const dirHandle = ref(null);
+    const currentPath = ref([]);
+    const files = ref([]);
+
+    // 手机端
+    const clientTab = ref('browse');
+    const clientPath = ref([]);
+    const remoteFiles = ref([]);
+    const dirReady = ref(false);
+    const listError = ref('');
+    const downloadBlob = ref(null);
+    const downloadName = ref('');
+    const downloadUrl = ref('#');
+    const uploadFiles = ref([]);
+    const uploading = ref(false);
+
+    // 传输
+    const transfers = ref([]);
+
+    let socket = null;
+    let peer = null;
+
+    // 接收状态
+    let recvState = { fileMeta: null, chunks: [], bytes: 0, startTime: 0 };
+
+    const ICE = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
+    };
+
+    // ── 工具 ─────────────────────────────────────────────
+    function formatSize(bytes) {
+      if (!bytes && bytes !== 0) return '?';
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+      if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
+      return (bytes / 1073741824).toFixed(2) + ' GB';
+    }
+
+    function genId() { return Math.random().toString(36).slice(2, 8); }
+
+    function addTransfer(fileName, direction, total) {
+      const t = { id: genId(), fileName, direction, total, transferred: 0, progress: 0, speed: '', status: 'transferring' };
+      transfers.value.unshift(t);
+      return t;
+    }
+
+    // ── 解析收到的数据 ───────────────────────────────────
+    // simple-peer 内部是 readable-stream，字符串消息到达时会变成 Buffer(Uint8Array)
+    // 因此控制消息需从 Buffer 中尝试解析，并通过 type 白名单与文件块区分
+    const KNOWN_MSG_TYPES = ['file-list-result', 'file-meta', 'file-complete', 'file-ack', 'file:list', 'file:download', 'file:upload'];
+    function parseMessage(data) {
+      if (typeof data === 'string') {
+        try { return { type: 'json', data: JSON.parse(data) }; } catch { return { type: 'binary', data }; }
+      }
+      if (data instanceof Uint8Array && data.byteLength > 0) {
+        // 控制消息 JSON 均以 { 开头，先预筛再解析，避免对文件块频繁 JSON.parse
+        const first = data[0];
+        if (first === 123 /* { */ || first === 91 /* [ */) {
+          try {
+            const json = JSON.parse(new TextDecoder().decode(data));
+            if (json && typeof json === 'object' && KNOWN_MSG_TYPES.includes(json.type)) {
+              return { type: 'json', data: json };
+            }
+          } catch { /* 非 JSON，视为文件数据 */ }
+        }
+      }
+      return { type: 'binary', data };
+    }
+
+    // ── 发送 JSON ────────────────────────────────────────
+    function sendJSON(obj) { peer.send(JSON.stringify(obj)); }
+
+    // ── 模式选择 ─────────────────────────────────────────
+    function selectMode(m) {
+      mode.value = m;
+      socket = io(location.origin);
+      socket.on('connect', () => {
+        if (m === 'host') {
+          socket.emit('host:register', { deviceName: '电脑-' + navigator.platform.slice(0, 3) });
+        }
+      });
+      socket.on('host:registered', ({ pairCode: code }) => { pairCode.value = code; });
+      socket.on('host:client-joined', ({ clientInfo: info }) => {
+        clientInfo.value = info;
+        clientConnected.value = true;
+        startPeer(true);
+      });
+      socket.on('client:joined', ({ hostInfo: info }) => {
+        hostInfo.value = info;
+        startPeer(false);
+      });
+      socket.on('connect_error', (err) => { joinError.value = '无法连接服务器: ' + err.message; connecting.value = false; });
+      socket.on('client:error', ({ reason }) => { joinError.value = reason; connecting.value = false; });
+      socket.on('peer:disconnected', () => { alert('对端已断开'); location.reload(); });
+      // 信令转发
+      socket.on('signal:server→host', ({ signal }) => { peer?.signal(signal); });
+      socket.on('signal:server→client', ({ signal }) => { peer?.signal(signal); });
+    }
+
+    // ── 手机端加入 ───────────────────────────────────────
+    function joinRoom() {
+      if (inputCode.value.length !== 10) return;
+      connecting.value = true;
+      joinError.value = '';
+      socket.emit('client:join', { pairCode: inputCode.value.toUpperCase(), deviceName: '手机' });
+    }
+
+    // ── P2P 连接 ─────────────────────────────────────────
+    function startPeer(isInitiator) {
+      connecting.value = true;
+      peer = new SimplePeer({ initiator: isInitiator, trickle: true, config: ICE });
+
+      peer.on('signal', (data) => {
+        if (mode.value === 'host') socket.emit('signal:host→client', { signal: data });
+        else socket.emit('signal:client→host', { signal: data });
+      });
+
+      peer.on('connect', () => {
+        if (peer._channel) peer._channel.binaryType = 'arraybuffer';
+        peerConnected.value = true;
+        connecting.value = false;
+        setupReceiver();
+        // 手机端自动请求文件列表
+        if (mode.value === 'client') requestFileList([]);
+      });
+
+      peer.on('error', (err) => {
+        console.error('P2P error:', err);
+        connecting.value = false;
+        peerConnected.value = false;
+        try { peer.destroy(); } catch {}
+        alert('P2P连接失败: ' + err.message);
+      });
+    }
+
+    function handleControlMsg(msg) {
+      switch (msg.type) {
+        case 'file-list-result':
+          remoteFiles.value = msg.files || [];
+          listError.value = msg.error || '';
+          dirReady.value = true;
+          break;
+        case 'file-meta':
+          recvState = { fileMeta: msg, chunks: [], bytes: 0, startTime: performance.now() };
+          addTransfer(msg.fileName, 'download', msg.fileSize);
+          break;
+        case 'file-complete':
+          finalizeReceive();
+          break;
+        case 'file-ack': {
+          // 发送端收到接收端确认，按文件名匹配（超时置 error 后也允许被 ack 纠正）
+          const ackT = transfers.value.find(x => x.fileName === msg.fileName && x.status !== 'done');
+          if (ackT) {
+            ackT.status = msg.success ? 'done' : 'error';
+            ackT.progress = 100;
+          }
+          break;
+        }
+      }
+    }
+
+    function handleBinaryChunk(data) {
+      if (!recvState.fileMeta) return;
+      recvState.chunks.push(data instanceof Blob ? data : new Blob([data]));
+      recvState.bytes += data.byteLength || data.size || 0;
+      // 更新进度
+      const t = transfers.value.find(x => x.status === 'transferring');
+      if (t) {
+        t.transferred = recvState.bytes;
+        t.progress = Math.round(recvState.bytes / recvState.fileMeta.fileSize * 100);
+        const elapsed = (performance.now() - recvState.startTime) / 1000;
+        t.speed = (recvState.bytes / 1048576 / elapsed).toFixed(2);
+      }
+    }
+
+    async function finalizeReceive() {
+      const meta = recvState.fileMeta;
+      if (!meta) return;
+      const blob = new Blob(recvState.chunks);
+      const t = transfers.value.find(x => x.fileName === meta.fileName && x.status === 'transferring');
+
+      let saved = true;
+      if (mode.value === 'client') {
+        // 手机端: 显示下载
+        downloadBlob.value = blob;
+        downloadName.value = meta.fileName;
+        downloadUrl.value = URL.createObjectURL(blob);
+      } else {
+        // 电脑端: 保存到共享目录（等待保存结果后再回 ACK）
+        saved = await saveToDir(meta.fileName, blob, meta.subPath || '');
+      }
+
+      const success = saved && blob.size === meta.fileSize;
+      if (t) { t.status = success ? 'done' : 'error'; t.progress = 100; }
+
+      // 发送 ACK（带文件名和真实结果）
+      sendJSON({ type: 'file-ack', fileName: meta.fileName, success });
+      recvState = { fileMeta: null, chunks: [], bytes: 0, startTime: 0 };
+    }
+
+    // ── 电脑端: 目录操作 ─────────────────────────────────
+    async function pickDirectory() {
+      try {
+        // 必须申请读写权限，否则保存上传文件时会因缺少写权限而失败
+        const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+        // 在用户手势内显式确认写权限，避免后续保存时被拦截
+        let perms = 'granted';
+        try {
+          perms = await handle.queryPermission({ mode: 'readwrite' });
+          if (perms !== 'granted') perms = await handle.requestPermission({ mode: 'readwrite' });
+        } catch (e) { console.log('权限查询失败:', e); }
+        if (perms !== 'granted') {
+          alert('未获得目录写入权限，上传的文件将无法保存。\n请重新选择目录，并在授权时选择"允许"。');
+          return;
+        }
+        dirHandle.value = handle;
+        currentPath.value = [];
+        await loadFiles();
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          console.log('用户取消选择');
+        } else {
+          console.error('选择目录失败:', e);
+          alert('选择目录失败: ' + e.message + '\n提示: 需使用 Chrome/Edge 浏览器，且通过 https 或 localhost 访问页面');
+        }
+      }
+    }
+
+    async function loadFiles() {
+      let handle = dirHandle.value;
+      for (const seg of currentPath.value) {
+        handle = await handle.getDirectoryHandle(seg);
+      }
+      const list = [];
+      for await (const entry of handle.values()) {
+        if (entry.kind === 'directory') {
+          list.push({ name: entry.name, kind: 'directory' });
+        } else {
+          const file = await entry.getFile();
+          list.push({ name: entry.name, kind: 'file', size: file.size });
+        }
+      }
+      files.value = list.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'directory' ? -1 : 1));
+    }
+
+    function openDir(f) { currentPath.value.push(f.name); loadFiles(); }
+    function navigateTo(path) { currentPath.value = path; loadFiles(); }
+
+    async function saveToDir(fileName, blob, subPath) {
+      try {
+        let handle = dirHandle.value;
+        if (subPath) {
+          for (const seg of subPath.split('/')) {
+            handle = await handle.getDirectoryHandle(seg, { create: true });
+          }
+        }
+        const fileHandle = await handle.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        await loadFiles(); // 刷新列表
+        return true;
+      } catch (e) {
+        console.error('保存失败:', e);
+        alert('文件保存失败: ' + (e.message || e));
+        return false;
+      }
+    }
+
+    // ── 手机端: 文件浏览 ─────────────────────────────────
+    function browseTab() {
+      clientTab.value = 'browse';
+      requestFileList(clientPath.value); // 切到浏览页时自动刷新列表
+    }
+
+    function requestFileList(path) {
+      clientPath.value = path;
+      dirReady.value = false;
+      listError.value = '';
+      remoteFiles.value = [];
+      sendJSON({ type: 'file:list', path: path.join('/') });
+    }
+
+    function downloadFile(f) {
+      const path = [...clientPath.value, f.name].join('/');
+      sendJSON({ type: 'file:download', fileName: f.name, path, fileSize: f.size });
+    }
+
+    // ── 手机端: 上传 ─────────────────────────────────────
+    function onFileSelected(e) {
+      uploadFiles.value = [...e.target.files];
+      e.target.value = ''; // 允许重复选择同一文件
+    }
+
+    async function startUpload() {
+      if (uploadFiles.value.length === 0) return;
+      uploading.value = true;
+      const CHUNK = 65536;
+
+      for (const file of uploadFiles.value) {
+        const totalChunks = Math.ceil(file.size / CHUNK);
+        const t = addTransfer(file.name, 'upload', file.size);
+        const startTime = performance.now();
+
+        sendJSON({ type: 'file:upload', fileName: file.name, fileSize: file.size, totalChunks });
+
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * CHUNK;
+          const end = Math.min(start + CHUNK, file.size);
+          const chunk = file.slice(start, end);
+          const buf = await chunk.arrayBuffer();
+
+          while (peer._channel && peer._channel.bufferedAmount > 8388608) await new Promise(r => setTimeout(r, 5));
+          peer.send(buf);
+
+          t.transferred = end;
+          t.progress = Math.round(end / file.size * 100);
+          const elapsed = (performance.now() - startTime) / 1000;
+          t.speed = (end / 1048576 / elapsed).toFixed(2);
+        }
+
+        sendJSON({ type: 'file-complete', fileName: file.name, fileSize: file.size });
+
+        // 等待接收端确认（最多10秒）
+        await new Promise((resolve) => {
+          const timeout = setTimeout(() => {
+            t.status = 'error';
+            resolve();
+          }, 10000);
+          const checkAck = () => {
+            if (t.status === 'done' || t.status === 'error') {
+              clearTimeout(timeout);
+              resolve();
+            } else {
+              setTimeout(checkAck, 100);
+            }
+          };
+          setTimeout(checkAck, 100);
+        });
+      }
+
+      uploading.value = false;
+      uploadFiles.value = [];
+    }
+
+    // ── 电脑端: 处理手机请求 ─────────────────────────────
+    // 重写 handleControlMsg 以处理电脑端逻辑
+    function handleControlMsgHost(msg) {
+      if (msg.type === 'file:list') {
+        handleFileList(msg.path);
+      } else if (msg.type === 'file:download') {
+        handleFileDownload(msg);
+      } else if (msg.type === 'file:upload') {
+        // 电脑端尚未选择共享目录时直接拒绝，避免文件静默丢失
+        if (!dirHandle.value) {
+          sendJSON({ type: 'file-ack', fileName: msg.fileName, success: false });
+          return;
+        }
+        recvState.fileMeta = { fileName: msg.fileName, fileSize: msg.fileSize, subPath: msg.subPath || '' };
+        recvState.chunks = [];
+        recvState.bytes = 0;
+        recvState.startTime = performance.now();
+        addTransfer(msg.fileName, 'upload', msg.fileSize);
+      }
+    }
+
+    async function handleFileList(pathStr) {
+      try {
+        let handle = dirHandle.value;
+        if (!handle) {
+          sendJSON({ type: 'file-list-result', files: [], error: '电脑端尚未选择共享目录' });
+          return;
+        }
+        const parts = pathStr ? pathStr.split('/') : [];
+        for (const seg of parts) {
+          if (seg) handle = await handle.getDirectoryHandle(seg);
+        }
+        const list = [];
+        for await (const entry of handle.values()) {
+          if (entry.kind === 'directory') {
+            list.push({ name: entry.name, type: 'directory' });
+          } else {
+            const file = await entry.getFile();
+            list.push({ name: entry.name, type: 'file', size: file.size });
+          }
+        }
+        list.sort((a, b) => a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'directory' ? -1 : 1);
+        sendJSON({ type: 'file-list-result', files: list });
+      } catch (e) {
+        sendJSON({ type: 'file-list-result', files: [], error: '读取目录失败: ' + (e.message || e) });
+      }
+    }
+
+    async function handleFileDownload(msg) {
+      try {
+        let handle = dirHandle.value;
+        const parts = msg.path.split('/');
+        const fileName = parts.pop();
+        for (const seg of parts) {
+          if (seg) handle = await handle.getDirectoryHandle(seg);
+        }
+        const fileHandle = await handle.getFileHandle(fileName);
+        const file = await fileHandle.getFile();
+        const CHUNK = 65536;
+        const totalChunks = Math.ceil(file.size / CHUNK);
+
+        addTransfer(msg.fileName, 'download', file.size);
+        sendJSON({ type: 'file-meta', fileName: msg.fileName, fileSize: file.size, totalChunks });
+
+        const startTime = performance.now();
+        const t = transfers.value.find(x => x.fileName === msg.fileName && x.status === 'transferring');
+
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * CHUNK;
+          const end = Math.min(start + CHUNK, file.size);
+          const chunk = file.slice(start, end);
+          const buf = await chunk.arrayBuffer();
+
+          while (peer._channel && peer._channel.bufferedAmount > 8388608) await new Promise(r => setTimeout(r, 5));
+          peer.send(buf);
+
+          if (t) {
+            t.transferred = end;
+            t.progress = Math.round(end / file.size * 100);
+            const elapsed = (performance.now() - startTime) / 1000;
+            t.speed = (end / 1048576 / elapsed).toFixed(2);
+          }
+        }
+
+        sendJSON({ type: 'file-complete', fileName: msg.fileName, fileSize: file.size });
+        if (t) { t.status = 'done'; t.progress = 100; }
+      } catch (e) {
+        console.error('发送文件失败:', e);
+      }
+    }
+
+    // 覆盖 handleControlMsg
+    const _origHandleControlMsg = handleControlMsg;
+    function combinedHandleControlMsg(msg) {
+      // 先尝试电脑端特有处理
+      if (mode.value === 'host') {
+        if (msg.type === 'file:list' || msg.type === 'file:download') {
+          handleControlMsgHost(msg);
+          return;
+        }
+        if (msg.type === 'file:upload') {
+          handleControlMsgHost(msg);
+          return;
+        }
+      }
+      _origHandleControlMsg(msg);
+    }
+
+    // 替换 setupReceiver 中的处理
+    function setupReceiver() {
+      peer.on('data', (raw) => {
+        const parsed = parseMessage(raw);
+        if (parsed.type === 'json') combinedHandleControlMsg(parsed.data);
+        else handleBinaryChunk(parsed.data);
+      });
+    }
+
+    return {
+      mode, pairCode, inputCode, peerConnected, clientConnected, clientInfo, hostInfo,
+      joinError, connecting, dirHandle, currentPath, files, clientTab, clientPath,
+      remoteFiles, dirReady, listError, downloadBlob, downloadName, downloadUrl, uploadFiles,
+      uploading, transfers, formatSize,
+      selectMode, joinRoom, pickDirectory, openDir, navigateTo,
+      browseTab, requestFileList, downloadFile, onFileSelected, startUpload
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

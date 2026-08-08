@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>P2P 管理后台</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+    .container { max-width: 900px; margin: 0 auto; padding: 16px; }
+    h1 { text-align: center; color: #38bdf8; margin-bottom: 20px; font-size: 1.3em; }
+    .card { background: #1e293b; border-radius: 12px; padding: 16px; margin: 12px 0; border: 1px solid #334155; }
+    .card-title { font-weight: bold; color: #7dd3fc; margin-bottom: 12px; font-size: 0.95em; }
+    label { display: block; margin: 8px 0 4px; color: #94a3b8; font-size: 0.85em; }
+    input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: 1em; }
+    button { padding: 10px 20px; border-radius: 8px; border: none; font-weight: bold; cursor: pointer; font-size: 0.9em; transition: all 0.2s; }
+    .btn-primary { background: #2563eb; color: white; width: 100%; }
+    .btn-primary:hover { background: #3b82f6; }
+    .btn-primary:disabled { background: #475569; cursor: not-allowed; }
+    .btn-sm { padding: 6px 14px; font-size: 0.8em; }
+    .btn-green { background: #16a34a; color: white; }
+    .btn-red { background: #dc2626; color: white; }
+    .btn-ghost { background: #334155; color: #e2e8f0; }
+    .btn-ghost:hover { background: #475569; }
+    .status { text-align: center; padding: 10px; border-radius: 8px; margin: 10px 0; font-weight: bold; font-size: 0.9em; }
+    .status-err { background: #7f1d1d; color: #fecaca; }
+    .status-info { background: #1e3a5f; color: #93c5fd; }
+    .hidden { display: none !important; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+    .stat-item { background: #0f172a; border-radius: 10px; padding: 14px; text-align: center; border: 1px solid #334155; }
+    .stat-value { font-size: 1.5em; font-weight: bold; color: #38bdf8; }
+    .stat-label { font-size: 0.78em; color: #94a3b8; margin-top: 4px; }
+    .stat-value.ok { color: #4ade80; }
+    .stat-value.warn { color: #fbbf24; }
+    .toolbar { display: flex; gap: 8px; margin-bottom: 12px; }
+    .toolbar input { flex: 1; }
+    .toolbar button { width: auto; flex-shrink: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+    th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid #334155; }
+    th { color: #94a3b8; font-weight: 600; white-space: nowrap; }
+    td { white-space: nowrap; }
+    td.phone { font-family: monospace; color: #7dd3fc; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 0.75em; font-weight: bold; }
+    .badge-active { background: #166534; color: #bbf7d0; }
+    .badge-disabled { background: #7f1d1d; color: #fecaca; }
+    .empty-state { text-align: center; padding: 24px; color: #64748b; }
+    .header-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .header-bar .brand { font-weight: bold; color: #38bdf8; }
+    .refresh-note { font-size: 0.75em; color: #64748b; text-align: center; margin-top: 16px; }
+    .logout { background: #334155; color: #e2e8f0; padding: 6px 14px; font-size: 0.8em; }
+    .logout:hover { background: #dc2626; }
+    .actions { display: flex; gap: 6px; }
+  </style>
+</head>
+<body>
+<div class="container" id="app">
+
+  <!-- ═══ 登录页 ═══ -->
+  <div id="loginView" class="card" style="max-width:400px;margin:60px auto;">
+    <div style="text-align:center;font-size:2em;margin-bottom:10px">🛠️</div>
+    <h1 style="margin-bottom:6px">P2P 管理后台</h1>
+    <div class="status status-info" style="margin-bottom:14px">仅管理员可访问</div>
+    <label>用户名</label>
+    <input type="text" id="loginUser" value="admin" autocomplete="username">
+    <label>密码</label>
+    <input type="password" id="loginPass" autocomplete="current-password" style="margin-bottom:12px">
+    <div id="loginError" class="status status-err hidden"></div>
+    <button class="btn-primary" id="loginBtn">登 录</button>
+  </div>
+
+  <!-- ═══ 主界面 ═══ -->
+  <div id="mainView" class="hidden">
+    <div class="header-bar">
+      <span class="brand">🛠️ P2P 管理后台</span>
+      <button class="logout" id="logoutBtn">退出登录</button>
+    </div>
+
+    <!-- 系统运行状态 -->
+    <div class="card">
+      <div class="card-title">📊 系统运行状态</div>
+      <div class="stats-grid">
+        <div class="stat-item">
+          <div class="stat-value ok" id="stStatus">-</div>
+          <div class="stat-label">服务状态</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="stSessions">-</div>
+          <div class="stat-label">当前配对</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="stUsers">-</div>
+          <div class="stat-label">注册用户</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value warn" id="stActive">-</div>
+          <div class="stat-label">活跃用户</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="stUptime">-</div>
+          <div class="stat-label">运行时长</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="stMemory">-</div>
+          <div class="stat-label">内存占用</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="stNode">-</div>
+          <div class="stat-label">Node 版本</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="stTime">-</div>
+          <div class="stat-label">服务器时间</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 用户管理 -->
+    <div class="card">
+      <div class="card-title">👥 注册用户管理</div>
+      <div class="toolbar">
+        <input type="text" id="searchInput" placeholder="按手机号搜索...">
+        <button class="btn-primary" id="searchBtn" style="width:auto">搜索</button>
+        <button class="btn-ghost" id="resetSearchBtn">重置</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>手机号</th>
+            <th>状态</th>
+            <th>注册时间</th>
+            <th>最后登录</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="userTable"></tbody>
+      </table>
+      <div id="userEmpty" class="empty-state">暂无用户</div>
+    </div>
+
+    <div class="refresh-note">状态每 10 秒自动刷新</div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let adminToken = localStorage.getItem('p2p_admin_token') || '';
+
+function fmtTime(ms) {
+  if (!ms) return '-';
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function fmtUptime(sec) {
+  if (!sec) return '-';
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return `${d}天${h}小时`;
+  if (h > 0) return `${h}小时${m}分`;
+  return `${m}分钟`;
+}
+function fmtSize(bytes) {
+  if (!bytes) return '-';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+async function api(path, options = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (adminToken) headers.Authorization = 'Bearer ' + adminToken;
+  const res = await fetch(path, { ...options, headers });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) { logout(); throw new Error('登录已过期'); }
+  if (!data.ok) throw new Error(data.error || '请求失败');
+  return data;
+}
+
+function logout() {
+  adminToken = '';
+  localStorage.removeItem('p2p_admin_token');
+  $('mainView').classList.add('hidden');
+  $('loginView').classList.remove('hidden');
+}
+
+async function doLogin() {
+  const username = $('loginUser').value.trim();
+  const password = $('loginPass').value;
+  const errBox = $('loginError');
+  errBox.classList.add('hidden');
+  try {
+    const data = await api('/api/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    });
+    adminToken = data.token;
+    localStorage.setItem('p2p_admin_token', adminToken);
+    $('loginView').classList.add('hidden');
+    $('mainView').classList.remove('hidden');
+    refreshStats();
+    loadUsers();
+  } catch (e) {
+    errBox.textContent = e.message;
+    errBox.classList.remove('hidden');
+  }
+}
+
+async function refreshStats() {
+  try {
+    const data = await api('/api/admin/stats');
+    const s = data.stats;
+    $('stStatus').textContent = s.status === 'ok' ? '运行中' : '异常';
+    $('stStatus').className = 'stat-value ' + (s.status === 'ok' ? 'ok' : 'warn');
+    $('stSessions').textContent = s.sessions;
+    $('stUsers').textContent = s.users;
+    $('stActive').textContent = s.activeUsers;
+    $('stUptime').textContent = fmtUptime(s.uptime);
+    $('stMemory').textContent = fmtSize(s.memory);
+    $('stNode').textContent = s.nodeVersion;
+    $('stTime').textContent = fmtTime(s.serverTime);
+  } catch (e) { /* 忽略，下一轮重试 */ }
+}
+
+async function loadUsers(keyword = '') {
+  try {
+    const data = await api('/api/admin/users' + (keyword ? '?keyword=' + encodeURIComponent(keyword) : ''));
+    const tbody = $('userTable');
+    tbody.innerHTML = '';
+    $('userEmpty').classList.toggle('hidden', data.users.length > 0);
+    for (const u of data.users) {
+      const tr = document.createElement('tr');
+      const active = u.status === 'active';
+      tr.innerHTML = `
+        <td class="phone">${u.phone}</td>
+        <td><span class="badge ${active ? 'badge-active' : 'badge-disabled'}">${active ? '正常' : '已禁用'}</span></td>
+        <td>${fmtTime(u.createdAt)}</td>
+        <td>${fmtTime(u.lastLoginAt)}</td>
+        <td><div class="actions"></div></td>`;
+      const actions = tr.querySelector('.actions');
+      // 启用/禁用
+      const toggleBtn = document.createElement('button');
+      toggleBtn.className = 'btn-sm ' + (active ? 'btn-red' : 'btn-green');
+      toggleBtn.textContent = active ? '禁用' : '启用';
+      toggleBtn.onclick = async () => {
+        try {
+          await api(`/api/admin/users/${u.phone}/status`, {
+            method: 'POST',
+            body: JSON.stringify({ status: active ? 'disabled' : 'active' }),
+          });
+          loadUsers(keyword);
+        } catch (e) { alert(e.message); }
+      };
+      actions.appendChild(toggleBtn);
+      // 删除
+      const delBtn = document.createElement('button');
+      delBtn.className = 'btn-sm btn-red';
+      delBtn.textContent = '删除';
+      delBtn.onclick = async () => {
+        if (!confirm(`确定删除用户 ${u.phone} 吗？\n删除后该用户将无法登录。`)) return;
+        try {
+          await api(`/api/admin/users/${u.phone}`, { method: 'DELETE' });
+          loadUsers(keyword);
+        } catch (e) { alert(e.message); }
+      };
+      actions.appendChild(delBtn);
+      tbody.appendChild(tr);
+    }
+  } catch (e) { alert(e.message); }
+}
+
+// ── 事件绑定 ──
+$('loginBtn').onclick = doLogin;
+$('loginPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+$('logoutBtn').onclick = logout;
+$('searchBtn').onclick = () => loadUsers($('searchInput').value.trim());
+$('searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadUsers($('searchInput').value.trim()); });
+$('resetSearchBtn').onclick = () => { $('searchInput').value = ''; loadUsers(); };
+
+// 自动刷新状态
+setInterval(() => {
+  if (adminToken && !$('mainView').classList.contains('hidden')) refreshStats();
+}, 10000);
+
+// ── 启动 ──
+(async () => {
+  if (adminToken) {
+    try {
+      await api('/api/admin/stats'); // 验证 token 有效性
+      $('loginView').classList.add('hidden');
+      $('mainView').classList.remove('hidden');
+      refreshStats();
+      loadUsers();
+      return;
+    } catch (e) { logout(); }
+  }
+  $('loginView').classList.remove('hidden');
+})();
+</script>
+</body>
+</html>
