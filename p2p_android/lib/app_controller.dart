@@ -154,9 +154,17 @@ class AppController extends ChangeNotifier {
         _startAutoReconnect();
         return;
       }
+      // 配对码无效（已被电脑端重新生成）：清除本地失效配对信息，
+      // 避免下次启动继续用旧码自动直连；并提示重新扫码配对
+      if (reason == '配对码无效' && autoMode) {
+        clearPairInfo();
+      }
       state = ConnectState.error;
-      errorMessage =
-          reason == 'host-offline' ? '电脑端未在线，请确认电脑端已启动后重试' : reason;
+      errorMessage = reason == 'host-offline'
+          ? '电脑端未在线，请确认电脑端已启动后重试'
+          : reason == '配对码无效'
+              ? '配对码无效或已变更，请重新扫码配对'
+              : reason;
       notifyListeners();
     };
     _signaling.onSignal = (signal) => _rtc.handleSignal(signal);
@@ -1144,6 +1152,15 @@ class AppController extends ChangeNotifier {
       }
     } catch (_) {}
     return null;
+  }
+
+  /// 清除本地保存的配对信息（配对码已失效时调用，
+  /// 避免下次启动继续用旧码自动直连而反复失败）
+  Future<void> clearPairInfo() async {
+    try {
+      final f = await _pairInfoFile();
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
   }
 
   @override

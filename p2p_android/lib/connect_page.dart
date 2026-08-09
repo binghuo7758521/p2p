@@ -116,7 +116,12 @@ class _ConnectPageState extends State<ConnectPage> {
       }
       if (s == ConnectState.error) {
         if (!mounted) return;
-        setState(() => _submitted = false);
+        final err = widget.controller.errorMessage ?? '';
+        setState(() {
+          _submitted = false;
+          // 配对码无效：旧码已失效，清空输入框，引导重新扫码配对
+          if (err.contains('配对码无效')) _codeCtrl.clear();
+        });
         return;
       }
     }
@@ -237,12 +242,27 @@ class _ConnectPageState extends State<ConnectPage> {
                       if (controller.state == ConnectState.error)
                         Padding(
                           padding: const EdgeInsets.only(top: 16),
-                          child: Text(
-                            controller.errorMessage ?? '连接失败',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                                color: theme.colorScheme.error,
-                                fontWeight: FontWeight.w500),
+                          child: Column(
+                            children: [
+                              Text(
+                                controller.errorMessage ?? '连接失败',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                    color: theme.colorScheme.error,
+                                    fontWeight: FontWeight.w500),
+                              ),
+                              if ((controller.errorMessage ?? '')
+                                  .contains('配对码无效'))
+                                const Padding(
+                                  padding: EdgeInsets.only(top: 4),
+                                  child: Text(
+                                    '请点击上方「扫码配对」扫描电脑端二维码，\n或输入电脑端显示的最新配对码',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                        fontSize: 12, color: Colors.grey),
+                                  ),
+                                ),
+                            ],
                           ),
                         ),
 
