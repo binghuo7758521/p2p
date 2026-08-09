@@ -79,6 +79,10 @@ class AppController extends ChangeNotifier {
   String? errorMessage;
   String? hostName;
 
+  /// 自动直连模式（App 冷启动自动配对）：连接失败自动重试，不弹错误死局；
+  /// 手动扫码/输入配对时置 false，失败立即提示
+  bool autoMode = false;
+
   // ── 浏览状态 ──────────────────────────────────────────
   final List<String> _path = []; // 面包屑名称栈
   final List<String> _dirStack = []; // 每层目录的完整路径栈（支持我的电脑模式）
@@ -140,12 +144,32 @@ class AppController extends ChangeNotifier {
     _rtc.sendSignal = _signaling.sendSignal;
     _signaling.onJoined = _onJoined;
     _signaling.onError = (reason) {
+      // 配对码有效但电脑端未上线（host-offline）且处于自动直连模式：
+      // 不报错，转入自动重试循环，等电脑端重新注册后自动恢复
+      if (reason == 'host-offline' && !_manualDisconnect && autoMode) {
+        if (state == ConnectState.lost) return; // 已在重试中（循环内 join 失败会重复触发）
+        state = ConnectState.lost;
+        errorMessage = '电脑端未在线，正在自动重连…';
+        notifyListeners();
+        _startAutoReconnect();
+        return;
+      }
       state = ConnectState.error;
-      errorMessage = reason;
+      errorMessage =
+          reason == 'host-offline' ? '电脑端未在线，请确认电脑端已启动后重试' : reason;
       notifyListeners();
     };
     _signaling.onSignal = (signal) => _rtc.handleSignal(signal);
     _signaling.onConnectError = (msg) {
+      // 自动直连/自动重连场景：网络抖动不报错，转入重试循环
+      if (!_manualDisconnect && autoMode) {
+        if (state == ConnectState.lost) return;
+        state = ConnectState.lost;
+        errorMessage = '无法连接服务器，正在自动重试…';
+        notifyListeners();
+        _startAutoReconnect();
+        return;
+      }
       state = ConnectState.error;
       errorMessage = '无法连接服务器: $msg';
       notifyListeners();

@@ -78,6 +78,17 @@ function getOrCreatePairCode() {
   return generatePairCode();
 }
 
+/** 读取当前有效配对码（只读，不生成）：用于区分“电脑端离线”与“配对码已变更” */
+function getCurrentPairCode() {
+  if (existsSync(PAIR_CODE_FILE)) {
+    const saved = readFileSync(PAIR_CODE_FILE, 'utf-8').trim();
+    if (new RegExp(`^[A-Z0-9]{${PAIR_CODE_LENGTH}}$`).test(saved)) {
+      return saved;
+    }
+  }
+  return null;
+}
+
 // ── 用户数据存储 ─────────────────────────────────────────────
 const USERS_FILE = join(process.cwd(), 'users.json');
 const TOKENS_FILE = join(process.cwd(), 'tokens.json');
@@ -505,6 +516,18 @@ io.on('connection', (socket) => {
     socket.pairCode = pairCode;
     socket.role = 'host';
     socket.emit('host:registered', { pairCode });
+    // 手机端已在等待（注册前 join 成功）：补发 joined 给两端，
+    // 电脑端立即发起 offer，手机端确认配对——避免双方互相等待的死锁
+    if (clientSocketId && io.sockets.sockets.has(clientSocketId)) {
+      socket.emit('host:client-joined', {
+        clientInfo: existing?.clientInfo ?? { name: '手机', id: clientSocketId },
+        turn: issueTurnCredential()
+      });
+      io.to(clientSocketId).emit('client:joined', {
+        hostInfo: existing?.hostInfo ?? { name: '电脑', id: socket.id },
+        turn: issueTurnCredential()
+      });
+    }
     console.log(`[注册] ${deviceName} → 配对码 ${pairCode}`);
   });
 
@@ -532,8 +555,22 @@ io.on('connection', (socket) => {
 
   // 手机端通过配对码加入
   socket.on('client:join', ({ pairCode, deviceName }) => {
-    const session = sessions.get(pairCode);
-    if (!session) return socket.emit('client:error', { reason: '配对码无效' });
+    let session = sessions.get(pairCode);
+    if (!session || !session.hostSocketId || !io.sockets.sockets.has(session.hostSocketId)) {
+      // 会话不存在或主机 socket 已死（电脑端离线/服务器重启后未注册）：
+      // 若配对码仍是当前有效码 → host-offline（手机端自动等待电脑端上线重试）；
+      // 否则配对码已被重新生成 → 无效，需重新扫码
+      const current = getCurrentPairCode();
+      if (current && pairCode === current) {
+        // 登记等待中的手机端（即使电脑端离线），电脑端注册时据此补发 joined
+        session = session || { hostSocketId: null, createdAt: Date.now() };
+        session.clientSocketId = socket.id;
+        session.clientInfo = { name: deviceName || '手机', id: socket.id };
+        sessions.set(pairCode, session);
+        return socket.emit('client:error', { reason: 'host-offline' });
+      }
+      return socket.emit('client:error', { reason: '配对码无效' });
+    }
     // 断线重连：同一配对码的旧 socket 被新连接替换（通知旧连接断开）
     if (session.clientSocketId && session.clientSocketId !== socket.id) {
       io.to(session.clientSocketId).emit('peer:disconnected');

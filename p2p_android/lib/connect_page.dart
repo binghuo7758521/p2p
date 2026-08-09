@@ -32,7 +32,11 @@ class _ConnectPageState extends State<ConnectPage> {
   @override
   void initState() {
     super.initState();
-    if (widget.autoConnect) _loadSavedAndAutoConnect();
+    if (widget.autoConnect) {
+      // 冷启动自动直连：失败自动重试（电脑端未开/服务器重启都能自动恢复）
+      widget.controller.autoMode = true;
+      _loadSavedAndAutoConnect();
+    }
   }
 
   /// 读取上次配对信息并自动连接（无需再次扫码/输入）
@@ -52,6 +56,8 @@ class _ConnectPageState extends State<ConnectPage> {
   }
 
   Future<void> _connect() async {
+    // 手动/扫码连接：失败立即提示，不自动重试
+    widget.controller.autoMode = false;
     final server = _serverCtrl.text.trim().replaceAll(RegExp(r'/$'), '');
     final code = _codeCtrl.text.trim().toUpperCase();
     if (server.isEmpty) {
@@ -91,6 +97,16 @@ class _ConnectPageState extends State<ConnectPage> {
           _serverCtrl.text.trim(),
           _codeCtrl.text.trim().toUpperCase(),
         );
+        if (!mounted) return;
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(
+              builder: (_) => HomePage(controller: widget.controller)),
+        );
+        return;
+      }
+      // 自动直连且电脑端暂未上线：直接进入主页面，
+      // 主页显示“正在自动重连”，电脑端上线后自动恢复并刷新文件列表
+      if (s == ConnectState.lost && widget.autoConnect) {
         if (!mounted) return;
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
