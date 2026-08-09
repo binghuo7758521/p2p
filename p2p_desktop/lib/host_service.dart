@@ -21,6 +21,8 @@ class HostService {
   Timer? _reconnectTimer;
   int _reconnectAttempts = 0;
   bool _disposed = false;
+  // ICE 短暂失联宽限期：Disconnected 后等待恢复，避免网络抖动导致传输中断
+  Timer? _disconnectGraceTimer;
 
   // ── 对外回调 ────────────────────────────────────────────
   void Function(String pairCode)? onRegistered;
@@ -146,9 +148,23 @@ class HostService {
     _pc!.onConnectionState = (state) {
       onChannelState?.call(
           state == RTCPeerConnectionState.RTCPeerConnectionStateConnected);
-      // WebRTC 层断开（如手机端断网/杀后台但 socket 仍存活）：通知上层进入等待状态
-      if (state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
-          state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        // ICE 恢复：取消宽限计时，传输继续进行
+        _disconnectGraceTimer?.cancel();
+        _disconnectGraceTimer = null;
+      } else if (state ==
+          RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        // 短暂失联（网络抖动/TURN 波动）：宽限 10 秒，恢复则继续，否则判死。
+        // 直接判死会让传输中的大文件瞬间中断，即使连接随后恢复也无法继续
+        _disconnectGraceTimer ??= Timer(const Duration(seconds: 10), () {
+          _disconnectGraceTimer = null;
+          onPeerDisconnected?.call();
+        });
+      } else if (state ==
+          RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+        // 连接确认失败（30 秒未恢复）：立即判死，等待手机端重连
+        _disconnectGraceTimer?.cancel();
+        _disconnectGraceTimer = null;
         onPeerDisconnected?.call();
       }
     };
@@ -240,6 +256,8 @@ class HostService {
     _disposed = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _disconnectGraceTimer?.cancel();
+    _disconnectGraceTimer = null;
     await _closePc();
     try {
       _socket?.dispose();

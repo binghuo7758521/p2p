@@ -27,6 +27,9 @@ class RtcService {
   /// TURN 中继凭证（由配对消息携带，创建 PeerConnection 前设置）
   Map<String, dynamic>? turnConfig;
 
+  // ICE 短暂失联宽限期：Disconnected 后等待恢复，避免网络抖动导致传输中断
+  Timer? _disconnectGraceTimer;
+
   bool get isOpen => _channel?.state == RTCDataChannelState.RTCDataChannelOpen;
 
   int get bufferedAmount => _channel?.bufferedAmount ?? 0;
@@ -72,9 +75,26 @@ class RtcService {
       });
     };
     _pc!.onConnectionState = (state) {
-      final open =
-          state == RTCPeerConnectionState.RTCPeerConnectionStateConnected;
-      _stateController.add(open);
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        // ICE 恢复：取消宽限计时，传输继续进行
+        _disconnectGraceTimer?.cancel();
+        _disconnectGraceTimer = null;
+        _stateController.add(true);
+      } else if (state ==
+          RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        // 短暂失联（网络抖动/TURN 波动）：宽限 10 秒，恢复则继续，否则判死。
+        // 直接判死会让传输中的大文件瞬间中断，即使连接随后恢复也无法继续
+        _disconnectGraceTimer ??= Timer(const Duration(seconds: 10), () {
+          _disconnectGraceTimer = null;
+          _stateController.add(false);
+        });
+      } else if (state ==
+          RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+        // 连接确认失败：立即判死，走自动重连
+        _disconnectGraceTimer?.cancel();
+        _disconnectGraceTimer = null;
+        _stateController.add(false);
+      }
     };
   }
 
@@ -137,6 +157,8 @@ class RtcService {
   }
 
   Future<void> dispose() async {
+    _disconnectGraceTimer?.cancel();
+    _disconnectGraceTimer = null;
     try {
       await _channel?.close();
     } catch (_) {}
