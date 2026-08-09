@@ -133,6 +133,7 @@ class AppController extends ChangeNotifier {
   String? _lastCode; // 最近一次配对码
   bool _manualDisconnect = false; // 用户主动断开：不再自动重连
   Timer? _reconnectTimer;
+  Timer? _connectTimer; // 连接超时兜底（避免无限“正在连接”）
   int _reconnectAttempts = 0;
   final List<ResumeUpload> _resumeUploads = []; // 断线时中断的上传队列
   ResumeDownload? _resumeDownload; // 断线时中断的下载
@@ -154,11 +155,9 @@ class AppController extends ChangeNotifier {
         _startAutoReconnect();
         return;
       }
-      // 配对码无效（已被电脑端重新生成）：清除本地失效配对信息，
-      // 避免下次启动继续用旧码自动直连；并提示重新扫码配对
-      if (reason == '配对码无效' && autoMode) {
-        clearPairInfo();
-      }
+      // 配对码无效（已被电脑端重新生成）：保留本地配对信息不删除，
+      // 连接页提示重新扫码；下次启动自动直连仍会用旧码尝试一次，
+      // 失败后再次给出扫码引导（避免误删后连接页空白、用户不知如何重连）
       state = ConnectState.error;
       errorMessage = reason == 'host-offline'
           ? '电脑端未在线，请确认电脑端已启动后重试'
@@ -206,6 +205,23 @@ class AppController extends ChangeNotifier {
     errorMessage = null;
     notifyListeners();
 
+    // 连接超时兜底：服务器握手/join 无响应时不再无限“正在连接”
+    _connectTimer?.cancel();
+    _connectTimer = Timer(const Duration(seconds: 15), () {
+      if (_manualDisconnect || state != ConnectState.connecting) return;
+      if (autoMode) {
+        // 自动直连：转入自动重试（进入主页面显示重连视图，电脑端上线自动恢复）
+        state = ConnectState.lost;
+        errorMessage = '连接超时，正在自动重连…';
+        notifyListeners();
+        _startAutoReconnect();
+      } else {
+        state = ConnectState.error;
+        errorMessage = '连接超时，请检查服务器地址与网络后重试';
+        notifyListeners();
+      }
+    });
+
     try {
       await _rtc.init();
       await _signaling.connect(
@@ -214,9 +230,17 @@ class AppController extends ChangeNotifier {
         deviceName: 'Android',
       );
     } catch (e) {
-      state = ConnectState.error;
-      errorMessage = '初始化失败: $e';
-      notifyListeners();
+      if (autoMode && !_manualDisconnect) {
+        // 自动直连：初始化失败同样转入自动重试
+        state = ConnectState.lost;
+        errorMessage = '初始化失败，正在自动重连…';
+        notifyListeners();
+        _startAutoReconnect();
+      } else {
+        state = ConnectState.error;
+        errorMessage = '初始化失败: $e';
+        notifyListeners();
+      }
     }
   }
 
@@ -461,6 +485,7 @@ class AppController extends ChangeNotifier {
   Future<void> disconnect() async {
     _manualDisconnect = true;
     _reconnectTimer?.cancel();
+    _connectTimer?.cancel();
     _resumeUploads.clear();
     _resumeDownload = null;
     _cleanupReceive();
@@ -1152,15 +1177,6 @@ class AppController extends ChangeNotifier {
       }
     } catch (_) {}
     return null;
-  }
-
-  /// 清除本地保存的配对信息（配对码已失效时调用，
-  /// 避免下次启动继续用旧码自动直连而反复失败）
-  Future<void> clearPairInfo() async {
-    try {
-      final f = await _pairInfoFile();
-      if (await f.exists()) await f.delete();
-    } catch (_) {}
   }
 
   @override
