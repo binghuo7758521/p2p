@@ -45,7 +45,12 @@ class _ConnectPageState extends State<ConnectPage> {
     if (!mounted || info == null) return;
     _serverCtrl.text = info.server;
     _codeCtrl.text = info.code.toUpperCase();
-    await _connect();
+    setState(() => _submitted = true);
+    // 直接调用 connect（不走 _connect：它会关闭自动重试模式，
+    // 导致电脑端未上线时既不重试也不进入主页面）
+    await widget.controller.connect(info.server, info.code.toUpperCase());
+    if (!mounted) return;
+    await _waitForPair();
   }
 
   @override
