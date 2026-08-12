@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'app_log.dart';
+
 /// 视频扩展名集合（用于识别可在线播放的视频文件）
 const kVideoExts = {
   'mp4', 'mkv', 'webm', 'avi', 'mov', '3gp', '3gpp',
@@ -65,18 +67,21 @@ class VideoPlayServer {
     _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     _server!.listen((req) {
       _handle(req, file, isFinished, mime).catchError((e) {
+        AppLog.w('play', '播放请求处理异常: ${req.uri.path} $e');
         try {
           req.response.statusCode = 500;
           req.response.close();
         } catch (_) {}
       });
     });
+    AppLog.i('play', '本地播放服务器已绑定: 127.0.0.1:${_server!.port} (文件=${file.path})');
     return _server!.port;
   }
 
   Future<void> stop() async {
     await _server?.close(force: true);
     _server = null;
+    AppLog.i('play', '本地播放服务器已停止');
   }
 
   Future<void> _handle(
@@ -87,6 +92,7 @@ class VideoPlayServer {
   ) async {
     final res = req.response;
     if (req.uri.path != '/play') {
+      AppLog.w('play', '未知请求路径: ${req.uri.path}');
       res.statusCode = 404;
       await res.close();
       return;
@@ -108,6 +114,8 @@ class VideoPlayServer {
         if (end < start) end = start;
       }
     }
+    AppLog.i('play',
+        '播放请求: range=${range ?? '无'} => ${hasRange ? '206' : '200'} start=$start end=$end total=$total (文件当前大小=${await file.length()})');
 
     res.statusCode = hasRange ? 206 : 200;
     res.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
@@ -119,8 +127,11 @@ class VideoPlayServer {
     res.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
 
     // 流式读取：文件未写完时等待写入（边下边播），完成后读到 EOF 结束
-    await res.addStream(_readRange(file, start, isFinished));
+    var sent = 0;
+    await res.addStream(_readRange(file, start, isFinished)
+        .map((d) { sent += d.length; return d; }));
     await res.close();
+    AppLog.i('play', '播放响应完成: 发送$sent字节 (请求start=$start)');
   }
 
   Stream<List<int>> _readRange(

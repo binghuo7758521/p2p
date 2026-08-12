@@ -1,6 +1,13 @@
 #include <flutter/dart_project.h>
 #include <flutter/flutter_view_controller.h>
+#include <flutter/method_call.h>
+#include <flutter/method_channel.h>
+#include <flutter/method_result.h>
+#include <flutter/standard_method_codec.h>
 #include <windows.h>
+
+#include <memory>
+#include <string>
 
 #include "flutter_window.h"
 #include "utils.h"
@@ -31,6 +38,40 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);
+
+  // ── 窗口标题通道：dart 侧启动时设置 "p2p_desktop vX.Y"（版本号单一来源）──
+  // 版本升级只需改 version.dart，窗口标题自动跟随，无需再改本文件
+  flutter::MethodChannel<flutter::EncodableValue> title_channel(
+      window.engine()->messenger(), "p2p/window_title",
+      &flutter::StandardMethodCodec::GetInstance());
+  title_channel.SetMethodCallHandler(
+      [&window](const flutter::MethodCall<flutter::EncodableValue>& call,
+                std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                    result) {
+        if (call.method_name() == "set") {
+          const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+          if (args != nullptr) {
+            const auto it = args->find(flutter::EncodableValue("title"));
+            if (it != args->end() &&
+                std::holds_alternative<std::string>(it->second)) {
+              const auto& utf8 = std::get<std::string>(it->second);
+              const int len = ::MultiByteToWideChar(
+                  CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()),
+                  nullptr, 0);
+              if (len > 0) {
+                std::wstring title(len, L'\0');
+                ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
+                                      static_cast<int>(utf8.size()), &title[0],
+                                      len);
+                ::SetWindowTextW(window.GetHandle(), title.c_str());
+              }
+            }
+          }
+          result->Success();
+        } else {
+          result->NotImplemented();
+        }
+      });
 
   ::MSG msg;
   while (::GetMessage(&msg, nullptr, 0, 0)) {

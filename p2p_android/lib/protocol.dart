@@ -3,8 +3,11 @@ library;
 
 import 'dart:convert';
 
-/// 文件分块大小（与电脑端一致：65536 字节）
-const int kChunkSize = 65536;
+/// 文件分块大小（与电脑端一致）。
+/// 64KB → 256KB：每块固定开销（Dart↔native 调用、接收端回调、写盘调度）
+/// 摊薄 4 倍，手机端消费上限从 ~20MB/s 提升到 40MB/s+；
+/// 256KB 在 libwebrtc/Chromium 的 DataChannel 单消息上限内（实测可发）
+const int kChunkSize = 262144;
 
 /// 背压阈值：数据通道待发送缓冲超过该值后暂停发送
 const int kBackpressureLimit = 8 * 1024 * 1024;
@@ -15,12 +18,28 @@ const List<String> kKnownMsgTypes = [
   'file-meta',
   'file-complete',
   'file-ack',
+  'file-delete-result',
   'file:list',
   'file:download',
   'file:upload',
+  'file:delete',
   'file:accept',
   'file:conflict',
   'file:conflict-resolve',
+  'user:list',
+  'user:list-result',
+  'user:create-share',
+  'user:remove-share',
+  'user:update-share',
+  'user:attach-share',
+  'user:share-result',
+  'user:share-updated',
+  'user:kick',
+  'user:kick-result',
+  'user:remove',
+  'user:remove-result',
+  // 电脑端已有其他管理员时：更换管理员申请结果（配对连接用户可申请）
+  'user:claim-result',
 ];
 
 /// 解析后的控制消息

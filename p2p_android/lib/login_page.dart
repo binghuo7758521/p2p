@@ -4,8 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'app_controller.dart';
+import 'app_log.dart';
 import 'auth_service.dart';
-import 'connect_page.dart';
+import 'home_page.dart';
+import 'reset_password_page.dart';
+import 'update_check.dart';
+import 'version.dart';
 
 /// 登录 / 注册页：注册（短信验证码）后才能登录使用
 class LoginPage extends StatefulWidget {
@@ -16,7 +20,6 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final _serverCtrl = TextEditingController(text: 'http://182.92.157.93:3000');
   final _phoneCtrl = TextEditingController();
   final _codeCtrl = TextEditingController();
   final _pwdCtrl = TextEditingController();
@@ -31,7 +34,6 @@ class _LoginPageState extends State<LoginPage> {
   @override
   void dispose() {
     _timer?.cancel();
-    _serverCtrl.dispose();
     _phoneCtrl.dispose();
     _codeCtrl.dispose();
     _pwdCtrl.dispose();
@@ -39,8 +41,8 @@ class _LoginPageState extends State<LoginPage> {
     super.dispose();
   }
 
-  String get _server =>
-      _serverCtrl.text.trim().replaceAll(RegExp(r'/$'), '');
+  /// 默认连接内置公网服务器，不在界面展示
+  String get _server => defaultServerUrl;
 
   void _showMsg(String msg, {bool error = false}) {
     if (!mounted) return;
@@ -103,6 +105,7 @@ class _LoginPageState extends State<LoginPage> {
     try {
       final token = await AuthService.instance.login(_server, phone, password);
       await AuthService.instance.save(token, phone);
+      AppLog.i('app', '登录成功，进入连接页');
       if (!mounted) return;
       _enterApp();
     } catch (e) {
@@ -139,6 +142,7 @@ class _LoginPageState extends State<LoginPage> {
       final token =
           await AuthService.instance.register(_server, phone, code, password);
       await AuthService.instance.save(token, phone);
+      AppLog.i('app', '注册成功，进入连接页');
       if (!mounted) return;
       _showMsg('注册成功，欢迎使用');
       _enterApp();
@@ -149,12 +153,25 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
-  /// 进入主流程（连接电脑）
+  /// 进入主页面（登录/注册后不强制先连接电脑，主页内提供连接入口）
   void _enterApp() {
     final controller = AppController();
     Navigator.of(context).pushReplacement(MaterialPageRoute(
-      builder: (_) => ConnectPage(controller: controller),
+      builder: (_) => HomePage(controller: controller),
     ));
+  }
+
+  /// 打开忘记密码页；重置成功后自动回填手机号
+  Future<void> _openResetPassword() async {
+    final phone = await Navigator.of(context).push<String>(MaterialPageRoute(
+      builder: (_) =>
+          ResetPasswordPage(initialPhone: _phoneCtrl.text.trim()),
+    ));
+    if (!mounted) return;
+    if (phone != null && phone.isNotEmpty) {
+      setState(() => _phoneCtrl.text = phone);
+      _showMsg('密码已重置，请输入新密码登录');
+    }
   }
 
   @override
@@ -175,7 +192,7 @@ class _LoginPageState extends State<LoginPage> {
                   const Icon(Icons.swap_horiz_rounded,
                       size: 64, color: Color(0xFF38BDF8)),
                   const SizedBox(height: 12),
-                  Text('P2P 文件助手',
+                  Text('P2P 文件助手 v$appVersion',
                       textAlign: TextAlign.center,
                       style: theme.textTheme.headlineMedium
                           ?.copyWith(fontWeight: FontWeight.bold)),
@@ -185,20 +202,6 @@ class _LoginPageState extends State<LoginPage> {
                       style: theme.textTheme.bodyMedium
                           ?.copyWith(color: Colors.grey)),
                   const SizedBox(height: 24),
-
-                  // 服务器地址
-                  TextField(
-                    controller: _serverCtrl,
-                    enabled: !_busy,
-                    keyboardType: TextInputType.url,
-                    decoration: const InputDecoration(
-                      labelText: '服务器地址',
-                      hintText: 'http://182.92.157.93:3000',
-                      prefixIcon: Icon(Icons.dns_outlined),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
 
                   // 登录 / 注册切换
                   SegmentedButton<bool>(
@@ -287,9 +290,8 @@ class _LoginPageState extends State<LoginPage> {
                           ? null
                           : IconButton(
                               icon: const Icon(Icons.help_outline),
-                              tooltip: '忘记密码请联系管理员',
-                              onPressed: () => _showMsg(
-                                  '密码暂不支持找回，请联系管理员重置'),
+                              tooltip: '忘记密码',
+                              onPressed: _busy ? null : _openResetPassword,
                             ),
                     ),
                   ),
@@ -349,7 +351,8 @@ class _LoginPageState extends State<LoginPage> {
                           '1. 首次使用请先「注册」：输入手机号获取短信验证码\n'
                           '2. 注册成功后自动登录，之后可直接「登录」\n'
                           '3. 登录后即可输入配对码连接电脑\n'
-                          '4. 账号需管理员后台启用后方可登录',
+                          '4. 账号需管理员后台启用后方可登录\n'
+                          '5. 忘记密码可点击密码框右侧问号图标重置',
                           style: TextStyle(fontSize: 13, height: 1.6),
                         ),
                       ],

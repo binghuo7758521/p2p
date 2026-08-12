@@ -3,8 +3,11 @@ library;
 
 import 'dart:convert';
 
-/// 文件分块大小（与电脑端一致：65536 字节）
-const int kChunkSize = 65536;
+/// 文件分块大小（与电脑端一致）。
+/// 64KB → 256KB：每块固定开销（Dart↔native 调用、接收端回调、写盘调度）
+/// 摊薄 4 倍，手机端消费上限从 ~20MB/s 提升到 40MB/s+；
+/// 256KB 在 libwebrtc/Chromium 的 DataChannel 单消息上限内（实测可发）
+const int kChunkSize = 262144;
 
 /// 背压阈值：数据通道待发送缓冲超过该值后暂停发送
 const int kBackpressureLimit = 8 * 1024 * 1024;
@@ -17,12 +20,33 @@ const List<String> kKnownMsgTypes = [
   'file-meta',
   'file-complete',
   'file-ack',
+  'file-delete-result',
   'file:list',
   'file:download',
   'file:upload',
+  'file:delete',
   'file:accept',
   'file:conflict',
   'file:conflict-resolve',
+  'user:list',
+  'user:list-result',
+  'user:create-share',
+  'user:remove-share',
+  'user:update-share',
+  'user:attach-share',
+  'user:share-result',
+  'user:share-updated',
+  'user:kick',
+  'user:kick-result',
+  'user:remove',
+  'user:remove-result',
+  // 自适应流控：手机端周期性上报写盘消费进度（曾漏加白名单，导致
+  // 反馈消息被当非控制消息丢弃、自适应调速从未生效）
+  'recv-stats',
+  // 手机端接收失败（典型：存储空间不足）：通知电脑端立即中止发送
+  'recv-error',
+  // 配对用户申请成为本电脑端管理员（覆盖已有管理员手机号）
+  'user:claim-admin',
 ];
 
 /// 解析后的控制消息

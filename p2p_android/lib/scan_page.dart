@@ -2,16 +2,22 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
-/// 扫码配对结果
+import 'app_log.dart';
+
+/// 扫码结果：配对码 或 共享码
 class ScanPairResult {
   final String server;
   final String code;
+  final String? shareToken; // 共享码（扫共享二维码时非空）
 
-  const ScanPairResult(this.server, this.code);
+  const ScanPairResult(this.server, this.code, [this.shareToken]);
 }
 
 /// 配对码格式：10 位数字/字母
 final RegExp kPairCodeRegExp = RegExp(r'^[A-Za-z0-9]{10}$');
+
+/// 共享码格式：8 位数字/字母
+final RegExp kShareTokenRegExp = RegExp(r'^[A-Za-z0-9]{8}$');
 
 /// 扫码配对页：扫描电脑端二维码，自动获取服务器地址与配对码
 ///
@@ -44,24 +50,33 @@ class _ScanPageState extends State<ScanPage> {
     if (raw == null || !raw.startsWith('p2p:')) return;
 
     final result = _parse(raw);
-    if (result == null) return;
+    if (result == null) {
+      AppLog.w('scan', '二维码内容格式异常: ${raw.length > 80 ? '${raw.substring(0, 80)}…' : raw}');
+      return;
+    }
     _handled = true;
+    AppLog.i('scan', '扫码成功: server=${result.server}');
     HapticFeedback.mediumImpact();
     Navigator.of(context).pop(result);
   }
 
-  /// 解析 `p2p:<server>|<code>`，失败返回 null
+  /// 解析 `p2p:<server>|<code>[|<shareToken>]`，失败返回 null
   ScanPairResult? _parse(String raw) {
     final body = raw.substring(4);
-    final sep = body.lastIndexOf('|');
-    if (sep <= 0 || sep == body.length - 1) return null;
-    final server = body.substring(0, sep).trim();
-    final code = body.substring(sep + 1).trim();
+    final parts = body.split('|');
+    if (parts.length < 2 || parts.length > 3) return null;
+    final server = parts[0].trim();
+    final code = parts[1].trim();
     if (!server.startsWith('http://') && !server.startsWith('https://')) {
       return null;
     }
     if (!kPairCodeRegExp.hasMatch(code)) return null;
-    return ScanPairResult(server, code);
+    String? shareToken;
+    if (parts.length == 3) {
+      shareToken = parts[2].trim();
+      if (!kShareTokenRegExp.hasMatch(shareToken)) return null;
+    }
+    return ScanPairResult(server, code, shareToken);
   }
 
   @override

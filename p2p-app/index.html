@@ -32,6 +32,9 @@
     .status-ok { background: #166534; color: #bbf7d0; }
     .status-err { background: #7f1d1d; color: #fecaca; }
     .status-info { background: #1e3a5f; color: #93c5fd; }
+    .conn-badge { display: inline-block; margin-left: 8px; padding: 2px 10px; border-radius: 10px; font-size: 0.8em; }
+    .conn-direct { background: #14532d; color: #86efac; }
+    .conn-relay { background: #7c2d12; color: #fdba74; }
     .file-list { list-style: none; max-height: 400px; overflow-y: auto; }
     .file-item { display: flex; align-items: center; padding: 10px; border-bottom: 1px solid #334155; gap: 10px; }
     .file-item:hover { background: #0f172a; }
@@ -111,7 +114,9 @@
 
   <!-- ═══ 电脑端: 主界面 ═══ -->
   <template v-if="mode==='host' && peerConnected">
-    <div class="status status-ok">🔗 已连接 {{ clientInfo?.name }}</div>
+    <div class="status status-ok">🔗 已连接 {{ clientInfo?.name }}
+      <span :class="['conn-badge', connType==='relay' ? 'conn-relay' : 'conn-direct']">{{ connType==='relay' ? '服务器中转' : (connType==='direct' ? 'P2P直连' : '探测中…') }}</span>
+    </div>
 
     <!-- 共享目录 -->
     <div class="card">
@@ -171,7 +176,9 @@
 
   <!-- ═══ 手机端: 主界面 ═══ -->
   <template v-if="mode==='client' && peerConnected">
-    <div class="status status-ok">🔗 已连接 {{ hostInfo?.name }}</div>
+    <div class="status status-ok">🔗 已连接 {{ hostInfo?.name }}
+      <span :class="['conn-badge', connType==='relay' ? 'conn-relay' : 'conn-direct']">{{ connType==='relay' ? '服务器中转' : (connType==='direct' ? 'P2P直连' : '探测中…') }}</span>
+    </div>
 
     <div class="tab-bar">
       <div :class="['tab', clientTab==='browse'?'active':'']" @click="browseTab()">📂 浏览文件</div>
@@ -258,6 +265,26 @@
 <script src="https://unpkg.com/simple-peer@9/simplepeer.min.js"></script>
 <script>
 const { createApp, reactive, ref, computed } = Vue;
+
+// ── 测试阶段日志（带时间戳，便于与服务器日志对照） ──
+function log(...args) {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const ts = `${d.getHours()}:${p(d.getMinutes())}:${p(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+  console.log(`[P2P] ${ts}`, ...args);
+}
+const logErr = (...args) => console.error('[P2P]', ...args);
+
+// 进度日志节流状态（每 8MB 或每 5 秒记一次）
+let lastProgressLog = { bytes: 0, time: 0 };
+function shouldLogProgress(bytes) {
+  const now = Date.now();
+  if (bytes - lastProgressLog.bytes >= 8 * 1024 * 1024 || now - lastProgressLog.time >= 5000) {
+    lastProgressLog = { bytes, time: now };
+    return true;
+  }
+  return false;
+}
 
 createApp({
   setup() {
@@ -346,33 +373,94 @@ createApp({
     }
 
     // ── 发送 JSON ────────────────────────────────────────
-    function sendJSON(obj) { peer.send(JSON.stringify(obj)); }
+    function sendJSON(obj) {
+      const fields = ['fileName', 'fileSize', 'path', 'subPath', 'requestId', 'offset', 'success', 'reason']
+        .filter((k) => obj[k] !== undefined && obj[k] !== null)
+        .map((k) => `${k}=${obj[k]}`);
+      log('发送控制消息:', obj.type, fields.join(' '));
+      peer.send(JSON.stringify(obj));
+    }
+
+    // ── 连接方式（直连/服务器中转）与发送限速 ──────────────
+    const connType = ref('unknown'); // 'direct' | 'relay' | 'unknown'
+    const RELAY_MAX_RATE = 500 * 1024; // 服务器中转限速 500KB/s
+    let rateLimiter = null; // { tokens, lastMs }
+
+    function setRelayMode(relay) {
+      rateLimiter = relay ? { tokens: RELAY_MAX_RATE, lastMs: performance.now() } : null;
+      connType.value = relay ? 'relay' : 'direct';
+      log(relay ? '连接方式: 服务器中转(TURN)，发送限速 500KB/s' : '连接方式: P2P 直连，发送不限速');
+    }
+
+    // 令牌桶：申请发送 bytes 字节，速率不足时等待（桶容量=1秒量，稳态精确限速）
+    async function waitSendPermit(bytes) {
+      if (!rateLimiter) return;
+      while (true) {
+        const now = performance.now();
+        const elapsed = (now - rateLimiter.lastMs) / 1000;
+        rateLimiter.lastMs = now;
+        rateLimiter.tokens = Math.min(rateLimiter.tokens + RELAY_MAX_RATE * elapsed, RELAY_MAX_RATE);
+        if (rateLimiter.tokens >= bytes) { rateLimiter.tokens -= bytes; return; }
+        const need = bytes - rateLimiter.tokens;
+        await new Promise(r => setTimeout(r, Math.ceil(need / RELAY_MAX_RATE * 1000)));
+      }
+    }
+
+    // 探测连接方式：读取 ICE 统计中选中的候选对，relay=服务器中转，其余=直连
+    function detectConnType() {
+      if (!peer) return;
+      setTimeout(async () => {
+        try {
+          if (!peer._pc) return;
+          const stats = await peer._pc.getStats();
+          let relay = false;
+          let found = false;
+          outer: for (const s of stats.values()) {
+            if (s.type !== 'candidate-pair' || !s.selected) continue;
+            found = true;
+            if (s.localCandidateType === 'relay' || s.remoteCandidateType === 'relay') { relay = true; break; }
+            // 兼容：通过候选 id 反查 candidateType
+            for (const c of stats.values()) {
+              if ((c.id === s.localCandidateId || c.id === s.remoteCandidateId)
+                  && (c.type === 'local-candidate' || c.type === 'remote-candidate')
+                  && c.candidateType === 'relay') { relay = true; break outer; }
+            }
+            break;
+          }
+          if (found) setRelayMode(relay);
+        } catch (e) { logErr('连接方式探测失败:', e); }
+      }, 1200);
+    }
 
     // ── 模式选择 ─────────────────────────────────────────
     function selectMode(m) {
       mode.value = m;
+      log('选择模式:', m === 'host' ? '电脑端' : '手机端');
       socket = io(location.origin);
       socket.on('connect', () => {
+        log('信令服务器已连接 (id=' + socket.id + ')');
         if (m === 'host') {
           socket.emit('host:register', { deviceName: '电脑-' + navigator.platform.slice(0, 3) });
         }
       });
-      socket.on('host:registered', ({ pairCode: code }) => { pairCode.value = code; });
+      socket.on('host:registered', ({ pairCode: code }) => { pairCode.value = code; log('收到配对码:', code); });
       socket.on('host:client-joined', ({ clientInfo: info }) => {
         clientInfo.value = info;
         clientConnected.value = true;
+        log('手机端已加入:', info.name, '开始建立P2P');
         startPeer(true);
       });
       socket.on('client:joined', ({ hostInfo: info }) => {
         hostInfo.value = info;
+        log('配对成功，主机:', info.name, '开始建立P2P');
         startPeer(false);
       });
-      socket.on('connect_error', (err) => { joinError.value = '无法连接服务器: ' + err.message; connecting.value = false; });
-      socket.on('client:error', ({ reason }) => { joinError.value = reason; connecting.value = false; });
-      socket.on('peer:disconnected', () => { alert('对端已断开'); location.reload(); });
+      socket.on('connect_error', (err) => { logErr('连接服务器失败:', err.message); joinError.value = '无法连接服务器: ' + err.message; connecting.value = false; });
+      socket.on('client:error', ({ reason }) => { log('配对失败:', reason); joinError.value = reason; connecting.value = false; });
+      socket.on('peer:disconnected', () => { log('对端已断开，刷新页面'); alert('对端已断开'); location.reload(); });
       // 信令转发
-      socket.on('signal:server→host', ({ signal }) => { peer?.signal(signal); });
-      socket.on('signal:server→client', ({ signal }) => { peer?.signal(signal); });
+      socket.on('signal:server→host', ({ signal }) => { log('收到信令:', signal.type); peer?.signal(signal); });
+      socket.on('signal:server→client', ({ signal }) => { log('收到信令:', signal.type); peer?.signal(signal); });
     }
 
     // ── 手机端加入 ───────────────────────────────────────
@@ -380,15 +468,18 @@ createApp({
       if (inputCode.value.length !== 10) return;
       connecting.value = true;
       joinError.value = '';
+      log('发起配对 join:', inputCode.value.toUpperCase());
       socket.emit('client:join', { pairCode: inputCode.value.toUpperCase(), deviceName: '手机' });
     }
 
     // ── P2P 连接 ─────────────────────────────────────────
     function startPeer(isInitiator) {
       connecting.value = true;
+      log('创建 PeerConnection, initiator=' + isInitiator);
       peer = new SimplePeer({ initiator: isInitiator, trickle: true, config: ICE });
 
       peer.on('signal', (data) => {
+        log('生成信令:', data.type, 'sdp长度=' + (data.sdp ? data.sdp.length : 0));
         if (mode.value === 'host') socket.emit('signal:host→client', { signal: data });
         else socket.emit('signal:client→host', { signal: data });
       });
@@ -397,13 +488,16 @@ createApp({
         if (peer._channel) peer._channel.binaryType = 'arraybuffer';
         peerConnected.value = true;
         connecting.value = false;
+        log('P2P 数据通道已建立');
+        // 连接建立后探测连接方式（直连 or 服务器中转），中转则自动限速 500KB/s
+        detectConnType();
         setupReceiver();
         // 手机端自动请求文件列表
         if (mode.value === 'client') requestFileList([]);
       });
 
       peer.on('error', (err) => {
-        console.error('P2P error:', err);
+        logErr('P2P error:', err);
         connecting.value = false;
         peerConnected.value = false;
         try { peer.destroy(); } catch {}
@@ -412,15 +506,18 @@ createApp({
     }
 
     function handleControlMsg(msg) {
+      log('收到控制消息:', msg.type, msg.fileName ? 'fileName=' + msg.fileName : '', msg.error ? 'error=' + msg.error : '');
       switch (msg.type) {
         case 'file-list-result':
           remoteFiles.value = msg.files || [];
           listError.value = msg.error || '';
           dirReady.value = true;
+          log('文件列表:', (msg.files || []).length + '项', listError.value ? '错误=' + listError.value : '');
           break;
         case 'file-meta':
           recvState = { fileMeta: msg, chunks: [], bytes: 0, startTime: performance.now() };
           addTransfer(msg.fileName, 'download', msg.fileSize);
+          log('开始接收下载:', msg.fileName, msg.fileSize + 'B');
           break;
         case 'file-complete':
           finalizeReceive();
@@ -431,6 +528,9 @@ createApp({
           if (ackT) {
             ackT.status = msg.success ? 'done' : 'error';
             ackT.progress = 100;
+            log('收到上传确认:', msg.fileName, msg.success ? '成功' : '失败');
+          } else {
+            log('收到上传确认(无匹配记录):', msg.fileName);
           }
           break;
         }
@@ -441,6 +541,9 @@ createApp({
       if (!recvState.fileMeta) return;
       recvState.chunks.push(data instanceof Blob ? data : new Blob([data]));
       recvState.bytes += data.byteLength || data.size || 0;
+      if (shouldLogProgress(recvState.bytes)) {
+        log('接收进度:', recvState.fileMeta.fileName, recvState.bytes + '/' + recvState.fileMeta.fileSize + 'B');
+      }
       // 更新进度
       const t = transfers.value.find(x => x.status === 'transferring');
       if (t) {
@@ -453,7 +556,10 @@ createApp({
 
     async function finalizeReceive() {
       const meta = recvState.fileMeta;
-      if (!meta) return;
+      if (!meta) {
+        logErr('收到 file-complete 但无接收记录');
+        return;
+      }
       const blob = new Blob(recvState.chunks);
       const t = transfers.value.find(x => x.fileName === meta.fileName && x.status === 'transferring');
 
@@ -470,6 +576,7 @@ createApp({
 
       const success = saved && blob.size === meta.fileSize;
       if (t) { t.status = success ? 'done' : 'error'; t.progress = 100; }
+      log('传输结束:', meta.fileName, '接收' + blob.size + '/' + meta.fileSize + 'B =>', success ? '成功' : '失败');
 
       // 发送 ACK（带文件名和真实结果）
       sendJSON({ type: 'file-ack', fileName: meta.fileName, success });
@@ -486,19 +593,21 @@ createApp({
         try {
           perms = await handle.queryPermission({ mode: 'readwrite' });
           if (perms !== 'granted') perms = await handle.requestPermission({ mode: 'readwrite' });
-        } catch (e) { console.log('权限查询失败:', e); }
+        } catch (e) { logErr('权限查询失败:', e); }
         if (perms !== 'granted') {
+          logErr('未获得目录写入权限:', handle.name);
           alert('未获得目录写入权限，上传的文件将无法保存。\n请重新选择目录，并在授权时选择"允许"。');
           return;
         }
         dirHandle.value = handle;
         currentPath.value = [];
         await loadFiles();
+        log('已选择共享目录:', handle.name, '(读写权限已确认)');
       } catch (e) {
         if (e.name === 'AbortError') {
-          console.log('用户取消选择');
+          log('用户取消选择目录');
         } else {
-          console.error('选择目录失败:', e);
+          logErr('选择目录失败:', e);
           alert('选择目录失败: ' + e.message + '\n提示: 需使用 Chrome/Edge 浏览器，且通过 https 或 localhost 访问页面');
         }
       }
@@ -519,6 +628,7 @@ createApp({
         }
       }
       files.value = list.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'directory' ? -1 : 1));
+      log('本地目录加载:', currentPath.value.join('/') || '/', files.value.length + '项');
     }
 
     function openDir(f) { currentPath.value.push(f.name); loadFiles(); }
@@ -537,9 +647,10 @@ createApp({
         await writable.write(blob);
         await writable.close();
         await loadFiles(); // 刷新列表
+        log('文件已保存到共享目录:', fileName, subPath ? '子目录=' + subPath : '');
         return true;
       } catch (e) {
-        console.error('保存失败:', e);
+        logErr('保存失败:', e);
         alert('文件保存失败: ' + (e.message || e));
         return false;
       }
@@ -556,11 +667,13 @@ createApp({
       dirReady.value = false;
       listError.value = '';
       remoteFiles.value = [];
+      log('请求文件列表:', path.join('/') || '/');
       sendJSON({ type: 'file:list', path: path.join('/') });
     }
 
     function downloadFile(f) {
       const path = [...clientPath.value, f.name].join('/');
+      log('请求下载:', f.name, '路径=' + path);
       sendJSON({ type: 'file:download', fileName: f.name, path, fileSize: f.size });
     }
 
@@ -573,12 +686,14 @@ createApp({
     async function startUpload() {
       if (uploadFiles.value.length === 0) return;
       uploading.value = true;
-      const CHUNK = 65536;
+      const CHUNK = 262144; // 64KB→256KB：分块固定开销摊薄4倍提速（三端一致）
+      log('开始上传批次:', uploadFiles.value.length + '个文件');
 
       for (const file of uploadFiles.value) {
         const totalChunks = Math.ceil(file.size / CHUNK);
         const t = addTransfer(file.name, 'upload', file.size);
         const startTime = performance.now();
+        log('开始上传文件:', file.name, file.size + 'B');
 
         sendJSON({ type: 'file:upload', fileName: file.name, fileSize: file.size, totalChunks });
 
@@ -589,10 +704,15 @@ createApp({
           const buf = await chunk.arrayBuffer();
 
           while (peer._channel && peer._channel.bufferedAmount > 8388608) await new Promise(r => setTimeout(r, 5));
+          // 服务器中转(relay)时限速 500KB/s；P2P 直连不限速
+          await waitSendPermit(buf.byteLength);
           peer.send(buf);
 
           t.transferred = end;
           t.progress = Math.round(end / file.size * 100);
+          if (shouldLogProgress(end)) {
+            log('上传进度:', file.name, end + '/' + file.size + 'B');
+          }
           const elapsed = (performance.now() - startTime) / 1000;
           t.speed = (end / 1048576 / elapsed).toFixed(2);
         }
@@ -603,6 +723,7 @@ createApp({
         await new Promise((resolve) => {
           const timeout = setTimeout(() => {
             t.status = 'error';
+            logErr('等待确认超时(10s):', file.name);
             resolve();
           }, 10000);
           const checkAck = () => {
@@ -615,10 +736,12 @@ createApp({
           };
           setTimeout(checkAck, 100);
         });
+        log('上传结束:', file.name, '=>', t.status);
       }
 
       uploading.value = false;
       uploadFiles.value = [];
+      log('上传批次完成');
     }
 
     // ── 电脑端: 处理手机请求 ─────────────────────────────
@@ -631,6 +754,7 @@ createApp({
       } else if (msg.type === 'file:upload') {
         // 电脑端尚未选择共享目录时直接拒绝，避免文件静默丢失
         if (!dirHandle.value) {
+          logErr('收到上传请求但未选择共享目录，拒绝:', msg.fileName);
           sendJSON({ type: 'file-ack', fileName: msg.fileName, success: false });
           return;
         }
@@ -639,6 +763,7 @@ createApp({
         recvState.bytes = 0;
         recvState.startTime = performance.now();
         addTransfer(msg.fileName, 'upload', msg.fileSize);
+        log('开始接收上传:', msg.fileName, msg.fileSize + 'B', msg.subPath ? '子目录=' + msg.subPath : '');
       }
     }
 
@@ -646,6 +771,7 @@ createApp({
       try {
         let handle = dirHandle.value;
         if (!handle) {
+          logErr('收到文件列表请求但未选择共享目录');
           sendJSON({ type: 'file-list-result', files: [], error: '电脑端尚未选择共享目录' });
           return;
         }
@@ -663,8 +789,10 @@ createApp({
           }
         }
         list.sort((a, b) => a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'directory' ? -1 : 1);
+        log('响应文件列表:', pathStr || '/', list.length + '项');
         sendJSON({ type: 'file-list-result', files: list });
       } catch (e) {
+        logErr('读取目录失败:', pathStr, e);
         sendJSON({ type: 'file-list-result', files: [], error: '读取目录失败: ' + (e.message || e) });
       }
     }
@@ -679,11 +807,12 @@ createApp({
         }
         const fileHandle = await handle.getFileHandle(fileName);
         const file = await fileHandle.getFile();
-        const CHUNK = 65536;
+        const CHUNK = 262144; // 64KB→256KB：分块固定开销摊薄4倍提速（三端一致）
         const totalChunks = Math.ceil(file.size / CHUNK);
+        log('开始发送下载:', msg.fileName, file.size + 'B', 'offset=' + (msg.offset || 0));
 
         addTransfer(msg.fileName, 'download', file.size);
-        sendJSON({ type: 'file-meta', fileName: msg.fileName, fileSize: file.size, totalChunks });
+        sendJSON({ type: 'file-meta', fileName: msg.fileName, fileSize: file.size, totalChunks, offset: msg.offset || 0 });
 
         const startTime = performance.now();
         const t = transfers.value.find(x => x.fileName === msg.fileName && x.status === 'transferring');
@@ -695,11 +824,16 @@ createApp({
           const buf = await chunk.arrayBuffer();
 
           while (peer._channel && peer._channel.bufferedAmount > 8388608) await new Promise(r => setTimeout(r, 5));
+          // 服务器中转(relay)时限速 500KB/s；P2P 直连不限速
+          await waitSendPermit(buf.byteLength);
           peer.send(buf);
 
           if (t) {
             t.transferred = end;
             t.progress = Math.round(end / file.size * 100);
+            if (shouldLogProgress(end)) {
+              log('发送进度:', msg.fileName, end + '/' + file.size + 'B');
+            }
             const elapsed = (performance.now() - startTime) / 1000;
             t.speed = (end / 1048576 / elapsed).toFixed(2);
           }
@@ -707,8 +841,9 @@ createApp({
 
         sendJSON({ type: 'file-complete', fileName: msg.fileName, fileSize: file.size });
         if (t) { t.status = 'done'; t.progress = 100; }
+        log('发送下载完成:', msg.fileName);
       } catch (e) {
-        console.error('发送文件失败:', e);
+        logErr('发送文件失败:', e);
       }
     }
 

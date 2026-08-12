@@ -51,6 +51,14 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  // 窗口关闭时直接终止进程：flutter_windows.dll 引擎析构阶段存在崩溃
+  // （0xc0000005/0xc000041d，偏移 0x14f27），走正常退出流程会导致进程
+  // 异常残留并锁定 exe 文件（无法删除/替换）。直接终止由系统回收所有句柄。
+  if (message == WM_CLOSE) {
+    ::ExitProcess(0);
+    return 0;
+  }
+
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =

@@ -35,6 +35,8 @@ class TransferItem {
   String status; // transferring | done | error
   String speed;
   final DateTime startTime;
+  final String clientName; // 手机端用户名（多用户区分）
+  final String clientId; // 手机端会话标识（断开/超时时精确标记失败记录）
 
   TransferItem({
     required this.id,
@@ -45,6 +47,8 @@ class TransferItem {
     this.transferred = 0,
     this.status = 'transferring',
     this.speed = '',
+    this.clientName = '',
+    this.clientId = '',
   });
 
   double get progress => total > 0 ? (transferred / total).clamp(0.0, 1.0) : 0.0;

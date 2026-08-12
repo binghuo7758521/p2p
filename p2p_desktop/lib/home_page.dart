@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'connect_page.dart';
 import 'host_controller.dart';
 import 'models.dart';
+import 'share_manage_page.dart';
 
 /// 电脑端主界面：共享目录浏览 + 传输记录
 class HomePage extends StatefulWidget {
@@ -27,6 +28,15 @@ class _HomePageState extends State<HomePage> {
                 controller.state == HostState.peerConnected;
             final waiting =
                 controller.state == HostState.registered;
+            // 在线用户（第一个为管理员）
+            final onlineUsers = controller.users.values
+                .where((u) => u.online)
+                .toList();
+            final onlineDesc = onlineUsers.isEmpty
+                ? '未连接'
+                : '已连接 ${onlineUsers.length} 台手机'
+                    '${onlineUsers.length == 1 && onlineUsers.first.isAdmin ? '（管理员）' : ''}'
+                    ' · 配对码 ${controller.pairCode}';
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -34,7 +44,7 @@ class _HomePageState extends State<HomePage> {
                     style: const TextStyle(fontSize: 18)),
                 Text(
                   connected
-                      ? '已连接: ${controller.clientName ?? '手机'} · 配对码 ${controller.pairCode}'
+                      ? onlineDesc
                       : waiting
                           ? '等待手机连接 · 配对码 ${controller.pairCode}'
                           : '未连接',
@@ -46,11 +56,28 @@ class _HomePageState extends State<HomePage> {
                               ? Colors.orange
                               : Colors.redAccent),
                 ),
+                if (connected) ...[const SizedBox(height: 2), _ConnBadge(controller: controller)],
               ],
             );
           },
         ),
         actions: [
+          ListenableBuilder(
+            listenable: controller,
+            // 共享文件夹管理：连接成功后始终可见
+            builder: (context, _) =>
+                controller.state == HostState.peerConnected
+                    ? IconButton(
+                        tooltip: '共享文件夹管理',
+                        icon: const Icon(Icons.folder_shared),
+                        onPressed: () {
+                          Navigator.of(context).push(MaterialPageRoute(
+                              builder: (_) =>
+                                  ShareManagePage(controller: controller)));
+                        },
+                      )
+                    : const SizedBox.shrink(),
+          ),
           IconButton(
             tooltip: '断开连接',
             icon: const Icon(Icons.link_off),
@@ -262,8 +289,8 @@ class _TransfersPanel extends StatelessWidget {
                 )
               : ListView.builder(
                   itemCount: items.length,
-                  itemBuilder: (context, i) =>
-                      _TransferTile(item: items[i]),
+                  itemBuilder: (context, i) => _TransferTile(
+                      item: items[i], connLabel: controller.connTypeLabel),
                 ),
         ),
       ],
@@ -271,10 +298,36 @@ class _TransfersPanel extends StatelessWidget {
   }
 }
 
+class _ConnBadge extends StatelessWidget {
+  final HostController controller;
+
+  const _ConnBadge({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final relay = controller.connTypeLabel.contains('服务器中转');
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        color: (relay ? Colors.orange : Colors.green).withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        controller.connTypeLabel,
+        style: TextStyle(
+          fontSize: 10,
+          color: relay ? Colors.orange : Colors.green,
+        ),
+      ),
+    );
+  }
+}
+
 class _TransferTile extends StatelessWidget {
   final TransferItem item;
+  final String connLabel;
 
-  const _TransferTile({required this.item});
+  const _TransferTile({required this.item, required this.connLabel});
 
   @override
   Widget build(BuildContext context) {
@@ -282,6 +335,7 @@ class _TransferTile extends StatelessWidget {
     final done = item.status == 'done';
     final error = item.status == 'error';
     final icon = isUpload ? Icons.upload : Icons.download;
+    final direct = connLabel.contains('直连');
 
     return ListTile(
       leading: Icon(
@@ -302,10 +356,30 @@ class _TransferTile extends StatelessWidget {
             LinearProgressIndicator(value: item.progress, minHeight: 4),
           const SizedBox(height: 4),
           Text(
+            '${item.clientName.isNotEmpty ? '${item.clientName} · ' : ''}'
             '${isUpload ? '手机 → 电脑' : '电脑 → 手机'}  '
             '${_fmtSize(item.transferred)} / ${_fmtSize(item.total)}'
             '${item.speed.isNotEmpty ? '  ${item.speed}' : ''}',
             style: const TextStyle(fontSize: 12),
+          ),
+          const SizedBox(height: 2),
+          // 连接方式：P2P直连(绿) / 服务器中转(橙)，直观告知用户传输通道
+          Row(
+            children: [
+              Icon(
+                direct ? Icons.link : Icons.hub,
+                size: 12,
+                color: direct ? Colors.green : Colors.orange,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                connLabel,
+                style: TextStyle(
+                  fontSize: 10,
+                  color: direct ? Colors.green : Colors.orange,
+                ),
+              ),
+            ],
           ),
         ],
       ),

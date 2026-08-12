@@ -18,6 +18,41 @@ class FileEntry {
   bool get isDirectory => type == 'directory';
 }
 
+/// 共享目录（管理员共享给用户的文件夹）
+class ShareEntry {
+  final String token; // 共享码
+  final String folder; // 电脑端文件夹绝对路径
+  final List<String> perms; // download / upload / delete
+  final String? targetDeviceId; // 目标设备 id（null=未绑定/公开）
+  final String? targetPhone; // 目标手机号（null=未指定/公开）
+
+  const ShareEntry({
+    required this.token,
+    required this.folder,
+    required this.perms,
+    this.targetDeviceId,
+    this.targetPhone,
+  });
+
+  factory ShareEntry.fromJson(Map<String, dynamic> json) => ShareEntry(
+        token: json['token']?.toString() ?? '',
+        folder: json['folder']?.toString() ?? '',
+        perms: (json['perms'] as List? ?? [])
+            .map((e) => e.toString())
+            .toList(),
+        targetDeviceId: json['targetDeviceId']?.toString(),
+        targetPhone: json['targetPhone']?.toString(),
+      );
+
+  String get name => folder.split('/').last;
+  bool get canDownload => perms.contains('download');
+  bool get canUpload => perms.contains('upload');
+  bool get canDelete => perms.contains('delete');
+
+  /// 公开共享（二维码）：未指定目标设备与手机号
+  bool get isPublic => targetDeviceId == null && targetPhone == null;
+}
+
 /// 传输记录（下载 / 上传）
 class TransferItem {
   final String id;
@@ -28,6 +63,9 @@ class TransferItem {
   String status; // transferring | done | error
   String speed;
   final DateTime startTime;
+  /// 传输时的连接方式快照：direct=点对点直连 relay=服务器中转 unknown=未探测
+  /// （显示在传输记录上的是本次传输实际使用的方式，而非当前连接状态）
+  String connType;
   /// 上传：手机端本地文件路径（断点续传定位用）
   final String? localPath;
   /// 下载：电脑端文件路径（断点续传用）
@@ -42,11 +80,42 @@ class TransferItem {
     this.transferred = 0,
     this.status = 'transferring',
     this.speed = '',
+    this.connType = 'unknown',
     this.localPath,
     this.remotePath,
   });
 
   double get progress => total > 0 ? (transferred / total).clamp(0.0, 1.0) : 0.0;
+
+  /// 持久化到本地（App 重启后仍保留最近 7 天传输记录）
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'fileName': fileName,
+        'direction': direction,
+        'total': total,
+        'transferred': transferred,
+        'status': status,
+        'speed': speed,
+        'startTime': startTime.toIso8601String(),
+        'connType': connType,
+        if (localPath != null) 'localPath': localPath,
+        if (remotePath != null) 'remotePath': remotePath,
+      };
+
+  factory TransferItem.fromJson(Map<String, dynamic> j) => TransferItem(
+        id: j['id']?.toString() ?? '',
+        fileName: j['fileName']?.toString() ?? '',
+        direction: j['direction']?.toString() ?? 'download',
+        total: (j['total'] as num?)?.toInt() ?? 0,
+        transferred: (j['transferred'] as num?)?.toInt() ?? 0,
+        status: j['status']?.toString() ?? 'error',
+        speed: j['speed']?.toString() ?? '',
+        startTime: DateTime.tryParse(j['startTime']?.toString() ?? '') ??
+            DateTime.now(),
+        connType: j['connType']?.toString() ?? 'unknown',
+        localPath: j['localPath']?.toString(),
+        remotePath: j['remotePath']?.toString(),
+      );
 
   void update(int transferredBytes, int elapsedMs) {
     transferred = transferredBytes;

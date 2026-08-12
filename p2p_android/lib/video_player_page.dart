@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
 import 'app_controller.dart';
+import 'app_log.dart';
 import 'models.dart';
 
 /// 在线视频播放页：边下边播（下载同时通过本地 HTTP 流式播放）
@@ -55,12 +56,19 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
         await p.dispose();
         return;
       }
+      AppLog.i('play', '播放器初始化成功: ${widget.entry.name}');
       setState(() => _player = p);
-    } catch (_) {
+    } catch (e) {
       await p.dispose();
       // 数据不足导致初始化失败：继续重试（最多 60 次 ≈ 36 秒）
       _initFails++;
-      if (_initFails >= 60) _checkTimer?.cancel();
+      if (_initFails == 1 || _initFails % 10 == 0) {
+        AppLog.w('play', '播放器初始化失败(第$_initFails次): ${widget.entry.name} $e');
+      }
+      if (_initFails >= 60) {
+        AppLog.e('play', '播放器初始化重试次数耗尽，放弃: ${widget.entry.name}');
+        _checkTimer?.cancel();
+      }
     }
   }
 
