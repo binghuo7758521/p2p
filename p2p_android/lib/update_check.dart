@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'app_log.dart';
 import 'version.dart';
@@ -54,10 +56,116 @@ Future<UpdateInfo?> checkAndroidUpdate() async {
   }
 }
 
-/// 打开系统浏览器下载升级包（APK）
-Future<void> openDownloadUrl(String relativeUrl) async {
+/// 升级包安装结果（main.dart 据此提示用户）
+enum InstallResult { installed, needPermission, cancelled, failed }
+
+/// 原生安装通道（MainActivity p2p/install）
+const MethodChannel _installChannel = MethodChannel('p2p/install');
+
+/// App 内下载升级包并拉起系统安装器（v4.9+）
+/// 升级包存于对象存储（OSS 默认公网域名禁止浏览器匿名下载 .apk），
+/// 改为 App 内下载：跟随 302 到对象存储直链，保存为 APK 后调用安装器
+/// v5.2：Android 8+ 未授权"安装未知应用"时引导用户去系统设置开启，
+/// 开启后自动继续安装；安装器拉起失败不再静默，返回 failed 供 UI 提示
+Future<InstallResult> downloadAndInstallApk(
+  String relativeUrl, {
+  BuildContext? context,
+  void Function(int received, int total)? onProgress,
+}) async {
   final url = '$defaultServerUrl$relativeUrl';
-  AppLog.i('update', '打开下载地址: $url');
-  final ok = await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
-  if (!ok) AppLog.e('update', '打开下载地址失败: $url');
+  AppLog.i('update', '开始下载升级包: $url');
+  final client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 15);
+  try {
+    final req = await client.getUrl(Uri.parse(url));
+    final resp = await req.close();
+    if (resp.statusCode != 200) {
+      AppLog.e('update', '下载失败: HTTP ${resp.statusCode}');
+      return InstallResult.failed;
+    }
+    final total =
+        int.tryParse(resp.headers.value('content-length') ?? '') ?? 0;
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/app-release.apk');
+    final sink = file.openWrite();
+    var received = 0;
+    await for (final chunk in resp) {
+      received += chunk.length;
+      sink.add(chunk);
+      onProgress?.call(received, total);
+    }
+    await sink.close();
+    client.close();
+    AppLog.i('update', '升级包下载完成: ${file.path} ($received 字节)');
+    if (context != null && !context.mounted) return InstallResult.cancelled;
+    return _installWithGuide(context, file.path);
+  } catch (e) {
+    AppLog.e('update', '升级包下载异常', e);
+    return InstallResult.failed;
+  } finally {
+    client.close(force: true);
+  }
+}
+
+/// 拉起系统安装器；返回 true 表示需要用户先开启"安装未知应用"授权
+Future<bool> _invokeInstall(String path) async {
+  try {
+    final r = await _installChannel
+        .invokeMethod('installApk', {'path': path}) as Map?;
+    return r?['needPermission'] == true;
+  } on PlatformException catch (e) {
+    AppLog.e('update', '拉起安装器失败: ${e.code} ${e.message}');
+    return false;
+  }
+}
+
+/// 安装主流程：先尝试拉起安装器，未授权时引导开启后轮询自动继续
+Future<InstallResult> _installWithGuide(BuildContext? context, String path) async {
+  final need = await _invokeInstall(path);
+  if (!need) return InstallResult.installed;
+  AppLog.i('update', '未授权安装未知应用，引导用户开启');
+  if (context == null) return InstallResult.failed;
+  if (!context.mounted) return InstallResult.cancelled;
+  final go = await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => AlertDialog(
+      icon: const Icon(Icons.security, color: Colors.orange),
+      title: const Text('需要安装权限'),
+      content: const Text(
+          '系统要求先允许 P2P 文件助手安装未知来源应用，才能安装升级包。\n\n'
+          '点击"去开启"后将跳转系统设置，开启后会自动继续安装。'),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消')),
+        FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('去开启')),
+      ],
+    ),
+  );
+  if (go != true || !context.mounted) return InstallResult.cancelled;
+  try {
+    await _installChannel.invokeMethod('openInstallSettings');
+  } catch (e) {
+    AppLog.w('update', '跳转安装权限设置失败', e);
+  }
+  // 轮询等待用户开启授权（最多 60 秒），开启后自动拉起安装器
+  for (var i = 0; i < 120; i++) {
+    await Future.delayed(const Duration(milliseconds: 500));
+    if (!context.mounted) return InstallResult.cancelled;
+    try {
+      final ok = await _installChannel.invokeMethod('canInstallUnknown') as bool?;
+      if (ok == true) {
+        AppLog.i('update', '安装权限已开启，继续安装');
+        final needAgain = await _invokeInstall(path);
+        return needAgain ? InstallResult.failed : InstallResult.installed;
+      }
+    } catch (e) {
+      AppLog.w('update', '查询安装权限失败', e);
+    }
+  }
+  AppLog.w('update', '等待安装权限开启超时');
+  return InstallResult.cancelled;
 }

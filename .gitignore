@@ -21,6 +21,9 @@ p2p_desktop/windows/flutter/ephemeral/
 p2p_desktop/windows/flutter/generated_plugin_registrant.cc
 p2p_desktop/windows/flutter/generated_plugin_registrant.h
 p2p_desktop/windows/flutter/generated_plugins.cmake
+p2p_usb_id/windows/flutter/generated_plugin_registrant.cc
+p2p_usb_id/windows/flutter/generated_plugin_registrant.h
+p2p_usb_id/windows/flutter/generated_plugins.cmake
 p2p_desktop/ios/Flutter/ephemeral/
 p2p_android/.gradle/
 p2p_android/local.properties

@@ -16,6 +16,7 @@ import 'models.dart';
 import 'protocol.dart';
 import 'scan_page.dart';
 import 'share_browse_page.dart';
+import 'share_center_page.dart';
 import 'users_page.dart';
 import 'version.dart';
 import 'video_play_service.dart';
@@ -86,6 +87,199 @@ class _HomePageState extends State<HomePage> {
         pendingShareToken: result.shareToken,
       ),
     ));
+  }
+
+  // ── 主页内切换连接目标（电脑/共享文件夹） ────────────────
+
+  /// 历史条目标题：电脑用码尾 4 位区分；共享用共享文件夹名
+  String _historyTitle(PairInfo h) {
+    if (h.name != null && h.name!.isNotEmpty) return h.name!;
+    return h.isShare ? '共享文件夹' : '电脑 ${_codeSuffix(h.code)}';
+  }
+
+  /// 配对码尾 4 位（多台电脑区分标识）
+  static String _codeSuffix(String code) =>
+      code.length >= 4 ? code.substring(code.length - 4) : code;
+
+  /// 最近连接时间的相对描述
+  static String _fmtTime(DateTime? t) {
+    if (t == null) return '';
+    final d = DateTime.now().difference(t);
+    if (d.inMinutes < 1) return '刚刚';
+    if (d.inHours < 1) return '${d.inMinutes} 分钟前';
+    if (d.inDays < 1) return '${d.inHours} 小时前';
+    return '${d.inDays} 天前';
+  }
+
+  /// 当前连接目标是否为该历史条目（已连接则无需切换）
+  bool _isCurrentTarget(PairInfo info, AppController c) {
+    final srv = c.lastServerUrl?.replaceAll(RegExp(r'/$'), '') ?? '';
+    final code = c.lastPairCode?.trim().toUpperCase() ?? '';
+    if (srv.isEmpty || code.isEmpty) return false;
+    if (info.server.replaceAll(RegExp(r'/$'), '') != srv) return false;
+    if (info.code.trim().toUpperCase() != code) return false;
+    // 共享记录仅当当前为共享访客时视为同一目标
+    return info.isShare ? c.isShareGuest : !c.isShareGuest;
+  }
+
+  /// 弹出历史设备列表（主页内切换连接目标）
+  Future<void> _showSwitchSheet() async {
+    final c = widget.controller;
+    final list = await c.loadPairInfos();
+    if (!mounted) return;
+    if (list.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('暂无历史记录，请先扫码或输入配对码连接')));
+      return;
+    }
+    final history = List<PairInfo>.from(list);
+    final connected = c.state == ConnectState.peerConnected;
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) {
+          final theme = Theme.of(ctx);
+          return SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+                  child: Row(
+                    children: [
+                      Text('切换连接目标',
+                          style: theme.textTheme.titleMedium
+                              ?.copyWith(fontWeight: FontWeight.bold)),
+                      const Spacer(),
+                      Text('点击条目即可切换',
+                          style: theme.textTheme.bodySmall
+                              ?.copyWith(color: Colors.grey)),
+                    ],
+                  ),
+                ),
+                Flexible(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                    itemCount: history.length,
+                    itemBuilder: (_, i) {
+                      final h = history[i];
+                      final isCurrent = connected && _isCurrentTarget(h, c);
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        elevation: 0,
+                        color: theme.colorScheme.surfaceContainerHighest
+                            .withValues(alpha: 0.5),
+                        child: ListTile(
+                          dense: true,
+                          leading: Icon(
+                              h.isShare
+                                  ? Icons.folder_shared
+                                  : Icons.desktop_windows,
+                              color: h.isShare
+                                  ? const Color(0xFF38BDF8)
+                                  : theme.colorScheme.primary),
+                          title: Text(
+                              isCurrent &&
+                                      c.hostName != null &&
+                                      c.hostName != '电脑'
+                                  ? c.hostName!
+                                  : _historyTitle(h)),
+                          subtitle: Text(
+                            '${h.isShare ? '' : '配对码 ${h.code}'}'
+                            '${_fmtTime(h.lastAt).isEmpty ? '' : ' · ${_fmtTime(h.lastAt)}'}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (isCurrent)
+                                const Icon(Icons.check_circle,
+                                    color: Colors.green, size: 20),
+                              IconButton(
+                                icon: const Icon(Icons.delete_outline,
+                                    size: 20),
+                                tooltip: '删除记录',
+                                onPressed: () => _removeHistoryItem(
+                                    ctx, h, history, setSheetState, c),
+                              ),
+                            ],
+                          ),
+                          onTap: () async {
+                            Navigator.of(ctx).pop();
+                            if (isCurrent) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                      content: Text('已连接该设备')));
+                              return;
+                            }
+                            await _switchTo(h);
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  /// 切换连接目标：断开当前连接后连接所选设备（失败立即提示）
+  Future<void> _switchTo(PairInfo info) async {
+    final c = widget.controller;
+    AppLog.i('connect', '主页切换连接: ${info.isShare ? '共享' : '电脑'} code=${info.code}');
+    c.autoMode = false; // 手动切换：失败立即提示，不自动重试
+    await c.disconnect();
+    await c.connect(info.server, info.code.toUpperCase(),
+        shareToken: info.shareToken);
+    // 等待连接结果，失败时提示（主页无连接页的配对等待循环）
+    for (var i = 0; i < 30 && mounted; i++) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      if (c.state == ConnectState.peerConnected) break;
+      if (c.state == ConnectState.error) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text('切换失败：${c.errorMessage ?? '连接失败'}')));
+        }
+        break;
+      }
+    }
+  }
+
+  /// 删除历史记录（底部弹窗内调用，确认后移除）
+  Future<void> _removeHistoryItem(
+      BuildContext ctx,
+      PairInfo info,
+      List<PairInfo> history,
+      StateSetter setSheetState,
+      AppController c) async {
+    final ok = await showDialog<bool>(
+      context: ctx,
+      builder: (dctx) => AlertDialog(
+        title: const Text('删除记录'),
+        content:
+            Text('删除后将不再显示「${_historyTitle(info)}」\n确认删除？'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(dctx).pop(false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.of(dctx).pop(true),
+              child: const Text('删除')),
+        ],
+      ),
+    );
+    if (ok != true || !ctx.mounted) return;
+    await c.removePairInfo(info.server, info.code,
+        shareToken: info.shareToken);
+    setSheetState(() => history
+        .removeWhere((h) => h.server == info.server && h.code == info.code));
   }
 
   /// 显示操作结果提示（共享附加/删除等，显示后自动清除）
@@ -280,61 +474,49 @@ class _HomePageState extends State<HomePage> {
               children: [
                 Text('P2P 文件助手 v$appVersion',
                     style: const TextStyle(fontSize: 18)),
-                Text(
-                  connected
-                      ? '已连接: ${controller.hostName ?? '电脑'}'
-                      : '未连接',
-                  style: TextStyle(
-                      fontSize: 12,
-                      color: connected ? Colors.green : Colors.redAccent),
-                ),
-                if (connected) ...[const SizedBox(width: 6), _ConnBadge(controller: controller)],
+                // 电脑名称与连接方式同行显示：名称过长时省略号截断，
+                // 不再溢出截断（v5.1 标题区优化）
+                if (connected)
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          '已连接: ${controller.hostName ?? '电脑'}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontSize: 12, color: Colors.green),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      _ConnBadge(controller: controller),
+                    ],
+                  )
+                else
+                  const Text('未连接',
+                      style: TextStyle(
+                          fontSize: 12, color: Colors.redAccent)),
               ],
             );
           },
         ),
         actions: [
+          // “共享给我的”入口（v4.8+）：登录后常显，免配对码连接服务器共享
+          if (AuthService.instance.token != null &&
+              AuthService.instance.token!.isNotEmpty)
+            IconButton(
+              tooltip: '共享给我的',
+              icon: const Icon(Icons.inbox_outlined),
+              onPressed: () {
+                Navigator.of(context).push(MaterialPageRoute(
+                    builder: (_) =>
+                        ShareCenterPage(controller: controller)));
+              },
+            ),
           IconButton(
             tooltip: '扫共享二维码',
             icon: const Icon(Icons.qr_code_scanner),
             onPressed: _scanShareCode,
-          ),
-          ListenableBuilder(
-            listenable: controller,
-            // 共享文件夹管理入口（仅管理员显示）：
-            // 非管理员/共享访客无权限，不再展示
-            builder: (context, _) =>
-                controller.state == ConnectState.peerConnected &&
-                        controller.isAdmin
-                    ? IconButton(
-                        tooltip: '共享文件夹管理',
-                        icon: const Icon(Icons.folder_shared_outlined),
-                        onPressed: () {
-                          controller.refreshUserList();
-                          Navigator.of(context).push(MaterialPageRoute(
-                              builder: (_) =>
-                                  UsersPage(controller: controller)));
-                        },
-                      )
-                    : const SizedBox.shrink(),
-          ),
-          IconButton(
-            tooltip: '复制运行日志',
-            icon: const Icon(Icons.article_outlined),
-            onPressed: () async {
-              final logText = await AppLog.readLog();
-              if (!context.mounted) return;
-              await Clipboard.setData(ClipboardData(text: logText));
-              if (!context.mounted) return;
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                content: Text('运行日志已复制，请直接粘贴给开发者排查'),
-              ));
-            },
-          ),
-          IconButton(
-            tooltip: '上传日志给开发者',
-            icon: const Icon(Icons.cloud_upload_outlined),
-            onPressed: _uploadLog,
           ),
           IconButton(
             tooltip: '断开连接',
@@ -342,6 +524,60 @@ class _HomePageState extends State<HomePage> {
             onPressed: () async {
               // 断开后停留在主页（未连接引导视图），不再强制跳连接页
               await controller.disconnect();
+            },
+          ),
+          // ⋮ 更多：低频操作收纳（菜单项在弹出时实时读取连接/管理员状态）
+          PopupMenuButton<String>(
+            tooltip: '更多',
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) async {
+              switch (value) {
+                case 'switch':
+                  _showSwitchSheet();
+                case 'manage':
+                  controller.refreshUserList();
+                  Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => UsersPage(controller: controller)));
+                case 'copy_log':
+                  final logText = await AppLog.readLog();
+                  if (!context.mounted) return;
+                  await Clipboard.setData(ClipboardData(text: logText));
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('运行日志已复制，请直接粘贴给开发者排查'),
+                  ));
+                case 'upload_log':
+                  _uploadLog();
+              }
+            },
+            itemBuilder: (context) {
+              final connected =
+                  controller.state == ConnectState.peerConnected;
+              return [
+                const PopupMenuItem(
+                  value: 'switch',
+                  child: _MenuRow(
+                      icon: Icons.swap_horiz, label: '切换连接目标'),
+                ),
+                if (connected && controller.isAdmin)
+                  const PopupMenuItem(
+                    value: 'manage',
+                    child: _MenuRow(
+                        icon: Icons.folder_shared_outlined,
+                        label: '共享文件夹管理'),
+                  ),
+                const PopupMenuItem(
+                  value: 'copy_log',
+                  child: _MenuRow(
+                      icon: Icons.article_outlined, label: '复制运行日志'),
+                ),
+                const PopupMenuItem(
+                  value: 'upload_log',
+                  child: _MenuRow(
+                      icon: Icons.cloud_upload_outlined,
+                      label: '上传日志给开发者'),
+                ),
+              ];
             },
           ),
         ],
@@ -400,6 +636,25 @@ class _HomePageState extends State<HomePage> {
           );
         },
       ),
+    );
+  }
+}
+
+/// 更多菜单项：图标 + 文字（v5.1 低频操作收纳进 ⋮ 菜单）
+class _MenuRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+
+  const _MenuRow({required this.icon, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Icon(icon, size: 20, color: Colors.grey.shade700),
+        const SizedBox(width: 12),
+        Text(label),
+      ],
     );
   }
 }

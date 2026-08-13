@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 升级包安装：允许 FileProvider 共享应用私有目录（app_flutter 下保存的 APK） -->
+<paths>
+    <files-path name="files" path="." />
+</paths>

@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
+import 'dart:io';
+
+import 'app_log.dart';
 import 'auto_start.dart';
 import 'home_page.dart';
 import 'host_controller.dart';
+import 'license_check.dart';
 import 'update_check.dart';
 import 'usb_drives.dart';
 import 'version.dart';
@@ -29,15 +33,19 @@ class _ConnectPageState extends State<ConnectPage> {
   List<UsbDriveInfo> _usbDrives = [];
   bool _usbLoading = true;
 
+  // ── U盘授权验证状态 ──
+  bool _licensing = false; // 验证中
+  bool _licenseDenied = false; // 未授权/验证失败，锁定程序
+  LicenseResult? _licenseResult;
+
   @override
   void initState() {
     super.initState();
     _loadAutoStart();
-    _checkUpdate();
     _loadUsbDrives();
-    // 启动后自动注册上线：无需手动点击「连接并生成配对码」
+    // 启动流程：先 U盘授权验证，通过后再自动注册上线
     // （等首帧渲染完成再发起，避免 setState 时机问题）
-    WidgetsBinding.instance.addPostFrameCallback((_) => _connect());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _startLicenseCheck());
   }
 
   /// 枚举所有 U 盘（GetVolumeInformation 对每个盘符一次查询，耗时可控）
@@ -48,37 +56,6 @@ class _ConnectPageState extends State<ConnectPage> {
       _usbDrives = drives;
       _usbLoading = false;
     });
-  }
-
-  /// 启动时检查升级：服务器有新版本时弹窗提示（每次启动检查一次）
-  Future<void> _checkUpdate() async {
-    final info = await checkDesktopUpdate();
-    if (!mounted || info == null || !info.needUpdate) return;
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        icon: const Icon(Icons.system_update_alt, color: Color(0xFF38BDF8)),
-        title: Text('发现新版本 v${info.latest}'),
-        content: Text(
-          '当前版本 v$appVersion\n\n${info.notes}\n\n'
-          '升级包下载后：解压覆盖原程序目录（先关闭正在运行的程序）',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('稍后'),
-          ),
-          FilledButton.icon(
-            onPressed: () {
-              Navigator.of(ctx).pop();
-              if (info.url != null) openDownloadUrl(info.url!);
-            },
-            icon: const Icon(Icons.download, size: 18),
-            label: const Text('立即下载'),
-          ),
-        ],
-      ),
-    );
   }
 
   Future<void> _loadAutoStart() async {
@@ -109,6 +86,29 @@ class _ConnectPageState extends State<ConnectPage> {
 
   Future<void> _start() => _connect();
 
+  /// U盘授权验证：本机U盘ID在服务器白名单中才允许使用；
+  /// 未授权给出购买方式并锁定；服务器不可达也锁定并提示重试
+  Future<void> _startLicenseCheck() async {
+    setState(() {
+      _licensing = true;
+      _licenseDenied = false;
+    });
+    final result = await verifyLicense(defaultServerUrl);
+    if (!mounted) return;
+    if (!result.licensed) {
+      setState(() {
+        _licensing = false;
+        _licenseDenied = true;
+        _licenseResult = result;
+      });
+      AppLog.w('license', result.error ??
+          '未授权U盘，程序锁定（购买方式: ${result.buyWechat} / ${result.buyPhone}）');
+      return;
+    }
+    setState(() => _licensing = false);
+    await _connect();
+  }
+
   /// 连接信令服务器并注册为在线主机
   /// 默认连接公网信令服务器；默认共享「我的电脑」，手动选择后按所选目录共享
   Future<void> _connect() async {
@@ -133,6 +133,17 @@ class _ConnectPageState extends State<ConnectPage> {
         );
         return;
       }
+      // 已有管理员（本地持久化过 adminPhone）：不再停留扫码页，
+      // 直接进入主页面等待手机连接（状态变化由 ListenableBuilder 自动刷新）
+      if (s == HostState.registered &&
+          (c.adminPhone?.isNotEmpty ?? false)) {
+        if (!mounted) return;
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(
+              builder: (_) => HomePage(controller: c)),
+        );
+        return;
+      }
       if (s == HostState.idle && c.errorMessage != null) {
         if (!mounted) return;
         setState(() => _connecting = false);
@@ -146,10 +157,120 @@ class _ConnectPageState extends State<ConnectPage> {
         .showSnackBar(SnackBar(content: Text(msg)));
   }
 
+  /// 未授权锁定页：说明原因 + 购买方式 + 重新验证/退出
+  Widget _buildLicenseDenied(ThemeData theme) {
+    final r = _licenseResult;
+    final reachable = r?.reachable ?? false;
+    final buyLines = [
+      if (r != null && r.buyTitle.isNotEmpty) r.buyTitle,
+      if (r != null && r.buyWechat.isNotEmpty) r.buyWechat,
+      if (r != null && r.buyPhone.isNotEmpty) r.buyPhone,
+    ];
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 480),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Icon(reachable ? Icons.usb_off : Icons.cloud_off,
+                      size: 72, color: Colors.redAccent),
+                  const SizedBox(height: 16),
+                  Text(
+                    reachable ? '未授权使用' : '无法验证授权',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.headlineSmall?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: Colors.redAccent),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    reachable
+                        ? '当前电脑未检测到已授权的U盘，程序无法使用。\n'
+                            '请插入已授权的U盘后重新验证。'
+                        : (r?.error ?? '网络异常'),
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodyMedium
+                        ?.copyWith(color: Colors.grey),
+                  ),
+                  if (reachable && buyLines.isNotEmpty) ...[
+                    const SizedBox(height: 20),
+                    Card(
+                      margin: EdgeInsets.zero,
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          children: [
+                            for (final line in buyLines)
+                              Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 3),
+                                child: Text(
+                                  line,
+                                  textAlign: TextAlign.center,
+                                  style: theme.textTheme.titleSmall?.copyWith(
+                                      color: const Color(0xFFF59E0B)),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 24),
+                  FilledButton.icon(
+                    onPressed:
+                        _licensing ? null : () => _startLicenseCheck(),
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('重新验证'),
+                    style: FilledButton.styleFrom(
+                        padding:
+                            const EdgeInsets.symmetric(vertical: 14)),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton(
+                    onPressed: () => exit(0),
+                    child: const Text('退出程序'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = widget.controller;
     final theme = Theme.of(context);
+
+    // 授权验证中
+    if (_licensing) {
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const CircularProgressIndicator(),
+              const SizedBox(height: 20),
+              Text('正在验证U盘授权…',
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(color: Colors.grey)),
+            ],
+          ),
+        ),
+      );
+    }
+    // 未授权 / 验证失败：锁定并展示购买方式
+    if (_licenseDenied) {
+      return _buildLicenseDenied(theme);
+    }
 
     return Scaffold(
       body: SafeArea(

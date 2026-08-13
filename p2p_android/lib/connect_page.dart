@@ -43,6 +43,13 @@ class _ConnectPageState extends State<ConnectPage> {
   final _codeCtrl = TextEditingController();
   bool _submitted = false;
 
+  /// 配对历史（最近连接过的电脑/共享文件夹）
+  List<PairInfo> _history = [];
+  bool _historyLoaded = false;
+
+  /// 当前连接携带的共享码（历史共享条目/扫码共享二维码时非空）
+  String? _connectShareToken;
+
   @override
   void initState() {
     super.initState();
@@ -59,16 +66,27 @@ class _ConnectPageState extends State<ConnectPage> {
     } else if (widget.pendingShareToken != null) {
       // 扫描共享二维码：立即连接（携带共享码加入共享目录）
       widget.controller.autoMode = false;
+      _connectShareToken = widget.pendingShareToken;
       _connect(shareToken: widget.pendingShareToken);
     }
   }
 
-  /// 读取上次配对信息并自动连接（无需再次扫码/输入）
+  /// 读取配对历史并决定是否自动直连：
+  /// 仅一台电脑记录 → 自动直连（与旧版行为一致）；
+  /// 多台电脑/有共享记录 → 停留连接页展示列表供用户选择
   Future<void> _loadSavedAndAutoConnect() async {
-    AppLog.i('connect', '冷启动自动直连模式，读取历史配对信息…');
-    final info = await widget.controller.loadPairInfo();
-    if (!mounted || info == null) return;
-    AppLog.i('connect', '自动直连: server=${info.server} (autoMode=${widget.controller.autoMode})');
+    AppLog.i('connect', '冷启动自动直连模式，读取配对历史…');
+    final list = await widget.controller.loadPairInfos();
+    if (!mounted) return;
+    setState(() {
+      _history = list;
+      _historyLoaded = true;
+    });
+    final pcList = list.where((p) => !p.isShare).toList();
+    if (pcList.length != 1) return; // 0 台停留连接页；多台让用户选择
+    final info = pcList.first;
+    AppLog.i('connect',
+        '自动直连: server=${info.server} (autoMode=${widget.controller.autoMode})');
     _server = info.server;
     _codeCtrl.text = info.code.toUpperCase();
     setState(() => _submitted = true);
@@ -85,9 +103,51 @@ class _ConnectPageState extends State<ConnectPage> {
     super.dispose();
   }
 
+  /// 从历史列表选择连接（电脑或共享文件夹）
+  Future<void> _connectFromHistory(PairInfo info) async {
+    // 手动选择：失败立即提示，不自动重试
+    widget.controller.autoMode = false;
+    _server = info.server;
+    _codeCtrl.text = info.code.toUpperCase();
+    _connectShareToken = info.shareToken;
+    setState(() => _submitted = true);
+    AppLog.i('connect',
+        '从历史选择连接: ${info.isShare ? '共享' : '电脑'} code=${info.code}');
+    await widget.controller.connect(info.server, info.code.toUpperCase(),
+        shareToken: info.shareToken);
+    if (!mounted) return;
+    await _waitForPair();
+  }
+
+  /// 删除一条配对历史（确认后移除）
+  Future<void> _removeHistory(PairInfo info) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除记录'),
+        content: Text('删除后将不再显示「${info.name ?? '电脑 ${_codeSuffix(info.code)}'}」\n确认删除？'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('删除')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    await widget.controller
+        .removePairInfo(info.server, info.code, shareToken: info.shareToken);
+    if (!mounted) return;
+    setState(() => _history.removeWhere(
+        (h) => h.server == info.server && h.code == info.code));
+  }
+
   Future<void> _connect({String? shareToken}) async {
     // 手动/扫码连接：失败立即提示，不自动重试
     widget.controller.autoMode = false;
+    if (shareToken != null) _connectShareToken = shareToken;
     final server = _server.trim().replaceAll(RegExp(r'/$'), '');
     final code = _codeCtrl.text.trim().toUpperCase();
     if (!kPairCodeRegExp.hasMatch(code)) {
@@ -125,16 +185,21 @@ class _ConnectPageState extends State<ConnectPage> {
       await Future.delayed(const Duration(milliseconds: 300));
       final s = widget.controller.state;
       if (s == ConnectState.paired || s == ConnectState.peerConnected) {
-        // 配对成功：保存信息，下次启动自动直连
-        // （共享访客扫码连接不保存：避免下次启动自动直连而成为配对客户端）
-        AppLog.i('connect', '配对成功，进入主页'
-            '${widget.pendingShareToken != null ? '（共享访客）' : ''}');
-        if (widget.pendingShareToken == null) {
-          await widget.controller.savePairInfo(
-            _server.trim(),
-            _codeCtrl.text.trim().toUpperCase(),
-          );
-        }
+        final share = _connectShareToken;
+        // 配对成功：保存历史（共享访客带共享码标记，仅列表可选，
+        // 不会成为下次启动自动直连的目标）
+        // 名称优先用电脑端备注名（hostName），其次码尾/共享文件夹名
+        final hostName = widget.controller.hostName;
+        AppLog.i('connect',
+            '配对成功，进入主页${share != null ? '（共享访客）' : ''}');
+        await widget.controller.savePairInfo(
+          _server.trim(),
+          _codeCtrl.text.trim().toUpperCase(),
+          name: (hostName != null && hostName != '电脑')
+              ? hostName
+              : _displayName(_codeCtrl.text.trim().toUpperCase(), share),
+          shareToken: share,
+        );
         if (!mounted) return;
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
@@ -169,6 +234,31 @@ class _ConnectPageState extends State<ConnectPage> {
   void _showError(String msg) {
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  /// 历史条目标题：电脑用码尾 4 位区分；共享用共享文件夹名
+  String _displayName(String code, String? shareToken) {
+    if (shareToken != null && shareToken.isNotEmpty) {
+      for (final s in widget.controller.shares) {
+        if (s.token == shareToken) return s.name;
+      }
+      return '共享文件夹';
+    }
+    return '电脑 ${_codeSuffix(code)}';
+  }
+
+  /// 配对码尾 4 位（多台电脑区分标识）
+  static String _codeSuffix(String code) =>
+      code.length >= 4 ? code.substring(code.length - 4) : code;
+
+  /// 最近连接时间的相对描述
+  static String _fmtTime(DateTime? t) {
+    if (t == null) return '';
+    final d = DateTime.now().difference(t);
+    if (d.inMinutes < 1) return '刚刚';
+    if (d.inHours < 1) return '${d.inMinutes} 分钟前';
+    if (d.inDays < 1) return '${d.inHours} 小时前';
+    return '${d.inDays} 天前';
   }
 
   /// 退出登录：清除本地 token 并返回登录页
@@ -224,6 +314,53 @@ class _ConnectPageState extends State<ConnectPage> {
                           style: theme.textTheme.bodyMedium
                               ?.copyWith(color: Colors.grey)),
                       const SizedBox(height: 32),
+
+                      // 最近连接过的电脑/共享文件夹（点击连接，垃圾桶删除）
+                      if (_historyLoaded && _history.isNotEmpty) ...[
+                        Text('最近连接',
+                            style: theme.textTheme.titleSmall
+                                ?.copyWith(fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 8),
+                        for (final h in _history)
+                          Card(
+                            margin: const EdgeInsets.only(bottom: 8),
+                            elevation: 0,
+                            color: theme.colorScheme.surfaceContainerHighest
+                                .withValues(alpha: 0.5),
+                            child: ListTile(
+                              dense: true,
+                              leading: Icon(
+                                  h.isShare
+                                      ? Icons.folder_shared
+                                      : Icons.desktop_windows,
+                                  color: h.isShare
+                                      ? const Color(0xFF38BDF8)
+                                      : theme.colorScheme.primary),
+                              title: Text(h.name ??
+                                  (h.isShare
+                                      ? '共享文件夹'
+                                      : '电脑 ${_codeSuffix(h.code)}')),
+                              subtitle: Text(
+                                '${h.isShare ? '' : '配对码 ${h.code}'}'
+                                '${_fmtTime(h.lastAt).isEmpty ? '' : ' · ${_fmtTime(h.lastAt)}'}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              trailing: IconButton(
+                                icon: const Icon(Icons.delete_outline,
+                                    size: 20),
+                                tooltip: '删除记录',
+                                onPressed: busy
+                                    ? null
+                                    : () => _removeHistory(h),
+                              ),
+                              onTap: busy
+                                  ? null
+                                  : () => _connectFromHistory(h),
+                            ),
+                          ),
+                        const SizedBox(height: 16),
+                      ],
 
                       TextField(
                         controller: _codeCtrl,

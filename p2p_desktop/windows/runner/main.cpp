@@ -14,6 +14,22 @@
 
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
+  // ── 单实例保护（命名互斥体）──────────────────────────
+  // 在 Flutter 引擎初始化之前拦截：CreateMutexW 与 GetLastError 紧邻调用，
+  // 无中间层，检测可靠（Dart FFI 版本的 GetLastError 会被 VM 运行时代码覆盖，
+  // 导致双开，v5.4 已废弃 Dart 侧实现，统一在此处理）
+  HANDLE mutex = ::CreateMutexW(
+      nullptr, FALSE, L"Local\\P2P_Desktop_Single_Instance");
+  (void)mutex;  // 句柄存活即可，进程退出时内核自动释放互斥体
+  if (::GetLastError() == ERROR_ALREADY_EXISTS) {
+    ::MessageBoxW(
+        nullptr,
+        L"P2P 文件助手已在运行（可能最小化在任务栏/托盘中）。\n"
+        L"请先关闭已打开的窗口，再重新启动程序。",
+        L"P2P 文件助手", MB_OK | MB_ICONINFORMATION);
+    return 0;
+  }
+
   // Attach to console when present (e.g., 'flutter run') or create a
   // new console when running with a debugger.
   if (!::AttachConsole(ATTACH_PARENT_PROCESS) && ::IsDebuggerPresent()) {

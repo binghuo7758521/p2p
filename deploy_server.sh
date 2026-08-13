@@ -5,6 +5,10 @@ for PID in $(pgrep -f 'node server.js'); do
 done
 sleep 1
 cd /opt/p2p-app || exit 1
+# 加载环境变量（阿里云短信/TURN 密钥等），否则重启后短信服务不可用
+if [ -f ./env.sh ]; then
+  . ./env.sh
+fi
 setsid nohup node server.js > /tmp/p2p-server.log 2>&1 &
 sleep 3
 echo "--- 新进程 ---"

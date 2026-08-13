@@ -36,10 +36,15 @@ bool FlutterWindow::OnCreate() {
   // window is shown. It is a no-op if the first frame hasn't completed yet.
   flutter_controller_->ForceRedraw();
 
+  // 创建系统托盘图标（双击恢复窗口 / 右键退出系统）
+  tray_.Create(GetHandle());
+
   return true;
 }
 
 void FlutterWindow::OnDestroy() {
+  tray_.Destroy();
+
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -51,11 +56,16 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
-  // 窗口关闭时直接终止进程：flutter_windows.dll 引擎析构阶段存在崩溃
-  // （0xc0000005/0xc000041d，偏移 0x14f27），走正常退出流程会导致进程
-  // 异常残留并锁定 exe 文件（无法删除/替换）。直接终止由系统回收所有句柄。
+  // 托盘回调消息（双击显示窗口 / 右键弹出退出菜单），先于 Flutter 处理
+  if (message == kTrayCallbackMessage) {
+    tray_.HandleMessage(wparam, lparam);
+    return 0;
+  }
+
+  // 点击关闭按钮 → 隐藏主窗口到托盘（程序继续后台运行，收发文件不受影响）；
+  // 需彻底退出时通过托盘右键「退出系统」（唯一退出途径）
   if (message == WM_CLOSE) {
-    ::ExitProcess(0);
+    tray_.HideMainWindow();
     return 0;
   }
 

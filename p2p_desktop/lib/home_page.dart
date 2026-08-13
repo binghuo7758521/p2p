@@ -1,9 +1,16 @@
 import 'package:flutter/material.dart';
 
+import 'dart:io';
+
+import 'app_log.dart';
 import 'connect_page.dart';
 import 'host_controller.dart';
 import 'models.dart';
 import 'share_manage_page.dart';
+import 'silent_updater.dart';
+import 'update_check.dart';
+import 'users_manage_page.dart';
+import 'version.dart';
 
 /// 电脑端主界面：共享目录浏览 + 传输记录
 class HomePage extends StatefulWidget {
@@ -16,6 +23,122 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  @override
+  void initState() {
+    super.initState();
+    _checkUpdate();
+  }
+
+  /// 启动时检查升级：服务器有新版本时弹窗提示（每次启动检查一次）
+  ///
+  /// 升级检查放在主页面而非连接页：连接页可能被「管理员直进主页」
+  /// pushReplacement 销毁，await 返回后 mounted=false 会跳过弹窗
+  Future<void> _checkUpdate() async {
+    final info = await checkDesktopUpdate();
+    if (!mounted || info == null || !info.needUpdate) return;
+    final hasMd5 = info.md5 != null && info.md5!.isNotEmpty;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.system_update_alt, color: Color(0xFF38BDF8)),
+        title: Text('发现新版本 v${info.latest}'),
+        content: Text(
+          '当前版本 v$appVersion\n\n${info.notes}\n\n'
+          '升级将自动下载、校验并重启，全程无需手动操作',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('稍后'),
+          ),
+          FilledButton.icon(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              if (info.url == null) return;
+              if (hasMd5) {
+                _runSilentUpgrade(info);
+              } else {
+                // 服务器未提供校验值：回退手动浏览器下载
+                openDownloadUrl(info.url!);
+                _showUpdateError('服务器未提供升级包校验信息，已为你打开下载页面，'
+                    '请手动下载并解压覆盖程序目录');
+              }
+            },
+            icon: const Icon(Icons.download, size: 18),
+            label: const Text('立即升级'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 静默升级：进度对话框 + 下载/校验/解压/重启编排
+  Future<void> _runSilentUpgrade(UpdateInfo info) async {
+    final progress = ValueNotifier<double?>(null);
+    final status = ValueNotifier<String>('正在准备升级…');
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.system_update_alt, color: Color(0xFF38BDF8)),
+        title: const Text('正在升级'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ValueListenableBuilder<double?>(
+              valueListenable: progress,
+              builder: (_, p, _) => LinearProgressIndicator(value: p),
+            ),
+            const SizedBox(height: 12),
+            ValueListenableBuilder<String>(
+              valueListenable: status,
+              builder: (_, s, _) => Text(s, textAlign: TextAlign.center),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final ok = await runSilentUpgrade(
+      downloadUrl: info.url!,
+      expectedMd5: info.md5,
+      onPhase: (phase, p, message) {
+        progress.value = p;
+        status.value = message;
+      },
+    );
+
+    if (!mounted) return;
+    Navigator.of(context).pop(); // 关闭进度对话框
+    if (ok) {
+      // 升级已编排：立即退出主程序，由 update.bat 完成替换与重启
+      AppLog.i('update', '静默升级成功，主程序退出');
+      exit(0);
+    }
+    if (info.url != null) openDownloadUrl(info.url!);
+    _showUpdateError('自动升级失败，已为你打开下载页面，'
+        '请手动下载并解压覆盖程序目录');
+  }
+
+  /// 升级失败提示
+  void _showUpdateError(String message) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.error_outline, color: Colors.red),
+        title: const Text('升级失败'),
+        content: Text(message),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final controller = widget.controller;
@@ -62,6 +185,61 @@ class _HomePageState extends State<HomePage> {
           },
         ),
         actions: [
+          // 备注名称：设置本机名称，手机端选择连接时展示
+          IconButton(
+            tooltip: '备注名称（手机端显示）',
+            icon: const Icon(Icons.edit_note),
+            onPressed: () async {
+              final ctrl = TextEditingController(
+                  text: controller.deviceName == '电脑-桌面'
+                      ? ''
+                      : controller.deviceName);
+              final name = await showDialog<String>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('备注名称'),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('设置后手机端在选择连接时会显示此名称\n'
+                          '（例如：办公室电脑、家里电脑）',
+                          style: TextStyle(fontSize: 12, color: Colors.grey)),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: ctrl,
+                        autofocus: true,
+                        maxLength: 20,
+                        decoration: const InputDecoration(
+                          labelText: '名称',
+                          hintText: '不填则显示默认名',
+                          border: OutlineInputBorder(),
+                          counterText: '',
+                        ),
+                      ),
+                    ],
+                  ),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.of(ctx).pop(),
+                        child: const Text('取消')),
+                    FilledButton(
+                        onPressed: () => Navigator.of(ctx).pop(ctrl.text),
+                        child: const Text('保存')),
+                  ],
+                ),
+              );
+              if (name == null || !context.mounted) return;
+              if (name.trim().isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('名称为空，未修改')));
+                return;
+              }
+              await controller.setDeviceName(name);
+              if (!context.mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  content: Text('名称已保存为「${name.trim()}」，重新连接中…')));
+            },
+          ),
           ListenableBuilder(
             listenable: controller,
             // 共享文件夹管理：连接成功后始终可见
@@ -74,6 +252,22 @@ class _HomePageState extends State<HomePage> {
                           Navigator.of(context).push(MaterialPageRoute(
                               builder: (_) =>
                                   ShareManagePage(controller: controller)));
+                        },
+                      )
+                    : const SizedBox.shrink(),
+          ),
+          ListenableBuilder(
+            listenable: controller,
+            // 手机端管理：连接成功后可见（在线/离线用户、踢出/删除）
+            builder: (context, _) =>
+                controller.state == HostState.peerConnected
+                    ? IconButton(
+                        tooltip: '手机端管理',
+                        icon: const Icon(Icons.people_alt_outlined),
+                        onPressed: () {
+                          Navigator.of(context).push(MaterialPageRoute(
+                              builder: (_) =>
+                                  UsersManagePage(controller: controller)));
                         },
                       )
                     : const SizedBox.shrink(),

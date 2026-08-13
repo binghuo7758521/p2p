@@ -38,8 +38,10 @@ class SignalingService {
     String deviceId = '',
     String? shareToken,
     String? phone,
+    bool joinByShare = false,
   }) async {
     AppLog.i('signal', '连接信令服务器: $serverUrl code=$pairCode'
+        '${joinByShare ? ' join-by-share' : ''}'
         '${shareToken != null ? ' share=$shareToken' : ''}'
         '${phone != null ? ' phone=$phone' : ''}');
     _socket?.dispose();
@@ -52,6 +54,18 @@ class SignalingService {
     );
 
     _socket!.onConnect((_) {
+      if (joinByShare) {
+        // 免配对码连接（v4.8+）：服务器按共享 token 查注册表直接加入配对
+        AppLog.i('signal', '服务器已连接 (id=${_socket!.id})，发送 client:join-by-share');
+        _socket!.emit('client:join-by-share', {
+          'token': shareToken,
+          'deviceName': deviceName,
+          'version': appVersion,
+          if (deviceId.isNotEmpty) 'deviceId': deviceId,
+          if (phone != null && phone.isNotEmpty) 'phone': phone,
+        });
+        return;
+      }
       AppLog.i('signal', '服务器已连接 (id=${_socket!.id})，发送 client:join');
       _socket!.emit('client:join', {
         'pairCode': pairCode,

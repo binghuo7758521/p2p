@@ -53,6 +53,38 @@ class ShareEntry {
   bool get isPublic => targetDeviceId == null && targetPhone == null;
 }
 
+/// 服务器共享条目（v4.8+：“共享给我的”列表，登录后免配对码可见）
+/// 数据源：GET /api/shares/mine（电脑端同步到服务器，不暴露本地路径）
+class ServerShare {
+  final String token; // 共享码（连接凭证）
+  final String hostName; // 共享所在电脑的备注名
+  final String name; // 共享文件夹名
+  final List<String> perms; // download / upload / delete
+  final bool online; // 电脑端是否在线
+
+  const ServerShare({
+    required this.token,
+    required this.hostName,
+    required this.name,
+    required this.perms,
+    required this.online,
+  });
+
+  factory ServerShare.fromJson(Map<String, dynamic> json) => ServerShare(
+        token: json['token']?.toString() ?? '',
+        hostName: json['hostName']?.toString() ?? '电脑',
+        name: json['name']?.toString() ?? '共享文件夹',
+        perms: (json['perms'] as List? ?? [])
+            .map((e) => e.toString())
+            .toList(),
+        online: json['online'] == true,
+      );
+
+  bool get canDownload => perms.contains('download');
+  bool get canUpload => perms.contains('upload');
+  bool get canDelete => perms.contains('delete');
+}
+
 /// 传输记录（下载 / 上传）
 class TransferItem {
   final String id;

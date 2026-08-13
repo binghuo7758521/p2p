@@ -14,6 +14,8 @@
  *   ALIYUN_ACCESS_KEY_SECRET   阿里云 AccessKey Secret
  *   ALIYUN_SMS_SIGN_NAME       阿里云短信认证-赠送签名名称（控制台赠送签名配置页）
  *   ALIYUN_SMS_TEMPLATE_CODE   阿里云短信认证-赠送模板CODE（如 100001）
+ *   OSS_BASE_URL               升级包对象存储域名（如 https://xxx.oss-cn-hangzhou.aliyuncs.com，
+ *                              配置后 /downloads 302 重定向到 OSS，升级包不占 ECS 带宽）
  * 
  * 短信能力：阿里云短信认证服务（号码认证产品线 Dypnsapi）
  *   - 发送: SendSmsVerifyCode（验证码由系统生成，官方可核验）
@@ -27,8 +29,8 @@
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import { randomBytes, scryptSync, timingSafeEqual, createHmac } from 'crypto';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { randomBytes, scryptSync, timingSafeEqual, createHmac, createHash } from 'crypto';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -58,9 +60,9 @@ const PORT = process.env.PORT || 3000;
 // 规则: 手机端 / 电脑端 / 服务器端 三端版本互相独立（vX.Y）
 // - 只要某端代码有修改，该端版本号 +0.1（v1.0 → v1.1 → v1.2 ...）
 // - 本文件同时记录三端最新版本，便于 /version 统一核对
-const SERVER_VERSION = '2.1';   // 服务器端版本
-const DESKTOP_VERSION = '4.7';  // 电脑端版本
-const ANDROID_VERSION = '4.4';  // 手机端版本
+const SERVER_VERSION = '2.4';   // 服务器端版本
+const DESKTOP_VERSION = '5.5';  // 电脑端版本
+const ANDROID_VERSION = '5.2';  // 手机端版本
 
 // 版本查询接口：调试时确认各端是否最新
 app.get('/version', (req, res) => {
@@ -97,8 +99,41 @@ app.post('/log-upload', express.text({ limit: '3mb', type: 'text/plain' }), (req
 // 发布新版本时，将升级包放到 downloads 目录：
 //   downloads/p2p_desktop.zip   电脑端升级包（覆盖解压 Release 目录）
 //   downloads/app-release.apk   手机端升级包（直接安装）
+// 可选：配置 OSS_BASE_URL（阿里云 OSS 等对象存储域名）后，
+// /downloads 302 重定向到对象存储直链，升级包不再占用 ECS 公网带宽
+// 注意：OSS 默认公网域名禁止匿名下载 .apk 后缀对象（ApkDownloadForbidden），
+// 故 APK 在 OSS 中以无后缀对象名存储（上传时 Content-Disposition 还原文件名）
 const DOWNLOADS_DIR = join(__dirname, 'downloads');
-app.use('/downloads', express.static(DOWNLOADS_DIR));
+const OSS_BASE_URL = (process.env.OSS_BASE_URL || '').replace(/\/+$/, '');
+// 下载文件名 → OSS 对象名映射（规避 APK 下载限制）
+const OSS_OBJECT_MAP = { 'app-release.apk': 'app-release' };
+
+// 电脑端升级包 MD5 缓存（静默升级完整性校验；按文件大小变化失效）
+// 发布时需同时将升级包上传到 downloads 目录，否则返回 null（客户端拒绝静默升级）
+let zipMd5Cache = { file: '', size: -1, md5: '' };
+function desktopZipMd5() {
+  const p = join(DOWNLOADS_DIR, 'p2p_desktop.zip');
+  if (!existsSync(p)) return null;
+  const size = statSync(p).size;
+  if (zipMd5Cache.file === p && zipMd5Cache.size === size) return zipMd5Cache.md5;
+  const h = createHash('md5');
+  h.update(readFileSync(p));
+  const md5 = h.digest('hex');
+  zipMd5Cache = { file: p, size, md5 };
+  return md5;
+}
+
+app.use('/downloads', (req, res, next) => {
+  if (!OSS_BASE_URL) return next(); // 未配置 OSS：交给本地静态目录
+  const file = decodeURIComponent(req.path.replace(/^\//, ''));
+  if (!file || file.includes('..')) return res.status(404).end();
+  const object = OSS_OBJECT_MAP[file] || file;
+  res.redirect(302, OSS_BASE_URL + '/' + encodeURIComponent(object));
+});
+// 未配置 OSS 时回退本地静态目录（放在路由之后，仅在未配置时注册）
+if (!OSS_BASE_URL) {
+  app.use('/downloads', express.static(DOWNLOADS_DIR));
+}
 
 // 版本号转数值（v1.5 → 1.5），用于大小比较
 function verNum(v) {
@@ -106,15 +141,29 @@ function verNum(v) {
   return Number.isNaN(n) ? 0 : n;
 }
 
+// 升级包是否存在：对象存储模式用 HEAD 探测直链，本地模式查文件
+async function upgradeFileExists(file) {
+  if (OSS_BASE_URL) {
+    const object = OSS_OBJECT_MAP[file] || file;
+    try {
+      const resp = await fetch(`${OSS_BASE_URL}/${object}`, { method: 'HEAD' });
+      return resp.ok;
+    } catch (e) {
+      log(`[升级检查] OSS 探测失败: ${file} ${e}`);
+      return false;
+    }
+  }
+  return existsSync(join(DOWNLOADS_DIR, file));
+}
+
 // 升级检查：/update-check?platform=desktop|android&version=x.y
 // 返回最新版本、是否需要升级、下载地址、更新说明
-app.get('/update-check', (req, res) => {
+app.get('/update-check', async (req, res) => {
   const platform = req.query.platform === 'android' ? 'android' : 'desktop';
   const current = String(req.query.version || '');
   const latest = platform === 'android' ? ANDROID_VERSION : DESKTOP_VERSION;
   const file = platform === 'android' ? 'app-release.apk' : 'p2p_desktop.zip';
-  const filePath = join(DOWNLOADS_DIR, file);
-  const hasFile = existsSync(filePath);
+  const hasFile = await upgradeFileExists(file);
   const needUpdate = hasFile && verNum(latest) > verNum(current);
   res.json({
     platform,
@@ -122,7 +171,9 @@ app.get('/update-check', (req, res) => {
     latest,
     needUpdate,
     url: hasFile ? `/downloads/${file}` : null,
-    notes: hasFile ? `升级到 v${latest}（服务器已就绪）` : ''
+    notes: hasFile ? `升级到 v${latest}（服务器已就绪）` : '',
+    // 电脑端升级包 MD5：客户端静默升级完整性校验（无 MD5 时客户端回退手动下载）
+    md5: platform === 'desktop' && hasFile ? desktopZipMd5() : null
   });
   if (platform === 'android') {
     log(`[升级检查] 手机端 v${current} → ${needUpdate ? '有新版 v' + latest : '已最新'}`);
@@ -148,13 +199,19 @@ const logErr = (...args) => console.error(ts(), ...args);
 const PAIR_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const PAIR_CODE_LENGTH = 10;
 
-function generatePairCode() {
-  // 生成新的配对码并持久化
+/** 纯生成配对码（不落盘）：设备码分配 / 全局码共用 */
+function randomPairCode() {
   const bytes = randomBytes(PAIR_CODE_LENGTH);
   let code = '';
   for (let i = 0; i < PAIR_CODE_LENGTH; i++) {
     code += PAIR_CODE_CHARS[bytes[i] % PAIR_CODE_CHARS.length];
   }
+  return code;
+}
+
+function generatePairCode() {
+  // 生成新的配对码并持久化
+  const code = randomPairCode();
   writeFileSync(PAIR_CODE_FILE, code, 'utf-8');
   console.log(`[配对码] 生成新配对码: ${code} (已保存)`);
   return code;
@@ -173,6 +230,64 @@ function getOrCreatePairCode() {
   return generatePairCode();
 }
 
+// ── 按设备分配配对码（v2.2+）───────────────────────────────────
+// 背景：v2.1 及之前所有电脑端共用服务器全局一个配对码（.pair-code），
+// 多台电脑安装后码相同且互相抢占。v2.2 起电脑端上报本机硬件 ID，
+// 服务器按 deviceId 维护映射：同一台电脑配对码稳定，不同电脑互不相同。
+const HOST_CODES_FILE = join(process.cwd(), 'host-codes.json');
+
+function loadHostCodes() {
+  try {
+    if (existsSync(HOST_CODES_FILE)) {
+      const codes = JSON.parse(readFileSync(HOST_CODES_FILE, 'utf-8'));
+      if (codes && typeof codes === 'object') return codes;
+    }
+  } catch (e) {
+    console.error(`[配对码] 读取 ${HOST_CODES_FILE} 失败: ${e.message}`);
+  }
+  return {};
+}
+
+/** 按设备取/分配配对码：同一 deviceId 返回同一码；新设备生成不重复的新码 */
+function getOrCreateHostCode(deviceId) {
+  const codes = loadHostCodes();
+  if (deviceId && codes[deviceId]) return codes[deviceId];
+  let code;
+  do {
+    code = randomPairCode();
+  } while (Object.values(codes).includes(code) ||
+      (existsSync(PAIR_CODE_FILE) && code === readFileSync(PAIR_CODE_FILE, 'utf-8').trim()));
+  if (deviceId) {
+    codes[deviceId] = code;
+    saveJson(HOST_CODES_FILE, codes);
+    console.log(`[配对码] 新设备 ${deviceId} → ${code}`);
+  }
+  return code;
+}
+
+/** 重新生成某设备的配对码（pair:reset）：旧码立即失效，映射持久化 */
+function resetHostCode(deviceId) {
+  const codes = loadHostCodes();
+  let code;
+  do {
+    code = randomPairCode();
+  } while (Object.values(codes).includes(code) ||
+      (existsSync(PAIR_CODE_FILE) && code === readFileSync(PAIR_CODE_FILE, 'utf-8').trim()));
+  codes[deviceId] = code;
+  saveJson(HOST_CODES_FILE, codes);
+  console.log(`[配对码] 设备 ${deviceId} 重新生成 → ${code}`);
+  return code;
+}
+
+/** 配对码是否有效：全局码（旧电脑端）或任一设备的专属码 */
+function isValidPairCode(code) {
+  if (!code) return false;
+  if (existsSync(PAIR_CODE_FILE) && readFileSync(PAIR_CODE_FILE, 'utf-8').trim() === code) {
+    return true;
+  }
+  return Object.values(loadHostCodes()).includes(code);
+}
+
 /** 读取当前有效配对码（只读，不生成）：用于区分“电脑端离线”与“配对码已变更” */
 function getCurrentPairCode() {
   if (existsSync(PAIR_CODE_FILE)) {
@@ -184,9 +299,102 @@ function getCurrentPairCode() {
   return null;
 }
 
+// ── 共享注册表（v2.4+）────────────────────────────────────
+// 电脑端创建/删除/修改共享时全量同步到服务器，手机端登录后按手机号
+// 拉取“共享给我的”列表，并通过 client:join-by-share 免配对码连接电脑端。
+// shareRegistry: { token: { token, deviceId, pairCode, hostName, name,
+//   folder, perms[], targetPhone|null, createdAt, updatedAt } }
+const SHARES_FILE = join(process.cwd(), 'shares.json');
+let shareRegistry = loadJson(SHARES_FILE, {});
+if (!shareRegistry || typeof shareRegistry !== 'object') shareRegistry = {};
+
+function saveShares() {
+  try {
+    saveJson(SHARES_FILE, shareRegistry);
+  } catch (e) {
+    console.error(`[共享] 保存 ${SHARES_FILE} 失败: ${e.message}`);
+  }
+}
+
+// 电脑端 HTTP 同步认证：host:register 时注册的 hostToken（防伪造共享上报）
+const HOST_TOKENS_FILE = join(process.cwd(), 'host-tokens.json');
+function loadHostTokens() {
+  return loadJson(HOST_TOKENS_FILE, {});
+}
+function saveHostTokens(ht) {
+  try {
+    saveJson(HOST_TOKENS_FILE, ht);
+  } catch (e) {
+    console.error(`[共享] 保存 ${HOST_TOKENS_FILE} 失败: ${e.message}`);
+  }
+}
+
+// 电脑端全量同步共享（幂等：以电脑端上报为准，覆盖该设备全部条目）
+function syncHostShares(deviceId, shares) {
+  if (!deviceId) return { ok: false, error: '缺少设备标识' };
+  const codes = loadHostCodes();
+  const pairCode = codes[deviceId] || null;
+  const valid = Array.isArray(shares) ? shares : [];
+  // 先移除该设备旧条目，再写入新条目（删除/修改后自然收敛）
+  for (const key of Object.keys(shareRegistry)) {
+    if (shareRegistry[key].deviceId === deviceId) {
+      delete shareRegistry[key];
+    }
+  }
+  const now = Date.now();
+  for (const s of valid) {
+    const token = String(s.token || '');
+    if (!token) continue;
+    shareRegistry[token] = {
+      token,
+      deviceId,
+      pairCode,
+      hostName: String(s.hostName || '电脑').slice(0, 50),
+      name: String(s.name || '共享文件夹').slice(0, 100),
+      folder: String(s.folder || '').slice(0, 500),
+      perms: Array.isArray(s.perms)
+          ? s.perms.filter((p) => ['download', 'upload', 'delete'].includes(p))
+          : [],
+      targetPhone: s.targetPhone ? String(s.targetPhone).slice(0, 20) : null,
+      createdAt: Number(s.createdAt) || now,
+      updatedAt: now,
+    };
+  }
+  saveShares();
+  log(`[共享] 电脑端同步: ${deviceId} 共 ${valid.length} 条`);
+  return { ok: true, count: valid.length };
+}
+
 // ── 用户数据存储 ─────────────────────────────────────────────
 const USERS_FILE = join(process.cwd(), 'users.json');
 const TOKENS_FILE = join(process.cwd(), 'tokens.json');
+
+// ── U盘授权（加密狗）存储 ───────────────────────────────────
+const LICENSES_FILE = join(process.cwd(), 'licenses.json');
+// 未授权时电脑端展示的购买方式（后台改不了，直接改这里后重启生效）
+const BUY_CONTACT = {
+  title: '如需购买授权，请联系：',
+  wechat: '客服微信：your-wechat-id',
+  phone: '客服电话：400-000-0000',
+};
+
+function loadLicenses() {
+  try {
+    if (existsSync(LICENSES_FILE)) {
+      const data = JSON.parse(readFileSync(LICENSES_FILE, 'utf-8'));
+      if (data && Array.isArray(data.usbIds)) return data;
+    }
+  } catch (e) {
+    console.error(`[授权] 读取 ${LICENSES_FILE} 失败: ${e.message}`);
+  }
+  return { usbIds: [] };
+}
+const licenses = loadLicenses();
+
+// U盘ID 格式：XXXX-XXXX（16 进制卷序列号）
+function isUsbIdValid(id) {
+  return /^[0-9A-F]{4}-[0-9A-F]{4}$/.test(id);
+}
 
 function loadJson(file, fallback) {
   try {
@@ -548,6 +756,43 @@ app.get('/api/user/me', requireUser, (req, res) => {
   });
 });
 
+// ── 共享同步与查询 API（v2.4+）───────────────────────────────
+// 电脑端全量同步共享（创建/删除/改权限/启动时调用，幂等覆盖）
+app.post('/api/shares/sync', (req, res) => {
+  const deviceId = String(req.body?.deviceId || '');
+  const hostToken = String(req.body?.hostToken || '');
+  const tokens = loadHostTokens();
+  if (!deviceId || !hostToken || tokens[deviceId] !== hostToken) {
+    return res.status(403).json({ ok: false, error: '主机令牌无效' });
+  }
+  const result = syncHostShares(deviceId, req.body?.shares);
+  res.json(result);
+});
+
+// 手机端：登录后拉取“共享给我的”文件夹列表（按登录手机号匹配）
+// 返回在线状态（电脑端在线可立即连接），不暴露共享目录绝对路径
+app.get('/api/shares/mine', requireUser, (req, res) => {
+  const phone = req.user.phone;
+  const list = [];
+  for (const s of Object.values(shareRegistry)) {
+    if (!s.targetPhone || s.targetPhone !== phone) continue;
+    const online = !!(s.pairCode &&
+        sessions.get(s.pairCode)?.hostSocketId &&
+        io.sockets.sockets.has(sessions.get(s.pairCode).hostSocketId));
+    list.push({
+      token: s.token,
+      hostName: s.hostName || '电脑',
+      name: s.name || '共享文件夹',
+      perms: s.perms || [],
+      online,
+      updatedAt: s.updatedAt || null,
+    });
+  }
+  list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  log(`[共享] 手机端查询: ${phone} 共 ${list.length} 条`);
+  res.json({ ok: true, shares: list });
+});
+
 // ── 管理 API ─────────────────────────────────────────────────
 // 管理员登录
 app.post('/api/admin/login', (req, res) => {
@@ -626,6 +871,121 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
   });
 });
 
+// 电脑端列表：在线（sessions 中主机 socket 存活）与全部已注册设备（host-codes.json）
+app.get('/api/admin/hosts', requireAdmin, (req, res) => {
+  const codes = loadHostCodes();
+  const offlineCodes = { ...codes };
+  const online = [];
+  for (const [pairCode, session] of sessions) {
+    if (!session?.hostSocketId || !io.sockets.sockets.has(session.hostSocketId)) continue;
+    const info = session.hostInfo || {};
+    online.push({
+      deviceId: info.deviceId || null,
+      name: info.name || '电脑',
+      version: info.version || null,
+      pairCode,
+      online: true,
+      clientCount: session.clients ? session.clients.size : 0,
+      registeredAt: info.registeredAt || session.createdAt || null,
+    });
+    if (info.deviceId) delete offlineCodes[info.deviceId];
+  }
+  // 已注册但当前不在线的设备（host-codes.json 映射），在线优先排序
+  const offline = Object.entries(offlineCodes).map(([deviceId, pairCode]) => ({
+    deviceId,
+    name: null,
+    version: null,
+    pairCode,
+    online: false,
+    clientCount: 0,
+    registeredAt: null,
+  }));
+  const hosts = [...online, ...offline];
+  log(`[管理] 电脑端列表: 在线 ${online.length} 台 / 已注册 ${hosts.length} 台`);
+  res.json({ ok: true, hosts, onlineCount: online.length });
+});
+
+// ── U盘授权 API（加密狗白名单） ────────────────────────────
+// 电脑端启动验证：任意一个U盘ID在白名单中即授权通过
+app.post('/api/usb/verify', (req, res) => {
+  const ids = Array.isArray(req.body?.usbIds)
+      ? req.body.usbIds.map((s) => String(s).trim().toUpperCase()).filter(Boolean)
+      : [];
+  const licensed = ids.some((id) => licenses.usbIds.some((x) => x.id === id));
+  if (licensed) return res.json({ ok: true, licensed: true });
+  res.json({ ok: true, licensed: false, buyInfo: BUY_CONTACT });
+});
+
+// 管理：授权列表
+app.get('/api/admin/usb/list', requireAdmin, (req, res) => {
+  const list = [...licenses.usbIds].sort((a, b) => b.createdAt - a.createdAt);
+  res.json({
+    ok: true,
+    count: list.length,
+    list: list.map((x) => ({
+      id: x.id,
+      note: x.note || '',
+      createdAt: x.createdAt,
+    })),
+  });
+});
+
+// 管理：单个添加
+app.post('/api/admin/usb/add', requireAdmin, (req, res) => {
+  const id = String(req.body?.id || '').trim().toUpperCase();
+  const note = String(req.body?.note || '').trim();
+  if (!isUsbIdValid(id)) {
+    return res.json({ ok: false, error: 'ID 格式应为 XXXX-XXXX（例如 1A2B-3C4D）' });
+  }
+  if (licenses.usbIds.some((x) => x.id === id)) {
+    return res.json({ ok: false, error: `ID ${id} 已存在` });
+  }
+  licenses.usbIds.push({ id, note, createdAt: Date.now() });
+  saveJson(LICENSES_FILE, licenses);
+  console.log(`[授权] 添加U盘ID: ${id} ${note ? `(${note})` : ''}`);
+  res.json({ ok: true });
+});
+
+// 管理：批量添加（多行/逗号分隔文本，自动去重、忽略空行）
+app.post('/api/admin/usb/batch', requireAdmin, (req, res) => {
+  const text = String(req.body?.text || '');
+  const rows = text
+      .split(/[\r\n,;，；]+/)
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+  let added = 0;
+  let skipped = 0;
+  const invalid = [];
+  for (const row of rows) {
+    if (!isUsbIdValid(row)) {
+      invalid.push(row);
+      continue;
+    }
+    if (licenses.usbIds.some((x) => x.id === row)) {
+      skipped++;
+      continue;
+    }
+    licenses.usbIds.push({ id: row, note: '', createdAt: Date.now() });
+    added++;
+  }
+  saveJson(LICENSES_FILE, licenses);
+  console.log(`[授权] 批量添加: 成功 ${added} / 跳过重复 ${skipped} / 无效 ${invalid.length}`);
+  res.json({ ok: true, added, skipped, invalid });
+});
+
+// 管理：删除
+app.delete('/api/admin/usb/:id', requireAdmin, (req, res) => {
+  const id = String(req.params.id || '').trim().toUpperCase();
+  const before = licenses.usbIds.length;
+  licenses.usbIds = licenses.usbIds.filter((x) => x.id !== id);
+  if (licenses.usbIds.length === before) {
+    return res.json({ ok: false, error: 'ID 不存在' });
+  }
+  saveJson(LICENSES_FILE, licenses);
+  console.log(`[授权] 删除U盘ID: ${id}`);
+  res.json({ ok: true });
+});
+
 // ── 静态文件 ─────────────────────────────────────────────────
 // 仅托管页面文件，避免暴露 server.js / package.json / .pair-code / users.json 等
 app.get('/', (req, res) => {
@@ -664,8 +1024,20 @@ io.on('connection', (socket) => {
   log(`[连接] ${socket.id} 新连接`);
 
   // 电脑端注册为主机（version：电脑端上报的版本号，记录于配对日志）
-  socket.on('host:register', ({ deviceName, desktop, version }) => {
-    const pairCode = getOrCreatePairCode();
+  socket.on('host:register', ({ deviceName, desktop, version, deviceId, hostToken }) => {
+    // v2.4+：绑定主机令牌（电脑端本地生成并持久化，供共享同步接口认证）
+    if (deviceId && hostToken) {
+      const ht = loadHostTokens();
+      if (ht[deviceId] !== hostToken) {
+        ht[deviceId] = hostToken;
+        saveHostTokens(ht);
+        log(`[注册] 绑定主机令牌: deviceId=${deviceId}`);
+      }
+    }
+    // v2.2+：按本机硬件 ID 分配设备专属配对码（同一台电脑重连后码不变，
+    // 不同电脑互不相同）；旧版电脑端（未上报 deviceId）回退到全局码
+    const pairCode = deviceId ? getOrCreateHostCode(deviceId) : getOrCreatePairCode();
+    socket.deviceId = deviceId || null;
     const existing = sessions.get(pairCode);
     // 旧主机 socket 仍存活时才视为“新电脑抢占”，通知手机端断开；
     // 电脑端 socket 闪断重连（旧 socket 已死）：保留手机端会话与配对信息，
@@ -686,7 +1058,14 @@ io.on('connection', (socket) => {
     sessions.set(pairCode, {
       hostSocketId: socket.id,
       clients,
-      hostInfo: { name: deviceName || '电脑', id: socket.id, desktop: desktop || null, version: version || null },
+      hostInfo: {
+        name: deviceName || '电脑',
+        id: socket.id,
+        desktop: desktop || null,
+        version: version || null,
+        deviceId: deviceId || null,
+        registeredAt: Date.now()
+      },
       createdAt: existing?.createdAt ?? Date.now()
     });
     socket.pairCode = pairCode;
@@ -720,7 +1099,9 @@ io.on('connection', (socket) => {
     log(`[注册] ${deviceName || '电脑'}${version ? ' v' + version : ''} → 配对码 ${pairCode} (socket=${socket.id})`);
   });
 
-  // 重新生成配对码（仅主机可用）：旧码失效，新码广播给所有已注册主机
+  // 重新生成配对码（仅主机可用）：旧码失效。
+  // v2.2+ 只重置本设备自己的码（不广播，避免影响其他电脑端）；
+  // 旧版电脑端（无 deviceId）仍走全局码广播逻辑
   socket.on('pair:reset', () => {
     if (socket.role !== 'host' || !socket.pairCode) return;
     const oldCode = socket.pairCode;
@@ -732,7 +1113,9 @@ io.on('connection', (socket) => {
       }
     }
     sessions.delete(oldCode);
-    const newCode = generatePairCode();
+    const newCode = socket.deviceId
+        ? resetHostCode(socket.deviceId)
+        : generatePairCode();
     sessions.set(newCode, {
       hostSocketId: socket.id,
       clients: new Map(),
@@ -740,20 +1123,26 @@ io.on('connection', (socket) => {
       createdAt: Date.now()
     });
     socket.pairCode = newCode;
-    io.emit('pair:code-changed', { pairCode: newCode });
-    console.log(`[配对码] ${oldCode} → 重新生成 ${newCode}`);
+    // 设备专属码：只通知本设备；全局码：广播所有（旧行为）
+    if (socket.deviceId) {
+      socket.emit('pair:code-changed', { pairCode: newCode });
+    } else {
+      io.emit('pair:code-changed', { pairCode: newCode });
+    }
+    console.log(`[配对码] ${socket.deviceId ? '设备 ' + socket.deviceId : '全局'} ${oldCode} → 重新生成 ${newCode}`);
   });
 
   // 手机端通过配对码加入（支持多客户端：deviceId 设备标识 / shareToken 共享码 / phone 登录手机号）
   // version：手机端上报的版本号，记录于配对日志便于排查版本差异
-  socket.on('client:join', ({ pairCode, deviceName, deviceId, shareToken, phone, version }) => {
+    // 手机端加入公共流程：配对码（client:join）与共享码（client:join-by-share）
+  // 两种入口复用同一路由逻辑（免配对码连接由服务器按共享注册表解析出 pairCode）
+  function joinClient(socket, { pairCode, deviceName, deviceId, shareToken, phone, version }) {
     let session = sessions.get(pairCode);
     if (!session || !session.hostSocketId || !io.sockets.sockets.has(session.hostSocketId)) {
       // 会话不存在或主机 socket 已死（电脑端离线/服务器重启后未注册）：
-      // 若配对码仍是当前有效码 → host-offline（手机端自动等待电脑端上线重试）；
-      // 否则配对码已被重新生成 → 无效，需重新扫码
-      const current = getCurrentPairCode();
-      if (current && pairCode === current) {
+      // 若配对码仍是有效码 → host-offline（手机端自动等待电脑端上线重试）；
+      // 否则配对码已失效（全局码被重新生成 / 设备码被重置）→ 需重新扫码
+      if (isValidPairCode(pairCode)) {
         // 登记等待中的手机端（即使电脑端离线），电脑端注册时据此补发 joined
         session = session || { hostSocketId: null, clients: new Map(), createdAt: Date.now() };
         if (!session.clients) session.clients = new Map();
@@ -768,7 +1157,7 @@ io.on('connection', (socket) => {
         log(`[等待] 电脑端离线，登记等待者: ${deviceName}${version ? ' v' + version : ''} socket=${socket.id} code=${pairCode}`);
         return socket.emit('client:error', { reason: 'host-offline' });
       }
-      log(`[无效] 配对码无效: ${deviceName} 请求码=${pairCode} 当前码=${current || '无'}`);
+      log(`[无效] 配对码无效: ${deviceName} 请求码=${pairCode} 当前码=${getCurrentPairCode() || '无'}`);
       return socket.emit('client:error', { reason: '配对码无效' });
     }
     if (!session.clients) session.clients = new Map();
@@ -810,6 +1199,30 @@ io.on('connection', (socket) => {
     });
     console.log(`[配对] ${deviceName || '手机'}${version ? ' v' + version : ''} → ${pairCode} → ${session.hostInfo.name}${session.hostInfo.version ? ' v' + session.hostInfo.version : ''}`);
     log(`[配对] 成功: ${deviceName || '手机'}${version ? ' v' + version : ''} (socket=${socket.id}, deviceId=${deviceId || '无'}, phone=${phone || '无'}) → 电脑=${session.hostInfo.name}${session.hostInfo.version ? ' v' + session.hostInfo.version : ''} (socket=${session.hostSocketId})`);
+  }
+
+  socket.on('client:join', (msg) => joinClient(socket, msg));
+
+  // v2.4+：免配对码加入——手机端凭共享 token 直接连接共享所在电脑
+  // 校验：token 存在于共享注册表，且 targetPhone 与登录手机号匹配
+  socket.on('client:join-by-share', ({ token, deviceId, phone, version, deviceName }) => {
+    const share = shareRegistry[token];
+    if (!share || !share.pairCode) {
+      log(`[共享] 加入失败: 共享不存在或已失效 token=${token}`);
+      return socket.emit('client:error', { reason: '共享不存在或已失效' });
+    }
+    if (share.targetPhone && share.targetPhone !== phone) {
+      log(`[共享] 加入失败: ${phone} 无权访问 ${share.name}`);
+      return socket.emit('client:error', { reason: '无权访问该共享' });
+    }
+    joinClient(socket, {
+      pairCode: share.pairCode,
+      deviceName: deviceName || '手机',
+      deviceId: deviceId || null,
+      shareToken: token,
+      phone: phone || null,
+      version: version || null
+    });
   });
 
   // 信令转发: 主机 → 客户端（多客户端时带 to 指定目标；不带则转发给唯一客户端）

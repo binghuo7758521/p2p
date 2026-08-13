@@ -114,6 +114,27 @@
       </div>
     </div>
 
+    <!-- 运行的电脑端 -->
+    <div class="card">
+      <div class="card-title">💻 运行的电脑端
+        <span id="hostSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>设备名称</th>
+            <th>配对码</th>
+            <th>版本</th>
+            <th>状态</th>
+            <th>连接手机</th>
+            <th>最近注册</th>
+          </tr>
+        </thead>
+        <tbody id="hostTable"></tbody>
+      </table>
+      <div id="hostEmpty" class="empty-state">暂无电脑端在线（已注册设备也会显示在此）</div>
+    </div>
+
     <!-- 用户管理 -->
     <div class="card">
       <div class="card-title">👥 注册用户管理</div>
@@ -135,6 +156,43 @@
         <tbody id="userTable"></tbody>
       </table>
       <div id="userEmpty" class="empty-state">暂无用户</div>
+    </div>
+
+    <!-- U盘授权管理（加密狗白名单） -->
+    <div class="card">
+      <div class="card-title">🔑 U盘授权管理
+        <span id="usbSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
+      </div>
+      <div class="status status-info">
+        电脑端启动时会校验插入的U盘 ID 是否在此白名单中，无匹配则无法使用。<br>
+        获取U盘 ID：插入U盘后运行 <a href="/downloads/usb_id_tool.zip" style="color:#38bdf8">U盘ID查看工具</a>（下载解压后双击 exe）。
+      </div>
+      <label>单个添加（格式 XXXX-XXXX）</label>
+      <div class="toolbar">
+        <input type="text" id="usbIdInput" placeholder="例如 1A2B-3C4D" style="flex:2">
+        <input type="text" id="usbNoteInput" placeholder="备注（可选，如客户名）" style="flex:3">
+        <button class="btn-green" id="usbAddBtn" style="width:auto">添加</button>
+      </div>
+      <label>批量添加（每行一个 ID，支持 TXT 文件导入）</label>
+      <textarea id="usbBatchText" rows="5" placeholder="1A2B-3C4D&#10;5E6F-7A8B&#10;..." style="width:100%;padding:12px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;font-family:monospace;resize:vertical"></textarea>
+      <div class="toolbar" style="margin-top:8px">
+        <button class="btn-ghost" id="usbFileBtn" style="width:auto">📄 选择 TXT 文件</button>
+        <button class="btn-primary" id="usbBatchBtn" style="width:auto">批量添加</button>
+      </div>
+      <input type="file" id="usbFileInput" accept=".txt,.csv" style="display:none">
+      <div id="usbBatchResult" class="status status-info hidden"></div>
+      <table style="margin-top:12px">
+        <thead>
+          <tr>
+            <th>U盘 ID</th>
+            <th>备注</th>
+            <th>添加时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="usbTable"></tbody>
+      </table>
+      <div id="usbEmpty" class="empty-state">暂无授权 U盘</div>
     </div>
 
     <div class="refresh-note">状态每 10 秒自动刷新</div>
@@ -198,7 +256,9 @@ async function doLogin() {
     $('loginView').classList.add('hidden');
     $('mainView').classList.remove('hidden');
     refreshStats();
+    loadHosts();
     loadUsers();
+    loadUsbIds();
   } catch (e) {
     errBox.textContent = e.message;
     errBox.classList.remove('hidden');
@@ -218,6 +278,30 @@ async function refreshStats() {
     $('stMemory').textContent = fmtSize(s.memory);
     $('stNode').textContent = s.nodeVersion;
     $('stTime').textContent = fmtTime(s.serverTime);
+  } catch (e) { /* 忽略，下一轮重试 */ }
+}
+
+async function loadHosts() {
+  try {
+    const data = await api('/api/admin/hosts');
+    const tbody = $('hostTable');
+    tbody.innerHTML = '';
+    $('hostEmpty').classList.toggle('hidden', data.hosts.length > 0);
+    $('hostSummary').textContent =
+        `在线 ${data.onlineCount} 台 / 已注册 ${data.hosts.length} 台`;
+    for (const h of data.hosts) {
+      const tr = document.createElement('tr');
+      const name = h.name
+          || (h.deviceId ? '设备 ' + h.deviceId.slice(0, 8) : '未知设备');
+      tr.innerHTML = `
+        <td>${name}</td>
+        <td style="font-family:monospace;color:#fbbf24">${h.pairCode || '-'}</td>
+        <td>${h.version ? 'v' + h.version : '-'}</td>
+        <td><span class="badge ${h.online ? 'badge-active' : 'badge-disabled'}">${h.online ? '在线' : '离线'}</span></td>
+        <td>${h.clientCount || 0}</td>
+        <td>${fmtTime(h.registeredAt)}</td>`;
+      tbody.appendChild(tr);
+    }
   } catch (e) { /* 忽略，下一轮重试 */ }
 }
 
@@ -268,6 +352,70 @@ async function loadUsers(keyword = '') {
   } catch (e) { alert(e.message); }
 }
 
+// ── U盘授权管理 ──
+async function loadUsbIds() {
+  try {
+    const data = await api('/api/admin/usb/list');
+    const tbody = $('usbTable');
+    tbody.innerHTML = '';
+    $('usbEmpty').classList.toggle('hidden', data.count > 0);
+    $('usbSummary').textContent = `共 ${data.count} 个授权`;
+    for (const x of data.list) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="font-family:monospace;color:#7dd3fc">${x.id}</td>
+        <td>${x.note || '-'}</td>
+        <td>${fmtTime(x.createdAt)}</td>
+        <td><div class="actions"></div></td>`;
+      const delBtn = document.createElement('button');
+      delBtn.className = 'btn-sm btn-red';
+      delBtn.textContent = '删除';
+      delBtn.onclick = async () => {
+        if (!confirm(`确定删除授权 ${x.id} 吗？\n删除后该U盘将无法使用电脑端。`)) return;
+        try {
+          await api('/api/admin/usb/' + x.id, { method: 'DELETE' });
+          loadUsbIds();
+        } catch (e) { alert(e.message); }
+      };
+      tr.querySelector('.actions').appendChild(delBtn);
+      tbody.appendChild(tr);
+    }
+  } catch (e) { alert(e.message); }
+}
+
+async function addUsb() {
+  const id = $('usbIdInput').value.trim();
+  const note = $('usbNoteInput').value.trim();
+  if (!id) { alert('请输入U盘 ID'); return; }
+  try {
+    await api('/api/admin/usb/add', {
+      method: 'POST',
+      body: JSON.stringify({ id, note }),
+    });
+    $('usbIdInput').value = '';
+    $('usbNoteInput').value = '';
+    loadUsbIds();
+  } catch (e) { alert(e.message); }
+}
+
+async function batchUsb() {
+  const text = $('usbBatchText').value;
+  if (!text.trim()) { alert('请粘贴 ID 列表或先选择 TXT 文件'); return; }
+  try {
+    const data = await api('/api/admin/usb/batch', {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    });
+    const box = $('usbBatchResult');
+    let msg = `成功添加 ${data.added} 个，重复跳过 ${data.skipped} 个`;
+    if (data.invalid.length > 0) msg += `，无效 ${data.invalid.length} 个：${data.invalid.join('、')}`;
+    box.textContent = msg;
+    box.classList.remove('hidden');
+    $('usbBatchText').value = '';
+    loadUsbIds();
+  } catch (e) { alert(e.message); }
+}
+
 // ── 事件绑定 ──
 $('loginBtn').onclick = doLogin;
 $('loginPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
@@ -275,10 +423,28 @@ $('logoutBtn').onclick = logout;
 $('searchBtn').onclick = () => loadUsers($('searchInput').value.trim());
 $('searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadUsers($('searchInput').value.trim()); });
 $('resetSearchBtn').onclick = () => { $('searchInput').value = ''; loadUsers(); };
+$('usbAddBtn').onclick = addUsb;
+$('usbIdInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addUsb(); });
+$('usbBatchBtn').onclick = batchUsb;
+$('usbFileBtn').onclick = () => $('usbFileInput').click();
+$('usbFileInput').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    $('usbBatchText').value = String(reader.result || '');
+    $('usbBatchResult').classList.add('hidden');
+  };
+  reader.readAsText(f);
+  e.target.value = '';
+});
 
 // 自动刷新状态
 setInterval(() => {
-  if (adminToken && !$('mainView').classList.contains('hidden')) refreshStats();
+  if (adminToken && !$('mainView').classList.contains('hidden')) {
+    refreshStats();
+    loadHosts();
+  }
 }, 10000);
 
 // ── 启动 ──
@@ -289,7 +455,9 @@ setInterval(() => {
       $('loginView').classList.add('hidden');
       $('mainView').classList.remove('hidden');
       refreshStats();
+      loadHosts();
       loadUsers();
+      loadUsbIds();
       return;
     } catch (e) { logout(); }
   }

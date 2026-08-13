@@ -195,6 +195,8 @@ class HostController extends ChangeNotifier {
       state = HostState.registered;
       AppLog.i('host', '注册成功: 配对码=$code');
       notifyListeners();
+      // v5.0+：注册后全量同步共享配置到服务器（手机端免配对码列表依赖）
+      unawaited(_syncSharesToServer());
     };
     _service.onClientJoined = (info) async {
       final clientInfo = info['clientInfo'];
@@ -332,6 +334,7 @@ class HostController extends ChangeNotifier {
       _bindPhoneShares(user);
       users[deviceId] = user;
       notifyListeners();
+      unawaited(_saveUsers());
     } else {
       user.name = name;
       user.clientId = clientId;
@@ -360,7 +363,20 @@ class HostController extends ChangeNotifier {
         }
         AppLog.i('host', '共享访客升级为正式用户: $name ($deviceId)');
       }
+      // 已存在用户带共享码连接：同样校验绑定。老用户（曾配对/历史连接）
+      // 扫码加入公开或指定共享时，此处必须补绑定，否则 user.shares 为空
+      // 导致“扫码后看不到文件夹”（file:list 返回无访问权限）
+      if (shareOnly) {
+        final share = _shareTable[shareToken];
+        if (share != null && _canBind(share, deviceId, user.phone)) {
+          if (!user.shares.any((s) => s.token == share.token)) {
+            user.shares.add(share);
+            AppLog.i('host', '老用户共享码绑定共享: ${share.name}');
+          }
+        }
+      }
       _bindPhoneShares(user);
+      unawaited(_saveUsers());
     }
   }
 
@@ -371,7 +387,6 @@ class HostController extends ChangeNotifier {
     await dir.create(recursive: true);
     return File('${dir.path}\\admin.json');
   }
-
   /// 启动/重新连接时恢复持久化的管理员手机号
   Future<void> _loadAdminPhone() async {
     try {
@@ -399,6 +414,169 @@ class HostController extends ChangeNotifier {
       AppLog.i('host', '管理员手机号已保存: $phone');
     } catch (e) {
       AppLog.w('host', '保存管理员文件失败', e);
+    }
+  }
+
+  // ── 用户列表持久化（重启后仍可查看/管理有连接权限的手机端） ──
+  Future<File> _usersFile() async {
+    final docs = Platform.environment['USERPROFILE'] ?? '.';
+    final dir = Directory('$docs\\Documents\\p2p_desktop_logs');
+    await dir.create(recursive: true);
+    return File('${dir.path}\\users.json');
+  }
+
+  /// 启动/重新连接时恢复用户列表（全部置为离线，重新加入时再上线）
+  Future<void> _loadUsers() async {
+    try {
+      final f = await _usersFile();
+      if (!await f.exists()) return;
+      final list = jsonDecode(await f.readAsString());
+      if (list is! List) return;
+      var changed = false;
+      for (final item in list.whereType<Map>()) {
+        final u = HostUser.fromJson(Map<String, dynamic>.from(item));
+        if (u.deviceId.isEmpty) continue;
+        u.clientId = null; // 离线状态，重新 join 时恢复在线
+        users[u.deviceId] = u;
+        if (u.isAdmin && (adminDeviceId == null || adminDeviceId!.isEmpty)) {
+          adminDeviceId = u.deviceId;
+        }
+        changed = true;
+      }
+      if (changed) {
+        AppLog.i('host', '从本地文件恢复用户列表: ${users.length} 台设备');
+        notifyListeners();
+      }
+    } catch (e) {
+      AppLog.w('host', '读取用户列表文件失败', e);
+    }
+  }
+
+  // ── 共享配置持久化（v5.0+：重启不丢，并同步服务器供手机端免配对码拉取） ──
+  Future<File> _sharesFile() async {
+    final docs = Platform.environment['USERPROFILE'] ?? '.';
+    final dir = Directory('$docs\\Documents\\p2p_desktop_logs');
+    await dir.create(recursive: true);
+    return File('${dir.path}\\shares.json');
+  }
+
+  /// 恢复共享配置：_shareTable 全部恢复，并把已绑定用户的共享补回 user.shares
+  /// （user.shares 不落盘，重启后依赖此处恢复，否则用户重连后看不到共享）
+  Future<void> _loadShares() async {
+    try {
+      final f = await _sharesFile();
+      if (!await f.exists()) return;
+      final json = jsonDecode(await f.readAsString());
+      if (json is! List) return;
+      _shareTable.clear();
+      for (final e in json.whereType<Map>()) {
+        final s = ShareConfig.fromJson(Map<String, dynamic>.from(e));
+        _shareTable[s.token] = s;
+      }
+      for (final s in _shareTable.values) {
+        final did = s.targetDeviceId;
+        if (did != null && did.isNotEmpty && users.containsKey(did)) {
+          final u = users[did]!;
+          if (!u.shares.any((x) => x.token == s.token)) u.shares.add(s);
+        }
+      }
+      AppLog.i('host', '恢复共享配置: ${_shareTable.length} 条');
+      notifyListeners();
+    } catch (e) {
+      AppLog.w('host', '读取共享配置失败', e);
+    }
+  }
+
+  Future<void> _saveShares() async {
+    try {
+      final f = await _sharesFile();
+      await f.writeAsString(jsonEncode(
+          _shareTable.values.map((s) => s.toJson()).toList()));
+    } catch (e) {
+      AppLog.w('host', '保存共享配置失败', e);
+    }
+  }
+
+  /// 全量同步共享到服务器：手机端登录后凭手机号拉取“共享给我的”列表，
+  /// 并通过免配对码信令连接本机浏览/传输
+  Future<void> _syncSharesToServer() async {
+    final list = _shareTable.values.map((s) => s.toJson()).toList();
+    await _service.syncSharesToServer(list);
+  }
+
+  /// 共享变更后统一处理：本地落盘 + 服务器同步
+  void _persistShares() {
+    unawaited(_saveShares());
+    unawaited(_syncSharesToServer());
+  }
+
+  /// 保存用户列表（保存设备身份；shares/clientId 为内存态不落盘）
+  Future<void> _saveUsers() async {
+    try {
+      final f = await _usersFile();
+      final list = users.values
+          .map((u) => {
+                'deviceId': u.deviceId,
+                'name': u.name,
+                'phone': u.phone,
+                'isAdmin': u.isAdmin,
+                'shareOnly': u.shareOnly,
+                'joinedAt': u.joinedAt.millisecondsSinceEpoch,
+              })
+          .toList();
+      await f.writeAsString(jsonEncode(list));
+      AppLog.i('host', '用户列表已保存: ${list.length} 台设备');
+    } catch (e) {
+      AppLog.w('host', '保存用户列表失败', e);
+    }
+  }
+
+  // ── 传输记录持久化（最近 7 天） ─────────────────────────
+  /// 传输记录保留天数（超过自动清理）
+  static const int _transferRetentionDays = 7;
+
+  /// 传输记录持久化文件（程序重启后仍可查看最近 7 天记录）
+  Future<File> _transfersFile() async {
+    final docs = Platform.environment['USERPROFILE'] ?? '.';
+    final dir = Directory('$docs\\Documents\\p2p_desktop_logs');
+    await dir.create(recursive: true);
+    return File('${dir.path}\\transfers.json');
+  }
+
+  /// 保存传输记录（新增 / 状态落定时调用；进度刷新不触发，避免频繁写盘）
+  Future<void> _saveTransfers() async {
+    try {
+      final f = await _transfersFile();
+      await f.writeAsString(
+          jsonEncode(transfers.map((t) => t.toJson()).toList()));
+    } catch (e) {
+      AppLog.w('transfer', '保存传输记录失败', e);
+    }
+  }
+
+  /// 启动时加载历史传输记录（按保留期清理过期记录，未完成记录置为失败）
+  Future<void> _loadTransfers() async {
+    try {
+      final f = await _transfersFile();
+      if (!await f.exists()) return;
+      final list = jsonDecode(await f.readAsString());
+      if (list is! List) return;
+      final cutoff = DateTime.now()
+          .subtract(const Duration(days: _transferRetentionDays));
+      final items = list
+          .whereType<Map>()
+          .map((e) => TransferItem.fromJson(Map<String, dynamic>.from(e)))
+          .where((t) => !t.startTime.isBefore(cutoff))
+          .toList()
+        ..sort((a, b) => b.startTime.compareTo(a.startTime));
+      for (final t in items) {
+        // 上次程序退出时正在传输的记录恢复为失败（实际传输已中断）
+        if (t.status == 'transferring') t.status = 'error';
+      }
+      transfers.addAll(items);
+      AppLog.i('transfer', '加载历史传输记录: ${items.length} 条');
+    } catch (e) {
+      AppLog.w('transfer', '加载传输记录失败', e);
     }
   }
 
@@ -465,6 +643,9 @@ class HostController extends ChangeNotifier {
     }
     users.remove(deviceId);
     notifyListeners();
+    unawaited(_saveUsers());
+    // 用户删除可能连带移除其专属共享（如设备指定共享）
+    _persistShares();
   }
 
   /// 管理员共享文件夹：按设备 id / 手机号 / 公开（二维码）三种方式
@@ -520,6 +701,7 @@ class HostController extends ChangeNotifier {
       AppLog.i('host', '创建共享(手机号): $phone -> $folder token=${share.token} '
           'perms=$perms ${deviceId != null ? '已绑定' : '待绑定'}');
       notifyListeners();
+      _persistShares();
       return share;
     }
 
@@ -542,6 +724,7 @@ class HostController extends ChangeNotifier {
     AppLog.i('host', '创建共享: ${user?.name ?? '公开二维码'} -> $folder '
         'token=${share.token} perms=$perms');
     notifyListeners();
+    _persistShares();
     return share;
   }
 
@@ -554,6 +737,7 @@ class HostController extends ChangeNotifier {
     }
     AppLog.i('host', '取消共享: ${share.name} token=$token');
     notifyListeners();
+    _persistShares();
   }
 
   /// 管理员修改共享权限，并通知已绑定的用户即时刷新
@@ -573,6 +757,7 @@ class HostController extends ChangeNotifier {
     }
     AppLog.i('host', '修改共享权限: ${share.name} perms=$clean');
     notifyListeners();
+    _persistShares();
   }
 
   /// 已连接用户扫码附加共享（管理员扫自己的码/用户扫新码）
@@ -610,7 +795,54 @@ class HostController extends ChangeNotifier {
     notifyListeners();
     // 重新连接时恢复持久化的管理员手机号（进程内断开重连场景）
     await _loadAdminPhone();
+    // 恢复用户列表（离线），手机端重新加入时更新在线状态
+    await _loadUsers();
+    // 恢复共享配置（重启不丢），并给已绑定用户补回 shares 列表
+    await _loadShares();
+    // 恢复最近 7 天传输记录（程序重启后仍可查看）
+    await _loadTransfers();
+    // 注册名使用本地备注（无备注时默认"电脑-桌面"）
+    _service.deviceName = deviceName;
     await _service.connect(serverUrl);
+  }
+
+  /// 设备备注名（持久化，注册时上报给服务器，手机端选择连接时展示）
+  String get deviceName {
+    try {
+      final base = Platform.environment['APPDATA'] ??
+          Platform.environment['HOME'] ??
+          Directory.systemTemp.path;
+      final f = File('$base/p2p_desktop/device_name');
+      if (f.existsSync()) {
+        final name = f.readAsStringSync().trim();
+        if (name.isNotEmpty) return name;
+      }
+    } catch (e) {
+      AppLog.w('host', '读取设备备注名失败', e);
+    }
+    return '电脑-桌面';
+  }
+
+  /// 设置设备备注名：持久化并重连信令（立即生效，手机端下次连接可见）
+  Future<void> setDeviceName(String name) async {
+    final clean = name.trim();
+    if (clean.isEmpty || clean == deviceName) return;
+    try {
+      final base = Platform.environment['APPDATA'] ??
+          Platform.environment['HOME'] ??
+          Directory.systemTemp.path;
+      final dir = Directory('$base/p2p_desktop');
+      dir.createSync(recursive: true);
+      await File('${dir.path}/device_name').writeAsString(clean);
+      AppLog.i('host', '设备备注名已保存: $clean');
+    } catch (e) {
+      AppLog.e('host', '保存设备备注名失败', e);
+    }
+    // 重连信令使新名称立即生效（在线手机端断开重连后也会看到新名称）
+    if (serverUrl.isNotEmpty) {
+      await disconnect();
+      await connect(server: serverUrl);
+    }
   }
 
   Future<void> disconnect() async {
@@ -635,6 +867,7 @@ class HostController extends ChangeNotifier {
         t.status = 'error';
       }
     }
+    unawaited(_saveTransfers());
     final rs = _recvStates[clientId];
     if (rs == null) {
       notifyListeners();
@@ -963,14 +1196,23 @@ class HostController extends ChangeNotifier {
       _pushUserList(clientId);
       return true;
     }
-    // 管理员身份兜底：若当前没有任何管理员在线（如管理员设备重装/更换后
-    // deviceId 变化），则首个在线的用户自动成为管理员，避免管理功能失联
-    final online = users.values.where((u) => u.online).toList()
+    // 管理员身份兜底：仅当从未设置过持久化管理员手机号时启用
+    // （管理员离线时不自动更换，避免任何在线用户意外接管管理权）；
+    // 共享访客（扫码加入）永不参与兜底，防止扫码者获得管理员
+    if (adminPhone != null && adminPhone!.isNotEmpty) return false;
+    final online = users.values
+        .where((u) => u.online && !u.shareOnly)
+        .toList()
       ..sort((a, b) => a.joinedAt.compareTo(b.joinedAt));
     if (online.isNotEmpty && online.first.clientId == clientId) {
       user.isAdmin = true;
       adminDeviceId ??= user.deviceId;
-      if (user.phone.isNotEmpty) adminPhone ??= user.phone;
+      // 兜底选中即持久化：避免电脑端每次重启后管理员身份再次丢失
+      // （无持久化管理员时，首个在线用户成为管理员并固定下来）
+      if (user.phone.isNotEmpty) {
+        adminPhone = user.phone;
+        unawaited(_saveAdminPhone(user.phone));
+      }
       AppLog.i('host', '无管理员在线，自动升级为首个在线用户: ${user.name}');
       _pushUserList(clientId);
       return true;
@@ -1417,11 +1659,19 @@ class HostController extends ChangeNotifier {
       await _sendTo(clientId,
           {'type': 'file-complete', 'fileName': fileName, 'fileSize': size});
       t.status = 'done';
+      unawaited(_saveTransfers());
       AppLog.i('download', '发送完成: $fileName (${t.transferred}/${size}B) [$clientId]');
       notifyListeners();
     } catch (e) {
       AppLog.e('download',
           '发送异常: ${msg['fileName']} 已发送=$sentBytes B', e);
+      // 发送中止/异常：进行中的记录标记失败并落盘，避免重启后残留「正在发送」
+      for (final t in transfers) {
+        if (t.clientId == clientId && t.status == 'transferring') {
+          t.status = 'error';
+        }
+      }
+      unawaited(_saveTransfers());
       _sendTo(clientId,
           {'type': 'file-ack', 'fileName': msg['fileName'], 'success': false});
     } finally {
@@ -1768,6 +2018,10 @@ class HostController extends ChangeNotifier {
     if (rs.skipUploading) {
       // 用户选择跳过：无文件落地，告知手机端
       rs.skipUploading = false;
+      if (item != null) {
+        item.status = 'error';
+      }
+      unawaited(_saveTransfers());
       _sendTo(clientId, {
         'type': 'file-ack',
         'fileName': fileName,
@@ -1787,6 +2041,7 @@ class HostController extends ChangeNotifier {
       if (item != null) {
         item.status = ok ? 'done' : 'error';
       }
+      unawaited(_saveTransfers());
       // 成功：.part 重命名为正式文件名；失败：删除残留 part
       final part = rs.file;
       if (ok && part != null) {
@@ -1895,6 +2150,11 @@ class HostController extends ChangeNotifier {
 
   // ── 辅助 ────────────────────────────────────────────────
   TransferItem _addTransfer(String name, String direction, int total, String clientId) {
+    // 传输记录仅保留 7 天：新增记录时清理过期记录（运行期间累积的旧记录自动消失，
+    // 避免列表无限增长）
+    final cutoff = DateTime.now()
+        .subtract(const Duration(days: _transferRetentionDays));
+    transfers.removeWhere((x) => x.startTime.isBefore(cutoff));
     final user = _userByClientId(clientId);
     final t = TransferItem(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
@@ -1906,6 +2166,7 @@ class HostController extends ChangeNotifier {
       clientId: clientId,
     );
     transfers.add(t);
+    unawaited(_saveTransfers());
     notifyListeners();
     return t;
   }

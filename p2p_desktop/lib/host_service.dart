@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
 import 'app_log.dart';
+import 'machine_id.dart';
 import 'version.dart';
 
 /// 发送限速器（令牌桶）：中转(relay)限 500KB/s，直连(direct)限 16MB/s 兜底；
@@ -181,7 +183,35 @@ class PeerSession {
 class HostService {
   io.Socket? _socket;
   final Map<String, PeerSession> _sessions = {}; // clientId -> session
+  String _serverUrl = '';
 
+  /// 主机令牌（v5.0+）：本地生成持久化，注册时上报服务器，
+  /// 共享同步 HTTP 接口凭此认证（防伪造共享上报）
+  String hostToken = _loadOrCreateHostToken();
+
+  /// 读取/生成主机令牌（%APPDATA%/p2p_desktop/host_token，无则生成 32 位随机）
+  static String _loadOrCreateHostToken() {
+    try {
+      final base = Platform.environment['APPDATA'] ??
+          Platform.environment['HOME'] ??
+          Directory.systemTemp.path;
+      final dir = Directory('$base/p2p_desktop');
+      final f = File('${dir.path}/host_token');
+      if (f.existsSync()) {
+        final saved = f.readAsStringSync().trim();
+        if (saved.length >= 16) return saved;
+      }
+      final rand = Random.secure();
+      final token =
+          List.generate(32, (_) => rand.nextInt(16).toRadixString(16)).join();
+      dir.createSync(recursive: true);
+      f.writeAsStringSync(token);
+      return token;
+    } catch (e) {
+      AppLog.w('host', '生成主机令牌失败', e);
+      return '';
+    }
+  }
   // ── 自动重连（socket 断线后保持注册状态，等待手机重新加入） ──
   Timer? _reconnectTimer;
   int _reconnectAttempts = 0;
@@ -202,6 +232,9 @@ class HostService {
   /// 当前在线手机端会话列表（clientId -> session）
   Map<String, PeerSession> get sessions => _sessions;
 
+  /// 设备名称（用户可备注，注册时上报，手机端选择连接时展示）
+  String deviceName = '电脑-桌面';
+
   /// 服务器中转时的最大发送速率：500KB/s
   static const double relayMaxRate = 500 * 1024;
   /// P2P 直连时的初始发送速率：16MB/s（已验证零积压稳定版；自适应流控接管后
@@ -220,6 +253,7 @@ class HostService {
     await dispose();
     _disposed = false;
     _reconnectAttempts = 0;
+    _serverUrl = serverUrl.replaceAll(RegExp(r'/$'), '');
     _socket = io.io(
       serverUrl,
       io.OptionBuilder()
@@ -230,13 +264,18 @@ class HostService {
 
     _socket!.onConnect((_) {
       _reconnectAttempts = 0;
-      AppLog.i('host', '信令服务器已连接，发送 host:register');
+      AppLog.i('host', '信令服务器已连接，发送 host:register (name=$deviceName)');
       _socket!.emit('host:register', {
-        'deviceName': '电脑-桌面',
+        'deviceName': deviceName,
         // 版本号：服务器配对日志记录电脑端版本，便于排查版本差异问题
         'version': appVersion,
         // 桌面绝对路径：手机端默认上传目录（我的电脑模式下有效）
         'desktop': _desktopPath(),
+        // 本机硬件 ID：服务器据此分配设备专属配对码（每台电脑一个码，
+        // 同一台电脑重连/重启后码不变）
+        'deviceId': MachineId.get(),
+        // 主机令牌：共享同步 HTTP 接口认证（v5.0+）
+        'hostToken': hostToken,
       });
     });
 
@@ -490,6 +529,41 @@ class HostService {
   /// 请求服务器重新生成配对码（旧码立即失效）
   void resetPairCode() {
     _socket?.emit('pair:reset');
+  }
+
+  /// 全量同步共享配置到服务器（v5.0+）：创建/删除/改权限/启动注册后调用，
+  /// 手机端登录后凭手机号拉取“共享给我的”列表，并免配对码连接共享所在电脑
+  Future<Map<String, dynamic>> syncSharesToServer(
+      List<Map<String, dynamic>> shares) async {
+    try {
+      if (_serverUrl.isEmpty) return {'ok': false, 'error': '未配置服务器'};
+      final client = HttpClient();
+      try {
+        final req = await client
+            .postUrl(Uri.parse('$_serverUrl/api/shares/sync'))
+            .timeout(const Duration(seconds: 10));
+        req.headers.contentType = ContentType.json;
+        req.write(jsonEncode({
+          'deviceId': MachineId.get(),
+          'hostToken': hostToken,
+          'shares': shares,
+        }));
+        final resp = await req.close().timeout(const Duration(seconds: 10));
+        final body = await resp.transform(utf8.decoder).join();
+        final result = jsonDecode(body);
+        if (result is Map && result['ok'] == true) {
+          AppLog.i('host', '共享已同步到服务器: ${shares.length} 条');
+          return Map<String, dynamic>.from(result);
+        }
+        AppLog.w('host', '共享同步失败: ${resp.statusCode} $body');
+        return {'ok': false, 'error': body};
+      } finally {
+        client.close(force: true);
+      }
+    } catch (e) {
+      AppLog.w('host', '共享同步异常', e);
+      return {'ok': false, 'error': '$e'};
+    }
   }
 
   /// 请求服务器踢出指定客户端（管理员功能）

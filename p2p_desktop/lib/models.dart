@@ -62,4 +62,34 @@ class TransferItem {
           : '${(bps / 1024).toStringAsFixed(0)} KB/s';
     }
   }
+
+  /// 持久化到本地（程序重启后仍保留最近 7 天传输记录）
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'fileName': fileName,
+        'direction': direction,
+        'total': total,
+        'transferred': transferred,
+        'status': status,
+        'speed': speed,
+        'startTime': startTime.toIso8601String(),
+        'clientName': clientName,
+        'clientId': clientId,
+      };
+
+  factory TransferItem.fromJson(Map<String, dynamic> json) => TransferItem(
+        id: json['id']?.toString() ?? '',
+        fileName: json['fileName']?.toString() ?? '',
+        direction:
+            json['direction']?.toString() == 'upload' ? 'upload' : 'download',
+        total: json['total'] is int ? json['total'] as int : 0,
+        startTime: DateTime.tryParse(json['startTime']?.toString() ?? '') ??
+            DateTime.now(),
+        transferred:
+            json['transferred'] is int ? json['transferred'] as int : 0,
+        status: json['status']?.toString() ?? 'done',
+        speed: json['speed']?.toString() ?? '',
+        clientName: json['clientName']?.toString() ?? '',
+        clientId: json['clientId']?.toString() ?? '',
+      );
 }

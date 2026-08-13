@@ -75,19 +75,47 @@ class ResumeDownload {
   });
 }
 
-/// 上次成功配对的信息（用于下次自动直连）
+/// 一次成功配对的历史记录（启动时选择连接 / 自动直连用）
 class PairInfo {
   final String server;
   final String code;
 
-  const PairInfo({required this.server, required this.code});
+  /// 显示名（电脑："电脑 XXXX"；共享：共享文件夹名）
+  final String? name;
+
+  /// 最近连接时间（历史列表排序）
+  final DateTime? lastAt;
+
+  /// 非空 = 共享文件夹记录（仅列表手动选择，不参与启动自动直连）
+  final String? shareToken;
+
+  const PairInfo({
+    required this.server,
+    required this.code,
+    this.name,
+    this.lastAt,
+    this.shareToken,
+  });
+
+  /// 是否为共享文件夹记录
+  bool get isShare => shareToken != null && shareToken!.isNotEmpty;
 
   factory PairInfo.fromJson(Map<String, dynamic> json) => PairInfo(
         server: json['server'] as String? ?? '',
         code: json['code'] as String? ?? '',
+        name: json['name']?.toString(),
+        lastAt: DateTime.tryParse(json['lastAt']?.toString() ?? ''),
+        shareToken: json['shareToken']?.toString(),
       );
 
-  Map<String, dynamic> toJson() => {'server': server, 'code': code};
+  Map<String, dynamic> toJson() => {
+        'server': server,
+        'code': code,
+        if (name != null) 'name': name,
+        if (lastAt != null) 'lastAt': lastAt!.toIso8601String(),
+        if (shareToken != null && shareToken!.isNotEmpty)
+          'shareToken': shareToken,
+      };
 }
 
 /// 电脑端已有其他管理员时的更换确认请求（UI 弹窗展示）
@@ -146,6 +174,7 @@ class AppController extends ChangeNotifier {
   final List<ShareEntry> allShares = []; // 管理员：电脑端全部共享配置
   List<Map<String, dynamic>> users = []; // 用户列表（管理员可见）
   String? _pendingShareToken; // 本次连接携带的共享码
+  bool _shareConnectMode = false; // 免配对码共享连接（v4.8+：共享中心页）
   ShareEntry? _lastShareResult; // 最近一次共享操作结果（UI 展示二维码）
 
   // 共享目录浏览状态
@@ -180,6 +209,10 @@ class AppController extends ChangeNotifier {
   bool _pendingUploadCheck = false;
   // 文件列表请求同源竞态：通道未就绪时被忽略，打开后补发
   bool _pendingBrowseList = false;
+  // user:list 同源竞态：ICE connected 与 channel OPEN 会各触发一次状态
+  // 事件，第一次时 isOpen 可能仍为 false，user:list 曾静默丢失
+  // （管理员身份 isAdmin 永不更新 → 共享文件夹管理入口不显示），挂起补发
+  bool _pendingUserInfo = false;
   String? _desktopPath; // 电脑端桌面路径（默认上传目录）
   String? _rememberedUploadDir; // 上次使用的上传目录（持久化）
   static const _prefUploadDir = 'last_upload_dir';
@@ -289,6 +322,7 @@ class AppController extends ChangeNotifier {
       if (open && _rtc.isOpen) {
         if (_pendingUploadCheck) _checkRememberedUploadDir();
         if (_pendingBrowseList) _requestFileList();
+        if (_pendingUserInfo) _requestUserInfo();
       }
       if (open && state != ConnectState.peerConnected) {
         state = ConnectState.peerConnected;
@@ -333,16 +367,18 @@ class AppController extends ChangeNotifier {
   String? get lastPairCode => _lastCode;
 
   Future<void> connect(String serverUrl, String pairCode,
-      {String? shareToken}) async {
+      {String? shareToken, bool joinByShare = false}) async {
     _lastServer = serverUrl.replaceAll(RegExp(r'/$'), '');
     _lastCode = pairCode.trim();
     _pendingShareToken = shareToken;
-    // 共享访客标记：扫码共享连接不保存配对信息、界面只开放共享功能
+    _shareConnectMode = joinByShare;
+    // 共享访客标记：扫码/免配对码共享连接不保存配对信息、界面只开放共享功能
     isShareGuest = shareToken != null && shareToken.isNotEmpty;
     _manualDisconnect = false;
     // 新会话：重置“拒绝更换管理员”抑制标志（断开重连后重新提示）
     _adminClaimDismissed = false;
     AppLog.i('connect', '发起连接: server=$_lastServer code=$_lastCode'
+        '${joinByShare ? ' joinByShare' : ''}'
         '${shareToken != null ? ' share=$shareToken' : ''}');
     state = ConnectState.connecting;
     errorMessage = null;
@@ -379,6 +415,7 @@ class AppController extends ChangeNotifier {
         deviceId: deviceId,
         shareToken: _pendingShareToken,
         phone: AuthService.instance.phone,
+        joinByShare: _shareConnectMode,
       );
     } catch (e) {
       if (autoMode && !_manualDisconnect) {
@@ -427,7 +464,11 @@ class AppController extends ChangeNotifier {
     final srv = _lastServer;
     final code = _lastCode;
     if (srv != null && code != null && _pendingShareToken == null) {
-      savePairInfo(srv, code);
+      // 保存电脑端备注名，手机端选择连接时展示
+      savePairInfo(srv, code,
+          name: (hostName != null && hostName != '电脑')
+              ? hostName
+              : null);
     }
   }
 
@@ -517,6 +558,7 @@ class AppController extends ChangeNotifier {
           deviceId: deviceId,
           shareToken: _pendingShareToken,
           phone: AuthService.instance.phone,
+          joinByShare: _shareConnectMode,
         );
         // 连接成功后 onConnect 自动 client:join；joined → paired 后电脑端发 offer
         // 若 join 失败（配对码暂不可用，如电脑端重连中）继续循环重试
@@ -760,6 +802,7 @@ class AppController extends ChangeNotifier {
     allShares.clear();
     _lastShareResult = null;
     _pendingShareToken = null;
+    _shareConnectMode = false;
     isShareGuest = false;
     _activeUploadShare = null;
     activeShare = null;
@@ -920,7 +963,11 @@ class AppController extends ChangeNotifier {
   /// 请求用户列表（身份/用户/共享目录）
   void _requestUserInfo() {
     if (_rtc.isOpen) {
+      _pendingUserInfo = false;
       _rtc.sendJson({'type': 'user:list'});
+    } else {
+      // 通道未就绪：挂起，等数据通道真正 OPEN 后补发
+      _pendingUserInfo = true;
     }
   }
 
@@ -1001,6 +1048,68 @@ class AppController extends ChangeNotifier {
   void updateSharePerms(String token, List<String> perms) {
     AppLog.i('share', '修改共享权限: $token $perms');
     _rtc.sendJson({'type': 'user:update-share', 'token': token, 'perms': perms});
+  }
+
+  /// 拉取“共享给我的”列表（v4.8+：服务器共享注册表，登录后免配对码可见）
+  Future<List<ServerShare>> fetchMyShares() async {
+    final token = AuthService.instance.token;
+    if (token == null || token.isEmpty) {
+      AppLog.w('share', '未登录，无法拉取共享列表');
+      return const [];
+    }
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final req = await client
+          .getUrl(Uri.parse('$defaultServerUrl/api/shares/mine'));
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      final res = await req.close();
+      final text = await res.transform(utf8.decoder).join();
+      AppLog.i('share', '拉取共享列表: HTTP ${res.statusCode} 共${text.length}字符');
+      if (res.statusCode != 200) return const [];
+      final data = jsonDecode(text);
+      if (data is! Map || data['ok'] != true || data['shares'] is! List) {
+        AppLog.w('share', '共享列表响应格式异常');
+        return const [];
+      }
+      return (data['shares'] as List)
+          .whereType<Map>()
+          .map((e) => ServerShare.fromJson(Map<String, dynamic>.from(e)))
+          .toList();
+    } catch (e) {
+      AppLog.e('share', '拉取共享列表失败', e);
+      return const [];
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// 免配对码连接共享（v4.8+：共享中心页）
+  /// 成功后自动打开对应共享目录；失败返回 false（错误信息见 errorMessage）
+  Future<bool> connectByShare(ServerShare share) async {
+    AppLog.i('share', '免配对码连接共享: ${share.name} (${share.hostName})');
+    autoMode = false;
+    errorMessage = null;
+    await connect(defaultServerUrl, '', shareToken: share.token,
+        joinByShare: true);
+    // 等待数据通道建立（电脑端上线后握手，最多 20 秒）
+    for (var i = 0; i < 200; i++) {
+      if (_rtc.isOpen) break;
+      if (state == ConnectState.error) break; // 服务器已拒绝（共享失效/电脑离线）
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    if (!_rtc.isOpen) {
+      AppLog.w('share', '共享连接失败: 数据通道未建立 (state=$state)');
+      return false;
+    }
+    // 电脑端下发共享列表后，按 token 匹配并打开浏览
+    final matches = shares.where((s) => s.token == share.token).toList();
+    if (matches.isEmpty) {
+      AppLog.w('share', '连接成功但未匹配到共享目录: ${share.token}');
+      return false;
+    }
+    openShare(matches.first);
+    return true;
   }
 
   /// 打开共享目录（进入共享浏览模式）
@@ -2164,50 +2273,116 @@ class AppController extends ChangeNotifier {
     return dir;
   }
 
-  /// 配对信息存储文件（应用私有目录）
+  /// 配对历史存储文件（应用私有目录，保存最近连接过的电脑/共享文件夹）
   static Future<File> _pairInfoFile() async {
     final dir = await getApplicationSupportDirectory();
     return File('${dir.path}/pair_info.json');
   }
 
-  /// 保存上次成功配对的信息（下次启动自动直连）
-  Future<void> savePairInfo(String server, String code) async {
-    try {
-      final f = await _pairInfoFile();
-      await f.writeAsString(
-          jsonEncode(PairInfo(server: server, code: code).toJson()));
-      AppLog.i('connect', '配对信息已保存: server=$server');
-    } catch (e) {
-      AppLog.e('connect', '保存配对信息失败（不影响主流程）', e);
-    }
-  }
-
-  /// 读取上次配对信息，无记录返回 null
-  Future<PairInfo?> loadPairInfo() async {
+  /// 读取全部配对历史（按最近连接时间倒序）。
+  /// 兼容旧版单对象格式：自动迁移为列表（并统一默认服务器地址）。
+  Future<List<PairInfo>> loadPairInfos() async {
     try {
       final f = await _pairInfoFile();
       if (!await f.exists()) {
-        AppLog.i('connect', '无历史配对信息');
-        return null;
+        AppLog.i('connect', '无配对历史');
+        return [];
       }
-      final json = jsonDecode(await f.readAsString());
-      if (json is Map<String, dynamic>) {
-        final info = PairInfo.fromJson(json);
-        if (info.server.isNotEmpty && info.code.isNotEmpty) {
-          // 正式版统一服务器地址：历史测试版本可能保存了非默认地址
-          // （如兼容端口 48828），自动迁移为默认地址，避免升级后连不上
-          if (info.server != defaultServerUrl) {
-            AppLog.w('connect', '配对信息地址非默认(${info.server})，迁移为 $defaultServerUrl');
-            await savePairInfo(defaultServerUrl, info.code);
-            return PairInfo(server: defaultServerUrl, code: info.code);
-          }
-          AppLog.i('connect', '读取配对信息: server=${info.server}');
-          return info;
+      final data = jsonDecode(await f.readAsString());
+      final list = <PairInfo>[];
+      if (data is List) {
+        for (final e in data.whereType<Map>()) {
+          final p = PairInfo.fromJson(Map<String, dynamic>.from(e));
+          if (p.server.isNotEmpty && p.code.isNotEmpty) list.add(p);
         }
-        AppLog.w('connect', '配对信息不完整，忽略');
+      } else if (data is Map<String, dynamic>) {
+        // 旧版单对象：迁移为列表（历史测试版本可能保存了非默认地址
+        // 如兼容端口 48828，统一迁移为默认地址避免升级后连不上）
+        var p = PairInfo.fromJson(data);
+        if (p.server.isNotEmpty && p.code.isNotEmpty) {
+          if (p.server != defaultServerUrl) {
+            AppLog.w('connect',
+                '配对信息地址非默认(${p.server})，迁移为 $defaultServerUrl');
+            p = PairInfo(
+                server: defaultServerUrl,
+                code: p.code,
+                name: p.name,
+                lastAt: p.lastAt,
+                shareToken: p.shareToken);
+          }
+          list.add(p);
+          await _writePairInfos(list);
+        }
       }
+      list.sort((a, b) => (b.lastAt ??
+              DateTime.fromMillisecondsSinceEpoch(0))
+          .compareTo(a.lastAt ?? DateTime.fromMillisecondsSinceEpoch(0)));
+      AppLog.i('connect', '读取配对历史: ${list.length} 条');
+      return list;
     } catch (e) {
-      AppLog.e('connect', '读取配对信息失败', e);
+      AppLog.e('connect', '读取配对历史失败', e);
+      return [];
+    }
+  }
+
+  Future<void> _writePairInfos(List<PairInfo> list) async {
+    try {
+      final f = await _pairInfoFile();
+      await f.writeAsString(
+          jsonEncode(list.map((p) => p.toJson()).toList()));
+    } catch (e) {
+      AppLog.e('connect', '写入配对历史失败', e);
+    }
+  }
+
+  /// 保存/更新一条配对历史：同一 server+code+shareToken 合并更新连接时间；
+  /// 上限 10 条，超出丢弃最旧记录
+  Future<void> savePairInfo(String server, String code,
+      {String? name, String? shareToken}) async {
+    try {
+      final list = await loadPairInfos();
+      list.removeWhere((p) =>
+          p.server == server &&
+          p.code == code &&
+          (p.shareToken ?? '') == (shareToken ?? ''));
+      list.insert(
+          0,
+          PairInfo(
+              server: server,
+              code: code,
+              name: name,
+              lastAt: DateTime.now(),
+              shareToken: shareToken));
+      if (list.length > 10) list.removeRange(10, list.length);
+      await _writePairInfos(list);
+      AppLog.i('connect',
+          '配对历史已保存: server=$server${shareToken != null ? ' (共享)' : ''}');
+    } catch (e) {
+      AppLog.e('connect', '保存配对历史失败（不影响主流程）', e);
+    }
+  }
+
+  /// 删除一条配对历史
+  Future<void> removePairInfo(String server, String code,
+      {String? shareToken}) async {
+    try {
+      final list = await loadPairInfos();
+      final before = list.length;
+      list.removeWhere((p) =>
+          p.server == server &&
+          p.code == code &&
+          (p.shareToken ?? '') == (shareToken ?? ''));
+      if (list.length != before) await _writePairInfos(list);
+    } catch (e) {
+      AppLog.e('connect', '删除配对历史失败', e);
+    }
+  }
+
+  /// 读取最近一次配对的电脑（不含共享记录，用于启动自动直连）
+  Future<PairInfo?> loadPairInfo() async {
+    final list = await loadPairInfos();
+    for (final p in list) {
+      if (!p.isShare) return p;
     }
     return null;
   }

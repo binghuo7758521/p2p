@@ -116,7 +116,7 @@ class _AuthGateState extends State<_AuthGate> {
       );
       if (!mounted) return;
       if (action == 'download') {
-        if (info.url != null) openDownloadUrl(info.url!);
+        if (info.url != null) await _downloadAndInstall(info.url!);
         return;
       }
       if (action == 'later') return;
@@ -125,6 +125,61 @@ class _AuthGateState extends State<_AuthGate> {
       AppLog.i('app', '升级弹窗被盖/关闭，重新弹出');
       await Future.delayed(const Duration(milliseconds: 300));
     }
+  }
+
+  /// App 内下载升级包（v4.9+：升级包在对象存储，浏览器直链受限）：
+  /// 显示下载进度，完成后拉起系统安装器
+  Future<void> _downloadAndInstall(String url) async {
+    final progress = ValueNotifier<double?>(null);
+    final status = ValueNotifier<String>('准备下载…');
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('下载升级包'),
+        content: ValueListenableBuilder<double?>(
+          valueListenable: progress,
+          builder: (ctx, p, _) => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (p == null)
+                const CircularProgressIndicator()
+              else
+                LinearProgressIndicator(value: p),
+              const SizedBox(height: 12),
+              ValueListenableBuilder<String>(
+                valueListenable: status,
+                builder: (ctx, s, _) => Text(s),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    final result = await downloadAndInstallApk(
+      url,
+      context: context,
+      onProgress: (received, total) {
+        progress.value = total > 0 ? received / total : null;
+        status.value = total > 0
+            ? '已下载 ${(received / 1048576).toStringAsFixed(1)} / '
+                '${(total / 1048576).toStringAsFixed(1)} MB'
+            : '已下载 $received 字节';
+      },
+    );
+    if (!mounted) return;
+    Navigator.of(context).pop(); // 关闭进度对话框
+    // 按安装结果提示（v5.2：未授权/失败不再静默）
+    final msg = switch (result) {
+      InstallResult.installed => '升级包已下载，请在系统安装界面确认安装',
+      InstallResult.needPermission => '请到系统设置开启安装权限后重试升级',
+      InstallResult.cancelled => '已取消升级，可稍后在升级提示中重试',
+      InstallResult.failed => '下载或安装失败，请重新尝试升级',
+    };
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg),
+      duration: const Duration(seconds: 4),
+    ));
   }
 
   @override

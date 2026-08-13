@@ -10,12 +10,14 @@ class UpdateInfo {
   final bool needUpdate; // 是否需要升级
   final String? url; // 升级包下载地址（相对路径）
   final String notes; // 更新说明
+  final String? md5; // 升级包 MD5（静默升级完整性校验；null 时回退手动下载）
 
   const UpdateInfo({
     required this.latest,
     required this.needUpdate,
     this.url,
     this.notes = '',
+    this.md5,
   });
 
   factory UpdateInfo.fromJson(Map<String, dynamic> json) => UpdateInfo(
@@ -23,6 +25,7 @@ class UpdateInfo {
         needUpdate: json['needUpdate'] == true,
         url: json['url']?.toString(),
         notes: json['notes']?.toString() ?? '',
+        md5: json['md5']?.toString(),
       );
 }
 
@@ -60,5 +63,39 @@ void openDownloadUrl(String relativeUrl) {
     Process.start('explorer.exe', [url]);
   } catch (e) {
     AppLog.e('update', '打开下载地址失败', e);
+  }
+}
+
+/// 下载升级包到本地文件（带进度回调：已下载字节/总字节）
+///
+/// 失败时抛出异常，由调用方决定回退策略。
+Future<void> downloadUpgradeZip(
+  String relativeUrl,
+  String targetPath,
+  void Function(int received, int total)? onProgress,
+) async {
+  final uri = Uri.parse('$defaultServerUrl$relativeUrl');
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+  try {
+    final req = await client.getUrl(uri);
+    final resp = await req.close();
+    if (resp.statusCode != 200) {
+      throw HttpException('下载失败: HTTP ${resp.statusCode}', uri: uri);
+    }
+    final total = resp.contentLength;
+    final sink = File(targetPath).openWrite();
+    var received = 0;
+    try {
+      await for (final chunk in resp) {
+        sink.add(chunk);
+        received += chunk.length;
+        onProgress?.call(received, total);
+      }
+      await sink.flush();
+    } finally {
+      await sink.close();
+    }
+  } finally {
+    client.close();
   }
 }
