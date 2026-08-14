@@ -78,7 +78,30 @@ Future<bool> runSilentUpgrade({
       target.writeAsBytesSync(entry.content, flush: true);
     }
     // 解压产物必须包含主程序 exe，否则拒绝升级（防止错误/损坏的升级包）
-    if (!File('$newDir\\$exeName').existsSync()) {
+    var appExe = File('$newDir\\$exeName');
+    if (!appExe.existsSync()) {
+      // 兼容带一层外层文件夹的升级包（zip 内套目录）：找到含 exe 的唯一
+      // 子目录并提升内容到 newDir 根，避免“升级包缺少 exe”误拒
+      final subs = Directory(newDir)
+          .listSync(followLinks: false)
+          .whereType<Directory>()
+          .toList();
+      if (subs.length == 1 &&
+          File('${subs.first.path}\\$exeName').existsSync()) {
+        final sub = subs.first;
+        for (final f in sub.listSync(recursive: true, followLinks: false)) {
+          if (f is! File) continue;
+          final rel = f.path.substring(sub.path.length + 1);
+          final t = File('$newDir\\$rel');
+          t.parent.createSync(recursive: true);
+          f.copySync(t.path);
+        }
+        AppLog.w('update',
+            '升级包含外层文件夹 ${sub.path.split('\\').last}，已提升内容');
+        appExe = File('$newDir\\$exeName');
+      }
+    }
+    if (!appExe.existsSync()) {
       AppLog.e('update', '升级包缺少 $exeName，拒绝升级');
       return false;
     }

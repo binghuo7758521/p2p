@@ -151,6 +151,7 @@ class _HomePageState extends State<HomePage> {
                 controller.state == HostState.peerConnected;
             final waiting =
                 controller.state == HostState.registered;
+            final offline = controller.state == HostState.offline;
             // 在线用户（第一个为管理员）
             final onlineUsers = controller.users.values
                 .where((u) => u.online)
@@ -166,18 +167,22 @@ class _HomePageState extends State<HomePage> {
                 Text('P2P 文件助手 - 电脑端',
                     style: const TextStyle(fontSize: 18)),
                 Text(
-                  connected
-                      ? onlineDesc
-                      : waiting
-                          ? '等待手机连接 · 配对码 ${controller.pairCode}'
-                          : '未连接',
+                  offline
+                      ? '离线（不接受手机连接）'
+                      : connected
+                          ? onlineDesc
+                          : waiting
+                              ? '等待手机连接 · 配对码 ${controller.pairCode}'
+                              : '未连接',
                   style: TextStyle(
                       fontSize: 12,
-                      color: connected
-                          ? Colors.green
-                          : waiting
-                              ? Colors.orange
-                              : Colors.redAccent),
+                      color: offline
+                          ? Colors.grey
+                          : connected
+                              ? Colors.green
+                              : waiting
+                                  ? Colors.orange
+                                  : Colors.redAccent),
                 ),
                 if (connected) ...[const SizedBox(height: 2), _ConnBadge(controller: controller)],
               ],
@@ -242,9 +247,10 @@ class _HomePageState extends State<HomePage> {
           ),
           ListenableBuilder(
             listenable: controller,
-            // 共享文件夹管理：连接成功后始终可见
+            // 共享文件夹管理：注册后即可管理（无手机连接时也可
+            // 提前设置共享，配置本地持久化 + 服务器同步；仅断网隐藏）
             builder: (context, _) =>
-                controller.state == HostState.peerConnected
+                controller.state != HostState.idle
                     ? IconButton(
                         tooltip: '共享文件夹管理',
                         icon: const Icon(Icons.folder_shared),
@@ -258,9 +264,9 @@ class _HomePageState extends State<HomePage> {
           ),
           ListenableBuilder(
             listenable: controller,
-            // 手机端管理：连接成功后可见（在线/离线用户、踢出/删除）
+            // 手机端管理：注册后即可查看（含离线用户记录，可删除）
             builder: (context, _) =>
-                controller.state == HostState.peerConnected
+                controller.state != HostState.idle
                     ? IconButton(
                         tooltip: '手机端管理',
                         icon: const Icon(Icons.people_alt_outlined),
@@ -272,17 +278,16 @@ class _HomePageState extends State<HomePage> {
                       )
                     : const SizedBox.shrink(),
           ),
-          IconButton(
-            tooltip: '断开连接',
-            icon: const Icon(Icons.link_off),
-            onPressed: () async {
-              await controller.disconnect();
-              if (!context.mounted) return;
-              Navigator.of(context).pushReplacement(
-                MaterialPageRoute(
-                    builder: (_) => ConnectPage(controller: controller)),
-              );
-            },
+          // 在线/离线开关：离线=不接受手机端连接；在线=接受（默认）
+          ListenableBuilder(
+            listenable: controller,
+            builder: (context, _) => Tooltip(
+              message: controller.isOnline ? '在线，点击切换离线' : '离线，点击切换在线',
+              child: Switch(
+                value: controller.isOnline,
+                onChanged: (v) => controller.setOnline(v),
+              ),
+            ),
           ),
         ],
       ),

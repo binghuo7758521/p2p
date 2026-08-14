@@ -60,9 +60,9 @@ const PORT = process.env.PORT || 3000;
 // 规则: 手机端 / 电脑端 / 服务器端 三端版本互相独立（vX.Y）
 // - 只要某端代码有修改，该端版本号 +0.1（v1.0 → v1.1 → v1.2 ...）
 // - 本文件同时记录三端最新版本，便于 /version 统一核对
-const SERVER_VERSION = '2.4';   // 服务器端版本
-const DESKTOP_VERSION = '5.5';  // 电脑端版本
-const ANDROID_VERSION = '5.2';  // 手机端版本
+const SERVER_VERSION = '2.5';   // 服务器端版本
+const DESKTOP_VERSION = '5.8';  // 电脑端版本
+const ANDROID_VERSION = '5.3';  // 手机端版本
 
 // 版本查询接口：调试时确认各端是否最新
 app.get('/version', (req, res) => {
@@ -171,7 +171,13 @@ app.get('/update-check', async (req, res) => {
     latest,
     needUpdate,
     url: hasFile ? `/downloads/${file}` : null,
-    notes: hasFile ? `升级到 v${latest}（服务器已就绪）` : '',
+    // 手机端升级提示附带安装引导：v5.0 及以下老版本无安装权限引导，
+    // 需用户先在系统设置手动开启“安装未知应用”（Android 8+ 硬前提）
+    notes: hasFile
+        ? (platform === 'android'
+            ? `升级到 v${latest}；若安装界面未弹出，请在 系统设置-应用-P2P 文件助手-安装未知应用 中允许后重试`
+            : `升级到 v${latest}（服务器已就绪）`)
+        : '',
     // 电脑端升级包 MD5：客户端静默升级完整性校验（无 MD5 时客户端回退手动下载）
     md5: platform === 'desktop' && hasFile ? desktopZipMd5() : null
   });
@@ -1097,6 +1103,22 @@ io.on('connection', (socket) => {
       }
     }
     log(`[注册] ${deviceName || '电脑'}${version ? ' v' + version : ''} → 配对码 ${pairCode} (socket=${socket.id})`);
+  });
+
+  // 电脑端主动离线（v2.5+）：删除会话并通知手机端断开——与意外断线
+  // （保留会话、等待自动重连覆盖）不同，主动离线后手机端 join 会立即
+  // 收到 host-offline，不会登记等待
+  socket.on('host:offline', () => {
+    if (socket.role !== 'host' || !socket.pairCode) return;
+    const code = socket.pairCode;
+    const session = sessions.get(code);
+    if (session?.clients) {
+      for (const cid of session.clients.keys()) {
+        io.to(cid).emit('peer:disconnected');
+      }
+    }
+    sessions.delete(code);
+    log(`[离线] 电脑端主动离线: ${socket.id} code=${code}`);
   });
 
   // 重新生成配对码（仅主机可用）：旧码失效。

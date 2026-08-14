@@ -17,6 +17,7 @@ enum HostState {
   registered, // 已注册（配对码就绪，等待手机）
   peerConnected, // 手机已连接
   lost, // 连接断开
+  offline, // 主动离线（不注册、不接受手机端连接，本地功能可用）
 }
 
 /// 共享配置：管理员给某个用户（设备或手机号）共享的一个文件夹
@@ -437,6 +438,17 @@ class HostController extends ChangeNotifier {
         final u = HostUser.fromJson(Map<String, dynamic>.from(item));
         if (u.deviceId.isEmpty) continue;
         u.clientId = null; // 离线状态，重新 join 时恢复在线
+        // 管理员身份一致性校正（防历史脏数据/误标）：共享访客永不可能是
+        // 管理员；已持久化管理员手机号时，仅同一手机号的用户保留管理员标记
+        if (u.isAdmin &&
+            (u.shareOnly ||
+                (adminPhone != null &&
+                    adminPhone!.isNotEmpty &&
+                    u.phone != adminPhone))) {
+          u.isAdmin = false;
+          AppLog.w('host',
+              '校正管理员标记: ${u.deviceId} (shareOnly=${u.shareOnly} phone=${u.phone})');
+        }
         users[u.deviceId] = u;
         if (u.isAdmin && (adminDeviceId == null || adminDeviceId!.isEmpty)) {
           adminDeviceId = u.deviceId;
@@ -856,6 +868,32 @@ class HostController extends ChangeNotifier {
     _recvStates.clear();
     _sendingClients.clear();
     notifyListeners();
+  }
+
+  /// 是否在线（已注册/已连接，接受手机端连接）
+  bool get isOnline =>
+      state == HostState.registered || state == HostState.peerConnected;
+
+  /// 在线/离线切换：
+  /// - 离线：通知服务器删除会话（手机端立即收到“电脑离线”），停止信令且
+  ///   不再自动重连；保留 users/shares/transfers 等本地数据（管理页仍可用）
+  /// - 在线：重新注册（配对码按硬件 ID 持久化，不变）
+  Future<void> setOnline(bool on) async {
+    if (on == isOnline) return;
+    if (on) {
+      if (serverUrl.isEmpty) return;
+      AppLog.i('host', '切换为在线，重新注册');
+      await connect(server: serverUrl);
+    } else {
+      AppLog.i('host', '切换为离线，停止接受手机端连接');
+      await _service.goOffline();
+      state = HostState.offline;
+      pairCode = '';
+      // 仅清理传输态内存，保留 users/shares/transfers/adminPhone
+      _recvStates.clear();
+      _sendingClients.clear();
+      notifyListeners();
+    }
   }
 
   // 传输中断清理：关闭该客户端的接收流（保留 .part 供续传）、复位发送状态

@@ -699,6 +699,15 @@ class HostService {
     await _closeSession(clientId);
   }
 
+  /// 主动离线：通知服务器删除本机会话（手机端立即收到“电脑离线”，
+  /// 不再登记等待），随后断开 socket 且不自动重连
+  Future<void> goOffline() async {
+    try {
+      _socket?.emit('host:offline');
+    } catch (_) {}
+    await dispose();
+  }
+
   Future<void> dispose() async {
     _disposed = true;
     _reconnectTimer?.cancel();

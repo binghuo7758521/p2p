@@ -11,7 +11,7 @@ import 'app_controller.dart';
 import 'app_log.dart';
 import 'models.dart';
 
-/// 管理员用户管理页：查看用户、共享文件夹（二维码）、踢出/删除用户
+/// 管理员用户管理页：查看用户、共享文件夹管理（新增/二维码）、踢出/删除用户
 class UsersPage extends StatefulWidget {
   final AppController controller;
 
@@ -255,8 +255,8 @@ class _UsersPageState extends State<UsersPage> {
         title: const Text('共享文件夹管理'),
         actions: [
           IconButton(
-            tooltip: '新增共享（生成二维码）',
-            icon: const Icon(Icons.qr_code_2),
+            tooltip: '新增共享',
+            icon: const Icon(Icons.create_new_folder),
             onPressed: () => _openShareDialog(null),
           ),
         ],
@@ -291,7 +291,7 @@ class _UsersPageState extends State<UsersPage> {
           final shares = controller.allShares;
           if (shares.isEmpty) {
             return const Center(
-              child: Text('暂无共享文件夹\n点击右上角二维码图标发起共享',
+              child: Text('暂无共享文件夹\n点击右上角文件夹加号图标发起共享',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Colors.grey)),
             );
