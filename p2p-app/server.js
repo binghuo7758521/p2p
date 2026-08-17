@@ -1,25 +1,17 @@
 /**
- * P2P 文件存取系统 — 信令服务器
+ * 无限大盘 — 信令服务器
  * 
  * 功能：
  * 1. 10位配对码（大写字母+数字），设备配对
  * 2. WebRTC SDP/ICE 信令转发
  * 3. 托管前端静态文件
- * 4. 手机用户体系：短信验证码注册 / 登录（Token 认证，30 天有效）
- * 5. 后台管理 API：用户管理 + 系统运行状态
+ * 4. 激活码激活：电脑端生成激活码（管理员码/普通码），手机端凭码激活
+ *    并连接电脑；服务器仅作激活码查询与配对转发，不存任何用户信息
+ * 5. 后台管理 API：运行状态 + 电脑端列表
  * 
  * 环境变量（占位配置）：
- *   SMS_DEV=1            开发模式：验证码直接返回，不发真实短信
- *   ALIYUN_ACCESS_KEY_ID       阿里云 AccessKey ID
- *   ALIYUN_ACCESS_KEY_SECRET   阿里云 AccessKey Secret
- *   ALIYUN_SMS_SIGN_NAME       阿里云短信认证-赠送签名名称（控制台赠送签名配置页）
- *   ALIYUN_SMS_TEMPLATE_CODE   阿里云短信认证-赠送模板CODE（如 100001）
  *   OSS_BASE_URL               升级包对象存储域名（如 https://xxx.oss-cn-hangzhou.aliyuncs.com，
  *                              配置后 /downloads 302 重定向到 OSS，升级包不占 ECS 带宽）
- * 
- * 短信能力：阿里云短信认证服务（号码认证产品线 Dypnsapi）
- *   - 发送: SendSmsVerifyCode（验证码由系统生成，官方可核验）
- *   - 核验: CheckSmsVerifyCode（VerifyResult=PASS 通过）
  * 
  * 启动: node server.js
  * 端口: 3000
@@ -60,9 +52,13 @@ const PORT = process.env.PORT || 3000;
 // 规则: 手机端 / 电脑端 / 服务器端 三端版本互相独立（vX.Y）
 // - 只要某端代码有修改，该端版本号 +0.1（v1.0 → v1.1 → v1.2 ...）
 // - 本文件同时记录三端最新版本，便于 /version 统一核对
-const SERVER_VERSION = '2.5';   // 服务器端版本
-const DESKTOP_VERSION = '5.8';  // 电脑端版本
-const ANDROID_VERSION = '5.3';  // 手机端版本
+const SERVER_VERSION = '2.13';  // 服务器端版本
+const DESKTOP_VERSION = '6.18';  // 电脑端版本
+const ANDROID_VERSION = '5.25'; // 手机端版本
+// 手机端最低可用版本（v2.7+ 强制升级）：低于此版本的手机端一律拒绝
+// 激活与连接（update-check 返回 force；激活/信令返回 APP_VERSION_REQUIRED），
+// 必须升级到最新版才能正常使用
+const MIN_ANDROID_VERSION = '5.6';
 
 // 版本查询接口：调试时确认各端是否最新
 app.get('/version', (req, res) => {
@@ -75,7 +71,7 @@ app.get('/version', (req, res) => {
 
 // ── 手机端日志上传 ──────────────────────────────────────────────
 // 手机端一键上传 app.log 到服务器 logs/ 目录，便于远程排查传输问题
-// 请求体为日志纯文本（text/plain），query 携带 deviceId/version/phone
+// 请求体为日志纯文本（text/plain），query 携带 deviceId/version
 const LOGS_DIR = join(__dirname, 'logs');
 app.post('/log-upload', express.text({ limit: '3mb', type: 'text/plain' }), (req, res) => {
   const clean = (s, allowed) => String(s || '').replace(new RegExp(`[^${allowed}]`, 'g'), '');
@@ -108,18 +104,18 @@ const OSS_BASE_URL = (process.env.OSS_BASE_URL || '').replace(/\/+$/, '');
 // 下载文件名 → OSS 对象名映射（规避 APK 下载限制）
 const OSS_OBJECT_MAP = { 'app-release.apk': 'app-release' };
 
-// 电脑端升级包 MD5 缓存（静默升级完整性校验；按文件大小变化失效）
+// 升级包 MD5 缓存（客户端完整性校验；按文件大小变化失效）
 // 发布时需同时将升级包上传到 downloads 目录，否则返回 null（客户端拒绝静默升级）
-let zipMd5Cache = { file: '', size: -1, md5: '' };
-function desktopZipMd5() {
-  const p = join(DOWNLOADS_DIR, 'p2p_desktop.zip');
+let pkgMd5Cache = { file: '', size: -1, md5: '' };
+function packageMd5(file) {
+  const p = join(DOWNLOADS_DIR, file);
   if (!existsSync(p)) return null;
   const size = statSync(p).size;
-  if (zipMd5Cache.file === p && zipMd5Cache.size === size) return zipMd5Cache.md5;
+  if (pkgMd5Cache.file === p && pkgMd5Cache.size === size) return pkgMd5Cache.md5;
   const h = createHash('md5');
   h.update(readFileSync(p));
   const md5 = h.digest('hex');
-  zipMd5Cache = { file: p, size, md5 };
+  pkgMd5Cache = { file: p, size, md5 };
   return md5;
 }
 
@@ -135,10 +131,25 @@ if (!OSS_BASE_URL) {
   app.use('/downloads', express.static(DOWNLOADS_DIR));
 }
 
-// 版本号转数值（v1.5 → 1.5），用于大小比较
+// 手动下载 APK（v5.7+）：旧版手机端（≤v5.6）自动升级安装链路缺陷无法拉起安装器时，
+// 用手机浏览器打开 /manual/apk 直接下载带 .apk 后缀的安装包后手动安装。
+// 不走 OSS 直链：OSS 公网 endpoint 禁止分发 APK（ApkDownloadForbidden），
+// 且无后缀对象下载后无法被系统识别为安装包。低频路径，占用 ECS 带宽可接受。
+app.get('/manual/apk', (req, res) => {
+  const file = join(DOWNLOADS_DIR, 'app-release.apk');
+  if (!existsSync(file)) return res.status(404).send('升级包不存在');
+  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+  res.setHeader('Content-Disposition', 'attachment; filename="app-release.apk"');
+  res.sendFile(file);
+});
+
+// 版本号转数值（v1.5 → 105），用于大小比较；
+// 分段解析避免 parseFloat 把 5.10 解析成 5.1（次版本号 ≥10 时误判为旧版）
 function verNum(v) {
-  const n = parseFloat(String(v));
-  return Number.isNaN(n) ? 0 : n;
+  const s = String(v).split('.');
+  const major = parseInt(s[0] || '0', 10) || 0;
+  const minor = parseInt(s[1] || '0', 10) || 0;
+  return major * 100 + minor;
 }
 
 // 升级包是否存在：对象存储模式用 HEAD 探测直链，本地模式查文件
@@ -165,21 +176,25 @@ app.get('/update-check', async (req, res) => {
   const file = platform === 'android' ? 'app-release.apk' : 'p2p_desktop.zip';
   const hasFile = await upgradeFileExists(file);
   const needUpdate = hasFile && verNum(latest) > verNum(current);
+  // v2.7+ 强制升级：手机端版本低于最低可用版本时标记强制更新
+  const force = platform === 'android' && verNum(current) > 0 &&
+      verNum(current) < verNum(MIN_ANDROID_VERSION);
   res.json({
     platform,
     current,
     latest,
-    needUpdate,
+    needUpdate: needUpdate || force,
+    force,
     url: hasFile ? `/downloads/${file}` : null,
     // 手机端升级提示附带安装引导：v5.0 及以下老版本无安装权限引导，
     // 需用户先在系统设置手动开启“安装未知应用”（Android 8+ 硬前提）
     notes: hasFile
         ? (platform === 'android'
-            ? `升级到 v${latest}；若安装界面未弹出，请在 系统设置-应用-P2P 文件助手-安装未知应用 中允许后重试`
+            ? `升级到 v${latest}；若自动安装无反应（旧版安装链路缺陷），请用手机浏览器打开 http://182.92.157.93:3000/manual/apk 下载后点击安装`
             : `升级到 v${latest}（服务器已就绪）`)
         : '',
-    // 电脑端升级包 MD5：客户端静默升级完整性校验（无 MD5 时客户端回退手动下载）
-    md5: platform === 'desktop' && hasFile ? desktopZipMd5() : null
+    // 升级包 MD5：客户端下载后完整性校验（无 MD5 时客户端回退手动下载）
+    md5: hasFile ? packageMd5(file) : null
   });
   if (platform === 'android') {
     log(`[升级检查] 手机端 v${current} → ${needUpdate ? '有新版 v' + latest : '已最新'}`);
@@ -306,10 +321,10 @@ function getCurrentPairCode() {
 }
 
 // ── 共享注册表（v2.4+）────────────────────────────────────
-// 电脑端创建/删除/修改共享时全量同步到服务器，手机端登录后按手机号
+// 电脑端创建/删除/修改共享时全量同步到服务器，手机端激活后按设备
 // 拉取“共享给我的”列表，并通过 client:join-by-share 免配对码连接电脑端。
 // shareRegistry: { token: { token, deviceId, pairCode, hostName, name,
-//   folder, perms[], targetPhone|null, createdAt, updatedAt } }
+//   folder, perms[], targetDeviceId|null, createdAt, updatedAt } }
 const SHARES_FILE = join(process.cwd(), 'shares.json');
 let shareRegistry = loadJson(SHARES_FILE, {});
 if (!shareRegistry || typeof shareRegistry !== 'object') shareRegistry = {};
@@ -319,6 +334,23 @@ function saveShares() {
     saveJson(SHARES_FILE, shareRegistry);
   } catch (e) {
     console.error(`[共享] 保存 ${SHARES_FILE} 失败: ${e.message}`);
+  }
+}
+
+// ── 扫码加入绑定（v2.8+）────────────────────────────────────
+// 手机端通过 client:join-by-share 扫码加入公开共享时记录 deviceId→token 绑定，
+// 使该共享持久化出现在“共享给我的”列表中（免重复扫码）；
+// 独立存储：电脑端 /api/shares/sync 全量覆盖不会冲掉绑定关系。
+// 绑定结构: { deviceId: { token: joinedAt } }
+const JOIN_FILE = join(process.cwd(), 'join-relations.json');
+let joinRelations = loadJson(JOIN_FILE, {});
+if (!joinRelations || typeof joinRelations !== 'object') joinRelations = {};
+
+function saveJoinRelations() {
+  try {
+    saveJson(JOIN_FILE, joinRelations);
+  } catch (e) {
+    console.error(`[共享] 保存 ${JOIN_FILE} 失败: ${e.message}`);
   }
 }
 
@@ -361,7 +393,7 @@ function syncHostShares(deviceId, shares) {
       perms: Array.isArray(s.perms)
           ? s.perms.filter((p) => ['download', 'upload', 'delete'].includes(p))
           : [],
-      targetPhone: s.targetPhone ? String(s.targetPhone).slice(0, 20) : null,
+      targetDeviceId: s.targetDeviceId ? String(s.targetDeviceId).slice(0, 64) : null,
       createdAt: Number(s.createdAt) || now,
       updatedAt: now,
     };
@@ -415,7 +447,8 @@ function saveJson(file, data) {
   writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
 }
 
-// 用户库: { users: [{ phone, salt, hash, status, createdAt, lastLoginAt }], admin: { username, salt, hash, createdAt } }
+// 管理后台库: { admin: { username, salt, hash, createdAt } }
+// v2.6+ 去手机号后不再存储任何用户，users 数组仅兼容历史文件保留
 const db = loadJson(USERS_FILE, { users: [], admin: null });
 if (!Array.isArray(db.users)) db.users = [];
 saveJson(USERS_FILE, db); // 确保文件存在
@@ -455,9 +488,9 @@ function saveTokens() {
   saveJson(TOKENS_FILE, tokens);
 }
 
-function createToken(phone, role) {
+function createToken(uid, role) {
   const token = randomBytes(24).toString('hex');
-  tokens[token] = { phone, role, createdAt: Date.now() };
+  tokens[token] = { uid, role, createdAt: Date.now() };
   saveTokens();
   return token;
 }
@@ -488,115 +521,57 @@ setInterval(() => {
   if (changed) saveTokens();
 }, 3600 * 1000);
 
-// ── 短信验证码（阿里云短信认证服务） ──────────────────────────
-const smsCodes = new Map(); // phone -> { code, expiresAt, lastSentAt }（仅开发模式使用）
-const SMS_TTL_MS = 5 * 60 * 1000; // 验证码 5 分钟有效
-const SMS_RESEND_MS = 60 * 1000; // 60 秒内不可重复发送
+// ── 激活码体系（v2.6+，去手机号） ──────────────────────────
+// 电脑端本地生成激活码（管理员码/普通码）并同步到服务器；手机端输入
+// 激活码换取配对码+设备令牌，凭设备令牌拉取“共享给我的”列表。
+// 服务器只存临时凭证（激活码/设备令牌），不存任何用户个人信息。
+const ACT_CODE_TTL_MS = 24 * 3600 * 1000; // 激活码 24 小时有效
+const actCodes = new Map(); // code -> { pairCode, type, createdAt }
+const usedCodes = new Map(); // code -> usedAt（防重放，保留 24h）
+const ACT_DEVICES_FILE = join(process.cwd(), 'act-devices.json');
+let actDevices = loadJson(ACT_DEVICES_FILE, {}); // deviceId -> { token, createdAt }
+if (!actDevices || typeof actDevices !== 'object') actDevices = {};
 
-/**
- * 发送短信验证码（阿里云短信认证服务 SendSmsVerifyCode）。
- * SMS_DEV=1 时本地生成验证码并直接返回（开发/演示模式）；
- * 否则验证码由阿里云系统生成并下发短信（TemplateParam 使用 ##code## 占位符，可被官方核验）。
- */
-async function sendSmsCode(phone) {
-  if (process.env.SMS_DEV === '1') {
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    console.log(`[短信][开发模式] ${phone} 验证码: ${code}`);
-    return { ok: true, code };
-  }
+function saveActDevices() {
   try {
-    if (!process.env.ALIYUN_ACCESS_KEY_ID || !process.env.ALIYUN_ACCESS_KEY_SECRET || !process.env.ALIYUN_SMS_SIGN_NAME || !process.env.ALIYUN_SMS_TEMPLATE_CODE) {
-      return { ok: false, error: '短信服务未配置：请设置 ALIYUN_ACCESS_KEY_ID/SECRET、ALIYUN_SMS_SIGN_NAME、ALIYUN_SMS_TEMPLATE_CODE（开发模式请设置 SMS_DEV=1）' };
-    }
-    const Dypnsapi = (await import('@alicloud/dypnsapi20170525')).default;
-    const OpenApi = (await import('@alicloud/openapi-client')).default;
-
-    const config = new OpenApi.Config({
-      accessKeyId: process.env.ALIYUN_ACCESS_KEY_ID,
-      accessKeySecret: process.env.ALIYUN_ACCESS_KEY_SECRET,
-    });
-    config.endpoint = 'dypnsapi.aliyuncs.com';
-    const client = new Dypnsapi.default(config);
-
-    const req = new Dypnsapi.SendSmsVerifyCodeRequest({
-      phoneNumber: phone,
-      signName: process.env.ALIYUN_SMS_SIGN_NAME,
-      templateCode: process.env.ALIYUN_SMS_TEMPLATE_CODE,
-      templateParam: JSON.stringify({ code: '##code##', min: '5' }),
-      codeLength: 6,   // 6 位验证码
-      codeType: 1,     // 纯数字
-      validTime: 300,  // 5 分钟有效
-      interval: 60,    // 60 秒频控
-    });
-    const resp = await client.sendSmsVerifyCode(req);
-    if (resp.body.code === 'OK') return { ok: true };
-    return { ok: false, error: `阿里云短信认证: ${resp.body.code} ${resp.body.message}` };
+    saveJson(ACT_DEVICES_FILE, actDevices);
   } catch (e) {
-    return { ok: false, error: `短信发送失败: ${e.message || e}` };
+    console.error(`[激活] 保存 ${ACT_DEVICES_FILE} 失败: ${e.message}`);
   }
 }
 
-/**
- * 核验短信验证码。
- * 开发模式：内存比对；生产模式：调用 CheckSmsVerifyCode 官方核验（VerifyResult=PASS 通过）。
- */
-async function verifySmsCode(phone, code) {
-  if (process.env.SMS_DEV === '1') {
-    const rec = smsCodes.get(phone);
-    if (!rec) return { ok: false, error: '请先获取验证码' };
-    if (rec.code !== code) return { ok: false, error: '验证码错误' };
-    if (Date.now() > rec.expiresAt) {
-      smsCodes.delete(phone);
-      return { ok: false, error: '验证码已过期，请重新获取' };
-    }
-    smsCodes.delete(phone);
-    return { ok: true };
+/** 电脑端上报未用激活码列表（host:sync-codes，幂等覆盖该设备的码） */
+function syncActivationCodes(deviceId, pairCode, codes) {
+  if (!deviceId || !pairCode) return;
+  // 先清掉该设备旧码（防止电脑端重启后旧码残留）
+  for (const [c, info] of [...actCodes]) {
+    if (info.pairCode === pairCode) actCodes.delete(c);
   }
-  try {
-    if (!process.env.ALIYUN_ACCESS_KEY_ID || !process.env.ALIYUN_ACCESS_KEY_SECRET) {
-      return { ok: false, error: '短信服务未配置：请设置 ALIYUN_ACCESS_KEY_ID/SECRET（开发模式请设置 SMS_DEV=1）' };
-    }
-    const Dypnsapi = (await import('@alicloud/dypnsapi20170525')).default;
-    const OpenApi = (await import('@alicloud/openapi-client')).default;
-
-    const config = new OpenApi.Config({
-      accessKeyId: process.env.ALIYUN_ACCESS_KEY_ID,
-      accessKeySecret: process.env.ALIYUN_ACCESS_KEY_SECRET,
-    });
-    config.endpoint = 'dypnsapi.aliyuncs.com';
-    const client = new Dypnsapi.default(config);
-
-    const req = new Dypnsapi.CheckSmsVerifyCodeRequest({
-      phoneNumber: phone,
-      verifyCode: code,
-    });
-    const resp = await client.checkSmsVerifyCode(req);
-    if (resp.body.code !== 'OK') {
-      return { ok: false, error: `核验服务异常: ${resp.body.code} ${resp.body.message}` };
-    }
-    if (resp.body.model?.verifyResult === 'PASS') return { ok: true };
-    return { ok: false, error: '验证码错误或已过期' };
-  } catch (e) {
-    const errCode = String(e.code || '');
-    if (errCode === 'isv.ValidateFail') return { ok: false, error: '验证码错误或已过期' };
-    return { ok: false, error: `验证码核验失败: ${e.message || e}` };
+  const now = Date.now();
+  for (const c of Array.isArray(codes) ? codes : []) {
+    const code = String(c?.code || '');
+    // v6.14+ 身份二态化：仅管理员码一种类型（不再接受普通码）
+    const type = 'admin';
+    if (!code) continue;
+    if (usedCodes.has(code)) continue; // 已用过的码不再注册
+    actCodes.set(code, { pairCode, type, createdAt: now });
   }
+  log(`[激活] 电脑端同步激活码: ${deviceId} 共 ${actCodes.size} 个有效码`);
 }
 
-// ── 认证中间件 ───────────────────────────────────────────────
-// 手机用户认证
-function requireUser(req, res, next) {
-  const info = getTokenInfo(req);
-  if (!info) return res.status(401).json({ ok: false, error: '未登录或登录已过期' });
-  if (info.role !== 'user') return res.status(403).json({ ok: false, error: '无权限' });
-  const user = db.users.find((u) => u.phone === info.phone);
-  if (!user) return res.status(401).json({ ok: false, error: '用户不存在' });
-  if (user.status !== 'active') return res.status(403).json({ ok: false, error: '账号已被禁用' });
-  req.user = user;
-  next();
-}
+// 定期清理过期激活码与防重放记录
+setInterval(() => {
+  const now = Date.now();
+  for (const [c, info] of [...actCodes]) {
+    if (now - info.createdAt > ACT_CODE_TTL_MS) actCodes.delete(c);
+  }
+  for (const [c, t] of [...usedCodes]) {
+    if (now - t > ACT_CODE_TTL_MS) usedCodes.delete(c);
+  }
+}, 3600 * 1000);
 
-// 管理员认证
+// ── 认证中间件（仅后台管理员） ───────────────────────────────
+// 后台管理员认证
 function requireAdmin(req, res, next) {
   const info = getTokenInfo(req);
   if (!info) return res.status(401).json({ ok: false, error: '未登录或登录已过期' });
@@ -604,163 +579,93 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// ── 手机用户 API ─────────────────────────────────────────────
-// 发送注册验证码
-app.post('/api/sms/send', async (req, res) => {
-  try {
-    const phone = String(req.body?.phone || '').trim();
-    if (!/^1\d{10}$/.test(phone)) {
-      log(`[验证码] 拒绝: 手机号格式不正确 ${phone}`);
-      return res.json({ ok: false, error: '手机号格式不正确' });
-    }
-    const prev = smsCodes.get(phone);
-    if (prev && Date.now() - prev.lastSentAt < SMS_RESEND_MS) {
-      log(`[验证码] 拒绝: 发送过于频繁 ${phone}`);
-      return res.json({ ok: false, error: '发送过于频繁，请 1 分钟后再试' });
-    }
-    const result = await sendSmsCode(phone);
-    if (!result.ok) return res.json({ ok: false, error: result.error });
-    if (process.env.SMS_DEV === '1') {
-      smsCodes.set(phone, { code: result.code, expiresAt: Date.now() + SMS_TTL_MS, lastSentAt: Date.now() });
-      console.log(`[验证码] ${phone} 已发送（开发模式，${SMS_TTL_MS / 60000} 分钟内有效）`);
-    } else {
-      console.log(`[验证码] ${phone} 短信已下发（阿里云短信认证服务）`);
-    }
-    res.json({ ok: true, devCode: result.code }); // devCode 仅开发模式返回
-  } catch (e) {
-    console.error('[短信] 发送异常:', e);
-    res.json({ ok: false, error: '服务器异常，请稍后再试' });
+// ── 手机端激活 API（v2.6+，去手机号） ─────────────────────────────
+// 手机端凭电脑端发放的管理员激活码换取配对码 + 设备令牌：
+// - 激活码一次性、24 小时有效，由电脑端生成/撤销，服务器只做查询与标记
+// - 设备令牌（deviceToken）用于 /api/shares/mine 等接口鉴权
+// - 服务器不存用户个人信息，仅存临时凭证（act-devices.json）
+app.post('/api/activate', (req, res) => {
+  const version = String(req.body?.version || '');
+  // v2.7+ 强制升级：旧版手机端（低于最低可用版本）拒绝激活
+  if (!version || verNum(version) < verNum(MIN_ANDROID_VERSION)) {
+    log(`[激活] 拒绝: 旧版手机端 v${version || '未知'}（最低 v${MIN_ANDROID_VERSION}）`);
+    return res.json({ ok: false, error: 'APP_VERSION_REQUIRED', latest: ANDROID_VERSION });
   }
+  const code = String(req.body?.code || '').trim().toUpperCase();
+  const deviceId = String(req.body?.deviceId || '').trim();
+  const now = Date.now();
+  if (!/^[A-Z0-9]{6,12}$/.test(code)) {
+    log(`[激活] 拒绝: 激活码格式不正确 ${code}`);
+    return res.json({ ok: false, error: '激活码格式不正确' });
+  }
+  if (!deviceId) {
+    log(`[激活] 拒绝: 缺少设备标识`);
+    return res.json({ ok: false, error: '设备标识无效' });
+  }
+  const info = actCodes.get(code);
+  // 已使用检查前置：避免用过即删的码被误报为“无效或已过期”
+  if (usedCodes.has(code)) {
+    log(`[激活] 失败: 激活码已被使用 ${code}`);
+    return res.json({ ok: false, error: '激活码已被使用' });
+  }
+  if (!info) {
+    log(`[激活] 失败: 激活码无效或已过期 ${code}`);
+    return res.json({ ok: false, error: '激活码无效或已过期' });
+  }
+  // 设备重新激活：撤销旧令牌（原设备需重新激活才能拉取共享）
+  if (actDevices[deviceId]) {
+    log(`[激活] 设备重新激活，撤销旧令牌: ${deviceId}`);
+    delete actDevices[deviceId];
+  }
+  usedCodes.set(code, now);
+  actCodes.delete(code);
+  const deviceToken = createHmac('sha256', 'act-device:' + info.pairCode)
+      .update(deviceId + ':' + now)
+      .digest('hex')
+      .slice(0, 32);
+  actDevices[deviceId] = {
+    token: deviceToken,
+    pairCode: info.pairCode,
+    type: info.type,
+    createdAt: now,
+  };
+  saveActDevices();
+  log(`[激活] 成功: ${deviceId} type=${info.type} → 配对码 ${info.pairCode}`);
+  // 通知电脑端该码已被兑换（管理页标记已用）
+  const sess = sessions.get(info.pairCode);
+  if (sess?.hostSocketId) {
+    io.to(sess.hostSocketId).emit('host:code-used', { code });
+  }
+  res.json({ ok: true, pairCode: info.pairCode, type: info.type, deviceToken });
 });
 
-// 注册新用户（需短信验证码，阿里云短信认证服务核验）
-app.post('/api/register', async (req, res) => {
-  try {
-    const phone = String(req.body?.phone || '').trim();
-    const code = String(req.body?.code || '').trim();
-    const password = String(req.body?.password || '');
-    if (!/^1\d{10}$/.test(phone)) {
-      log(`[注册] 拒绝: 手机号格式不正确 ${phone}`);
-      return res.json({ ok: false, error: '手机号格式不正确' });
-    }
-    if (!/^\d{6}$/.test(code)) {
-      log(`[注册] 拒绝: 验证码格式不正确 ${phone}`);
-      return res.json({ ok: false, error: '验证码为 6 位数字' });
-    }
-    if (password.length < 6) {
-      log(`[注册] 拒绝: 密码过短 ${phone}`);
-      return res.json({ ok: false, error: '密码至少 6 位' });
-    }
-    if (db.users.some((u) => u.phone === phone)) {
-      log(`[注册] 拒绝: 手机号已注册 ${phone}`);
-      return res.json({ ok: false, error: '该手机号已注册，请直接登录' });
-    }
-    const v = await verifySmsCode(phone, code);
-    if (!v.ok) {
-      log(`[注册] 失败: 验证码核验未通过 ${phone} (${v.error})`);
-      return res.json({ ok: false, error: v.error });
-    }
-    db.users.push({
-      phone,
-      ...hashPassword(password),
-      status: 'active',
-      createdAt: Date.now(),
-      lastLoginAt: null,
-    });
-    saveJson(USERS_FILE, db);
-    const token = createToken(phone, 'user');
-    console.log(`[注册] 新用户 ${phone}`);
-    res.json({ ok: true, token, phone });
-  } catch (e) {
-    console.error('[注册] 异常:', e);
-    res.json({ ok: false, error: '服务器异常，请稍后再试' });
+// 激活码状态查询（v2.10+）：扫码/粘贴/激活前即时校验，二次扫描提示失效
+// - 8 位随机码本身即凭证，查询不增加攻击面（无法凭查询结果使用或伪造码）
+// - 已使用（usedCodes 命中）→ valid:false reason:'used'
+// - 有效（actCodes 命中）→ valid:true
+// - 不存在/已撤销/已过期 → valid:false reason:'invalid'
+app.get('/api/activate-status', (req, res) => {
+  const code = String(req.query.code || '').trim().toUpperCase();
+  if (!/^[A-Z0-9]{6,12}$/.test(code)) {
+    return res.json({ ok: false, error: '激活码格式不正确' });
   }
+  if (usedCodes.has(code)) {
+    return res.json({ ok: true, valid: false, reason: 'used' });
+  }
+  const info = actCodes.get(code);
+  if (info) {
+    return res.json({ ok: true, valid: true });
+  }
+  return res.json({ ok: true, valid: false, reason: 'invalid' });
 });
 
-// 登录
-app.post('/api/login', (req, res) => {
-  const phone = String(req.body?.phone || '').trim();
-  const password = String(req.body?.password || '');
-  const user = db.users.find((u) => u.phone === phone);
-  if (!user) {
-    log(`[登录] 失败: 用户不存在 ${phone}`);
-    return res.json({ ok: false, error: '手机号或密码错误' });
-  }
-  if (user.status !== 'active') {
-    log(`[登录] 失败: 账号已禁用 ${phone}`);
-    return res.json({ ok: false, error: '账号已被禁用，请联系管理员' });
-  }
-  if (!verifyPassword(password, user.salt, user.hash)) {
-    log(`[登录] 失败: 密码错误 ${phone}`);
-    return res.json({ ok: false, error: '手机号或密码错误' });
-  }
-  user.lastLoginAt = Date.now();
-  saveJson(USERS_FILE, db);
-  const token = createToken(phone, 'user');
-  log(`[登录] 成功: ${phone}`);
-  res.json({ ok: true, token, phone });
-});
 
-// 重置密码（需短信验证码核验，验证码发送复用 /api/sms/send）
-app.post('/api/reset-password', async (req, res) => {
-  try {
-    const phone = String(req.body?.phone || '').trim();
-    const code = String(req.body?.code || '').trim();
-    const password = String(req.body?.password || '');
-    if (!/^1\d{10}$/.test(phone)) {
-      log(`[重置密码] 拒绝: 手机号格式不正确 ${phone}`);
-      return res.json({ ok: false, error: '手机号格式不正确' });
-    }
-    if (!/^\d{6}$/.test(code)) {
-      log(`[重置密码] 拒绝: 验证码格式不正确 ${phone}`);
-      return res.json({ ok: false, error: '验证码为 6 位数字' });
-    }
-    if (password.length < 6) {
-      log(`[重置密码] 拒绝: 密码过短 ${phone}`);
-      return res.json({ ok: false, error: '密码至少 6 位' });
-    }
-    const user = db.users.find((u) => u.phone === phone);
-    if (!user) {
-      log(`[重置密码] 失败: 用户不存在 ${phone}`);
-      return res.json({ ok: false, error: '该手机号未注册' });
-    }
-    if (user.status !== 'active') {
-      log(`[重置密码] 失败: 账号已禁用 ${phone}`);
-      return res.json({ ok: false, error: '账号已被禁用，请联系管理员' });
-    }
-    const v = await verifySmsCode(phone, code);
-    if (!v.ok) {
-      log(`[重置密码] 失败: 验证码核验未通过 ${phone} (${v.error})`);
-      return res.json({ ok: false, error: v.error });
-    }
-    Object.assign(user, hashPassword(password));
-    // 安全策略：重置后使该用户所有 token 失效，需重新登录
-    let revoked = 0;
-    for (const [t, info] of Object.entries(tokens)) {
-      if (info.phone === phone) {
-        delete tokens[t];
-        revoked++;
-      }
-    }
-    if (revoked > 0) saveTokens();
-    saveJson(USERS_FILE, db);
-    console.log(`[重置密码] 成功: ${phone}（已使 ${revoked} 个旧 token 失效）`);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[重置密码] 异常:', e);
-    res.json({ ok: false, error: '服务器异常，请稍后再试' });
-  }
-});
 
-// 当前登录用户信息
-app.get('/api/user/me', requireUser, (req, res) => {
-  res.json({
-    ok: true,
-    phone: req.user.phone,
-    createdAt: req.user.createdAt,
-    lastLoginAt: req.user.lastLoginAt,
-  });
-});
+
+
+
+
+
 
 // ── 共享同步与查询 API（v2.4+）───────────────────────────────
 // 电脑端全量同步共享（创建/删除/改权限/启动时调用，幂等覆盖）
@@ -775,13 +680,29 @@ app.post('/api/shares/sync', (req, res) => {
   res.json(result);
 });
 
-// 手机端：登录后拉取“共享给我的”文件夹列表（按登录手机号匹配）
+// 手机端：凭设备令牌拉取“共享给我的”文件夹列表（按激活设备匹配）
 // 返回在线状态（电脑端在线可立即连接），不暴露共享目录绝对路径
-app.get('/api/shares/mine', requireUser, (req, res) => {
-  const phone = req.user.phone;
+app.get('/api/shares/mine', (req, res) => {
+  const deviceId = String(req.query.deviceId || '').trim();
+  const deviceToken = String(req.query.deviceToken || '').trim();
+  const rec = deviceId ? actDevices[deviceId] : null;
+  // v2.11+：共享访客（扫码共享码自动激活，type='guest'）凭令牌拉取；
+  // 绑定设备（曾凭共享码加入，join-relations 有记录）仅可看自己的绑定共享
+  const authed = !!(rec && rec.token === deviceToken);
+  const bound = !!deviceId && !!joinRelations[deviceId] &&
+      Object.keys(joinRelations[deviceId]).length > 0;
+  if (!authed && !bound) {
+    log(`[共享] 手机端查询拒绝: 设备令牌无效 ${deviceId}`);
+    return res.status(401).json({ ok: false, error: '设备令牌无效，请重新激活' });
+  }
   const list = [];
   for (const s of Object.values(shareRegistry)) {
-    if (!s.targetPhone || s.targetPhone !== phone) continue;
+    // v2.8+：定向共享（targetDeviceId 精确匹配，仅令牌有效设备可见）∪ 扫码加入
+    // 过的公开共享（join-relations 绑定；扫码即授权，绑定记录天然经过认证）
+    const isTarget = authed && s.targetDeviceId && s.targetDeviceId === deviceId;
+    const isJoined = !s.targetDeviceId && !!joinRelations[deviceId] &&
+        !!joinRelations[deviceId][s.token];
+    if (!isTarget && !isJoined) continue;
     const online = !!(s.pairCode &&
         sessions.get(s.pairCode)?.hostSocketId &&
         io.sockets.sockets.has(sessions.get(s.pairCode).hostSocketId));
@@ -795,8 +716,32 @@ app.get('/api/shares/mine', requireUser, (req, res) => {
     });
   }
   list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  log(`[共享] 手机端查询: ${phone} 共 ${list.length} 条`);
+  log(`[共享] 手机端查询: ${deviceId} 共 ${list.length} 条`);
   res.json({ ok: true, shares: list });
+});
+
+// 手机端上报扫码加入绑定（v2.9+）：已连接电脑扫码附加共享（attachShare）时
+// 服务器无感知，手机端主动上报 token 使共享持久化出现在“共享给我的”列表；
+// 校验：激活设备令牌 + 共享有效（与 join-by-share 同口径）
+app.post('/api/shares/join', (req, res) => {
+  const { deviceId, deviceToken, token } = req.body || {};
+  const share = token ? shareRegistry[token] : null;
+  if (!share || !share.pairCode) {
+    log(`[共享] 绑定失败: 共享不存在或已失效 token=${token}`);
+    return res.json({ ok: false, error: '共享不存在或已失效' });
+  }
+  const rec = deviceId ? actDevices[deviceId] : null;
+  if (!rec || rec.token !== deviceToken) {
+    log(`[共享] 绑定失败: 设备令牌无效 ${deviceId}`);
+    return res.status(401).json({ ok: false, error: '设备令牌无效，请重新激活' });
+  }
+  joinRelations[deviceId] = joinRelations[deviceId] || {};
+  if (!joinRelations[deviceId][token]) {
+    log(`[共享] 记录扫码加入(attach): ${deviceId} → ${share.name}`);
+  }
+  joinRelations[deviceId][token] = Date.now();
+  saveJoinRelations();
+  res.json({ ok: true });
 });
 
 // ── 管理 API ─────────────────────────────────────────────────
@@ -813,52 +758,7 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ ok: true, token });
 });
 
-// 用户列表（支持手机号模糊搜索）
-app.get('/api/admin/users', requireAdmin, (req, res) => {
-  const kw = (req.query.keyword || '').trim();
-  let list = db.users;
-  if (kw) list = list.filter((u) => u.phone.includes(kw));
-  list = [...list].sort((a, b) => b.createdAt - a.createdAt);
-  res.json({
-    ok: true,
-    users: list.map((u) => ({
-      phone: u.phone,
-      status: u.status,
-      createdAt: u.createdAt,
-      lastLoginAt: u.lastLoginAt,
-    })),
-  });
-});
-
-// 启用 / 禁用用户
-app.post('/api/admin/users/:phone/status', requireAdmin, (req, res) => {
-  const user = db.users.find((u) => u.phone === String(req.params.phone));
-  if (!user) return res.json({ ok: false, error: '用户不存在' });
-  const status = String(req.body?.status || '');
-  if (status !== 'active' && status !== 'disabled') return res.json({ ok: false, error: '状态无效' });
-  user.status = status;
-  saveJson(USERS_FILE, db);
-  console.log(`[管理] 用户 ${req.params.phone} → ${status === 'active' ? '启用' : '禁用'}`);
-  res.json({ ok: true });
-});
-
-// 删除用户（同时清除其 token）
-app.delete('/api/admin/users/:phone', requireAdmin, (req, res) => {
-  const idx = db.users.findIndex((u) => u.phone === String(req.params.phone));
-  if (idx < 0) return res.json({ ok: false, error: '用户不存在' });
-  db.users.splice(idx, 1);
-  let changed = false;
-  for (const [t, info] of Object.entries(tokens)) {
-    if (info.phone === req.params.phone) {
-      delete tokens[t];
-      changed = true;
-    }
-  }
-  saveJson(USERS_FILE, db);
-  if (changed) saveTokens();
-  console.log(`[管理] 删除用户 ${req.params.phone}`);
-  res.json({ ok: true });
-});
+// 用户管理已移至电脑端本地（v2.6+ 去手机号后服务器不存用户，无此接口）
 
 // 系统运行状态
 app.get('/api/admin/stats', requireAdmin, (req, res) => {
@@ -1030,7 +930,11 @@ io.on('connection', (socket) => {
   log(`[连接] ${socket.id} 新连接`);
 
   // 电脑端注册为主机（version：电脑端上报的版本号，记录于配对日志）
-  socket.on('host:register', ({ deviceName, desktop, version, deviceId, hostToken }) => {
+  // v2.6+：activationCodes 为该电脑当前未用激活码列表（管理员码/普通码），
+  // 服务器据此响应手机端 /api/activate 换取配对码与设备令牌
+  // 空消息防御：恶意/异常客户端发空 body 会触发解构崩溃，必须先判空
+  socket.on('host:register', (msg) => {
+    const { deviceName, desktop, version, deviceId, hostToken, activationCodes } = msg || {};
     // v2.4+：绑定主机令牌（电脑端本地生成并持久化，供共享同步接口认证）
     if (deviceId && hostToken) {
       const ht = loadHostTokens();
@@ -1076,6 +980,8 @@ io.on('connection', (socket) => {
     });
     socket.pairCode = pairCode;
     socket.role = 'host';
+    // 同步该电脑的未用激活码（生成/撤销后也走 host:sync-codes 增量同步）
+    syncActivationCodes(deviceId, pairCode, activationCodes);
     socket.emit('host:registered', { pairCode });
     // 手机端已在等待（注册前 join 成功）：补发 joined 给两端，
     // 电脑端立即发起 offer，手机端确认配对——避免双方互相等待的死锁
@@ -1091,7 +997,7 @@ io.on('connection', (socket) => {
             name: info?.name || '手机',
             id: cid,
             deviceId: info?.deviceId || null,
-            phone: info?.phone || null,
+            activationCode: info?.activationCode || null,
             shareToken: info?.shareToken || null
           },
           turn: issueTurnCredential()
@@ -1103,6 +1009,15 @@ io.on('connection', (socket) => {
       }
     }
     log(`[注册] ${deviceName || '电脑'}${version ? ' v' + version : ''} → 配对码 ${pairCode} (socket=${socket.id})`);
+  });
+
+  // 电脑端同步激活码（v2.6+）：生成/撤销激活码后增量同步，幂等覆盖该设备码表
+  // 空消息防御：发空 body 会触发解构崩溃
+  socket.on('host:sync-codes', (msg) => {
+    const { codes } = msg || {};
+    if (socket.role !== 'host' || !socket.pairCode) return;
+    syncActivationCodes(socket.deviceId, socket.pairCode, codes);
+    socket.emit('host:codes-synced', { ok: true });
   });
 
   // 电脑端主动离线（v2.5+）：删除会话并通知手机端断开——与意外断线
@@ -1154,11 +1069,17 @@ io.on('connection', (socket) => {
     console.log(`[配对码] ${socket.deviceId ? '设备 ' + socket.deviceId : '全局'} ${oldCode} → 重新生成 ${newCode}`);
   });
 
-  // 手机端通过配对码加入（支持多客户端：deviceId 设备标识 / shareToken 共享码 / phone 登录手机号）
+  // 手机端通过配对码加入（支持多客户端：deviceId 设备标识 / shareToken 共享码 /
+  // activationCode 激活码，激活码用于电脑端判定该手机是否为管理员）
   // version：手机端上报的版本号，记录于配对日志便于排查版本差异
     // 手机端加入公共流程：配对码（client:join）与共享码（client:join-by-share）
   // 两种入口复用同一路由逻辑（免配对码连接由服务器按共享注册表解析出 pairCode）
-  function joinClient(socket, { pairCode, deviceName, deviceId, shareToken, phone, version }) {
+  function joinClient(socket, { pairCode, deviceName, deviceId, shareToken, activationCode, version }) {
+    // v2.7+ 强制升级：旧版手机端（低于最低可用版本）拒绝连接
+    if (!version || verNum(version) < verNum(MIN_ANDROID_VERSION)) {
+      log(`[强制升级] 拒绝旧版手机端连接: ${deviceName || '手机'} v${version || '未知'}（最低 v${MIN_ANDROID_VERSION}）`);
+      return socket.emit('client:error', { reason: 'APP_VERSION_REQUIRED', latest: ANDROID_VERSION });
+    }
     let session = sessions.get(pairCode);
     if (!session || !session.hostSocketId || !io.sockets.sockets.has(session.hostSocketId)) {
       // 会话不存在或主机 socket 已死（电脑端离线/服务器重启后未注册）：
@@ -1171,7 +1092,7 @@ io.on('connection', (socket) => {
         session.clients.set(socket.id, {
           name: deviceName || '手机',
           deviceId: deviceId || null,
-          phone: phone || null,
+          activationCode: activationCode || null,
           shareToken: shareToken || null,
           version: version || null
         });
@@ -1196,7 +1117,7 @@ io.on('connection', (socket) => {
     session.clients.set(socket.id, {
       name: deviceName || '手机',
       deviceId: deviceId || null,
-      phone: phone || null,
+      activationCode: activationCode || null,
       shareToken: shareToken || null,
       version: version || null
     });
@@ -1213,42 +1134,85 @@ io.on('connection', (socket) => {
         name: deviceName || '手机',
         id: socket.id,
         deviceId: deviceId || null,
-        phone: phone || null,
+        activationCode: activationCode || null,
         shareToken: shareToken || null,
         version: version || null
       },
       turn: issueTurnCredential()
     });
     console.log(`[配对] ${deviceName || '手机'}${version ? ' v' + version : ''} → ${pairCode} → ${session.hostInfo.name}${session.hostInfo.version ? ' v' + session.hostInfo.version : ''}`);
-    log(`[配对] 成功: ${deviceName || '手机'}${version ? ' v' + version : ''} (socket=${socket.id}, deviceId=${deviceId || '无'}, phone=${phone || '无'}) → 电脑=${session.hostInfo.name}${session.hostInfo.version ? ' v' + session.hostInfo.version : ''} (socket=${session.hostSocketId})`);
+    log(`[配对] 成功: ${deviceName || '手机'}${version ? ' v' + version : ''} (socket=${socket.id}, deviceId=${deviceId || '无'}, activationCode=${activationCode ? '有' : '无'}) → 电脑=${session.hostInfo.name}${session.hostInfo.version ? ' v' + session.hostInfo.version : ''} (socket=${session.hostSocketId})`);
   }
 
-  socket.on('client:join', (msg) => joinClient(socket, msg));
+  socket.on('client:join', (msg) => {
+      const m = msg || {};
+      // v2.9+：手机端扫码共享二维码实际走 client:join（配对码 + shareToken），
+      // 与 client:join-by-share 同效，此处同样记录扫码加入绑定；
+      // 配对码有效 = 有权访问该电脑，绑定仅是订阅标记（共享删除后自然消失）
+      const st = String(m.shareToken || '');
+      const share = st ? shareRegistry[st] : null;
+      if (share && share.pairCode && m.deviceId) {
+        const deviceId = String(m.deviceId);
+        // v2.12+：扫码即绑定（共享码本身即连接凭证），不再签发访客令牌；
+        // 绑定记录使共享出现在「共享给我的」并可免令牌重连（与 mine 同口径）
+        joinRelations[deviceId] = joinRelations[deviceId] || {};
+        if (!joinRelations[deviceId][st]) {
+          log(`[共享] 记录扫码加入(join): ${deviceId} → ${share.name}`);
+        }
+        joinRelations[deviceId][st] = Date.now();
+        saveJoinRelations();
+      }
+      joinClient(socket, { ...m });
+    });
 
-  // v2.4+：免配对码加入——手机端凭共享 token 直接连接共享所在电脑
-  // 校验：token 存在于共享注册表，且 targetPhone 与登录手机号匹配
-  socket.on('client:join-by-share', ({ token, deviceId, phone, version, deviceName }) => {
+  // v2.6+：免配对码加入——手机端凭共享 token 直接连接共享所在电脑
+  // 校验：token 存在于共享注册表，且 targetDeviceId 与激活设备匹配
+  // 空消息防御：恶意/异常客户端发空 body 会触发解构崩溃，必须先判空
+  socket.on('client:join-by-share', (msg) => {
+    const { token, deviceId, deviceToken, version, deviceName } = msg || {};
+    // v2.7+ 强制升级：旧版手机端（低于最低可用版本）拒绝免配对码连接
+    if (!version || verNum(version) < verNum(MIN_ANDROID_VERSION)) {
+      log(`[强制升级] 拒绝旧版手机端免配对码连接: ${deviceName || '手机'} v${version || '未知'}`);
+      return socket.emit('client:error', { reason: 'APP_VERSION_REQUIRED', latest: ANDROID_VERSION });
+    }
     const share = shareRegistry[token];
     if (!share || !share.pairCode) {
       log(`[共享] 加入失败: 共享不存在或已失效 token=${token}`);
       return socket.emit('client:error', { reason: '共享不存在或已失效' });
     }
-    if (share.targetPhone && share.targetPhone !== phone) {
-      log(`[共享] 加入失败: ${phone} 无权访问 ${share.name}`);
+    const rec = deviceId ? actDevices[deviceId] : null;
+    // v2.12+：绑定设备（曾凭共享码加入，join-relations 有记录）免令牌放行——
+    // 共享码本身即凭证，绑定即授权（与 mine 列表同口径）；定向共享不放行
+    const bound = !!deviceId && !!joinRelations[deviceId] &&
+        !!joinRelations[deviceId][token] && !share.targetDeviceId;
+    if ((!rec || rec.token !== deviceToken) && !bound) {
+      log(`[共享] 加入失败: 设备令牌无效 ${deviceId}`);
+      return socket.emit('client:error', { reason: '设备令牌无效，请重新激活' });
+    }
+    if (share.targetDeviceId && share.targetDeviceId !== deviceId) {
+      log(`[共享] 加入失败: ${deviceId} 无权访问 ${share.name}`);
       return socket.emit('client:error', { reason: '无权访问该共享' });
     }
+    // v2.8+：记录扫码加入绑定，使该共享持久化出现在“共享给我的”列表
+    joinRelations[deviceId] = joinRelations[deviceId] || {};
+    if (!joinRelations[deviceId][token]) {
+      log(`[共享] 记录扫码加入: ${deviceId} → ${share.name}`);
+    }
+    joinRelations[deviceId][token] = Date.now();
+    saveJoinRelations();
     joinClient(socket, {
       pairCode: share.pairCode,
       deviceName: deviceName || '手机',
       deviceId: deviceId || null,
       shareToken: token,
-      phone: phone || null,
       version: version || null
     });
   });
 
   // 信令转发: 主机 → 客户端（多客户端时带 to 指定目标；不带则转发给唯一客户端）
-  socket.on('signal:host→client', ({ signal, to }) => {
+  // 空消息防御：发空 body 会触发解构崩溃
+  socket.on('signal:host→client', (msg) => {
+    const { signal, to } = msg || {};
     const session = sessions.get(socket.pairCode);
     log(`[信令] 电脑→手机 type=${signal?.type} 长度=${JSON.stringify(signal || '').length}`);
     if (!session?.clients) return;
@@ -1260,7 +1224,9 @@ io.on('connection', (socket) => {
   });
 
   // 信令转发: 客户端 → 主机
-  socket.on('signal:client→host', ({ signal }) => {
+  // 空消息防御：发空 body 会触发解构崩溃
+  socket.on('signal:client→host', (msg) => {
+    const { signal } = msg || {};
     const session = sessions.get(socket.pairCode);
     log(`[信令] 手机→电脑 type=${signal?.type} 长度=${JSON.stringify(signal || '').length}`);
     if (session) {
@@ -1269,7 +1235,9 @@ io.on('connection', (socket) => {
   });
 
   // 管理员踢出指定客户端（仅主机可调用）
-  socket.on('admin:kick', ({ clientId }) => {
+  // 空消息防御：发空 body 会触发解构崩溃
+  socket.on('admin:kick', (msg) => {
+    const { clientId } = msg || {};
     if (socket.role !== 'host' || !socket.pairCode) return;
     const session = sessions.get(socket.pairCode);
     if (!session?.clients || !session.clients.has(clientId)) return;
@@ -1331,17 +1299,12 @@ const LOG_FILE = join(process.cwd(), 'server.log');
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n╔══════════════════════════════════════════╗`);
-  console.log(`║   P2P 文件存取系统                         ║`);
+  console.log(`║   无限大盘                                 ║`);
   console.log(`╠══════════════════════════════════════════╣`);
   console.log(`║  版本: v${SERVER_VERSION}${' '.repeat(Math.max(1, 20 - SERVER_VERSION.length))}║`);
   console.log(`║  本机: http://localhost:${PORT}              ║`);
   console.log(`║  后台: http://localhost:${PORT}/admin        ║`);
-    const smsStatus = process.env.SMS_DEV === '1'
-      ? '开发模式(验证码直返)'
-      : (process.env.ALIYUN_ACCESS_KEY_ID && process.env.ALIYUN_SMS_SIGN_NAME && process.env.ALIYUN_SMS_TEMPLATE_CODE)
-        ? `阿里云短信认证(签名:${process.env.ALIYUN_SMS_SIGN_NAME})`
-        : '阿里云(待配置)';
-    console.log(`║  短信: ${smsStatus}${' '.repeat(Math.max(1, 18 - smsStatus.length))}║`);
+  console.log(`║  激活: 电脑端发放激活码(管理员/普通)║`);
   console.log(`╚══════════════════════════════════════════╝\n`);
 });
 

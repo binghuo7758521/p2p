@@ -37,6 +37,8 @@ class TransferItem {
   final DateTime startTime;
   final String clientName; // 手机端用户名（多用户区分）
   final String clientId; // 手机端会话标识（断开/超时时精确标记失败记录）
+  String connType; // 传输时连接方式快照：'direct' | 'relay' | 'probing' | ''（空=未知/旧数据）
+  DateTime? endTime; // 完成/失败时间（进行中为 null）
 
   TransferItem({
     required this.id,
@@ -49,6 +51,8 @@ class TransferItem {
     this.speed = '',
     this.clientName = '',
     this.clientId = '',
+    this.connType = '',
+    this.endTime,
   });
 
   double get progress => total > 0 ? (transferred / total).clamp(0.0, 1.0) : 0.0;
@@ -63,6 +67,14 @@ class TransferItem {
     }
   }
 
+  /// 传输结束：设置终态并定格完成时间与连接方式（历史记录显示固定不再变）
+  void finish(String status, {String? connType}) {
+    this.status = status;
+    endTime ??= DateTime.now();
+    // 断线/无连接时的当前值可能为空，保留创建时快照不覆盖
+    if (connType != null && connType.isNotEmpty) this.connType = connType;
+  }
+
   /// 持久化到本地（程序重启后仍保留最近 7 天传输记录）
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -75,6 +87,8 @@ class TransferItem {
         'startTime': startTime.toIso8601String(),
         'clientName': clientName,
         'clientId': clientId,
+        if (connType.isNotEmpty) 'connType': connType,
+        if (endTime != null) 'endTime': endTime!.toIso8601String(),
       };
 
   factory TransferItem.fromJson(Map<String, dynamic> json) => TransferItem(
@@ -91,5 +105,7 @@ class TransferItem {
         speed: json['speed']?.toString() ?? '',
         clientName: json['clientName']?.toString() ?? '',
         clientId: json['clientId']?.toString() ?? '',
+        connType: json['connType']?.toString() ?? '',
+        endTime: DateTime.tryParse(json['endTime']?.toString() ?? ''),
       );
 }

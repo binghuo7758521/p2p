@@ -6,7 +6,7 @@ import 'models.dart';
 import 'share_browse_page.dart';
 
 /// 共享中心（v4.8+）：“共享给我的”列表
-/// 数据源：服务器共享注册表（电脑端同步），登录后免配对码直接连接
+/// 数据源：服务器共享注册表（电脑端同步），激活后免配对码直接连接
 class ShareCenterPage extends StatefulWidget {
   final AppController controller;
 
@@ -38,7 +38,7 @@ class _ShareCenterPageState extends State<ShareCenterPage> {
       _shares = list;
       _loading = false;
       if (list.isEmpty) {
-        _error = '暂无共享给你的文件夹\n请让电脑端管理员在“共享文件夹管理”中指定你的手机号';
+        _error = '暂无共享给你的文件夹\n请让电脑端管理员在“共享文件夹管理”中生成共享二维码，用本应用扫码加入';
       }
     });
   }

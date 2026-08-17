@@ -47,6 +47,11 @@ const List<String> kKnownMsgTypes = [
   'recv-error',
   // 配对用户申请成为本电脑端管理员（覆盖已有管理员手机号）
   'user:claim-admin',
+  // 远程电源控制（v6.2）：shutdown/reboot/cancel
+  'user:power',
+  // 远程自动登录设置（v6.6）：status/enable/disable（曾漏加白名单
+  // 导致消息被当文件二进制块丢弃、手机端无响应，须与手机端 protocol 同步）
+  'user:auto-login',
 ];
 
 /// 解析后的控制消息

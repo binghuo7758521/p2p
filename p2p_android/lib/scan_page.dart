@@ -4,13 +4,20 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 
 import 'app_log.dart';
 
-/// 扫码结果：配对码 或 共享码
+/// 扫码结果：配对码 / 共享码 / 管理员激活码（v5.23+）
 class ScanPairResult {
   final String server;
   final String code;
   final String? shareToken; // 共享码（扫共享二维码时非空）
+  /// true=管理员激活码（`p2p-act:` 格式，v5.23+ 已激活手机成为另一台电脑管理员）
+  final bool isAct;
 
-  const ScanPairResult(this.server, this.code, [this.shareToken]);
+  const ScanPairResult(this.server, this.code, [this.shareToken])
+      : isAct = false;
+
+  const ScanPairResult.act(this.server, this.code)
+      : shareToken = null,
+        isAct = true;
 }
 
 /// 配对码格式：10 位数字/字母
@@ -18,6 +25,9 @@ final RegExp kPairCodeRegExp = RegExp(r'^[A-Za-z0-9]{10}$');
 
 /// 共享码格式：8 位数字/字母
 final RegExp kShareTokenRegExp = RegExp(r'^[A-Za-z0-9]{8}$');
+
+/// 激活码格式：8 位大写字母/数字（与电脑端生成规则一致）
+final RegExp kActCodeRegExp = RegExp(r'^[A-Z0-9]{8}$');
 
 /// 扫码配对页：扫描电脑端二维码，自动获取服务器地址与配对码
 ///
@@ -47,7 +57,11 @@ class _ScanPageState extends State<ScanPage> {
     if (_handled) return;
     if (capture.barcodes.isEmpty) return;
     final raw = capture.barcodes.first.rawValue;
-    if (raw == null || !raw.startsWith('p2p:')) return;
+    // v5.23+：管理员激活码（p2p-act:）与配对/共享码（p2p:）均为合法二维码
+    if (raw == null ||
+        (!raw.startsWith('p2p:') && !raw.startsWith('p2p-act:'))) {
+      return;
+    }
 
     final result = _parse(raw);
     if (result == null) {
@@ -60,8 +74,21 @@ class _ScanPageState extends State<ScanPage> {
     Navigator.of(context).pop(result);
   }
 
-  /// 解析 `p2p:<server>|<code>[|<shareToken>]`，失败返回 null
+  /// 解析 `p2p-act:<server>|<8位激活码>`（v5.23+ 管理员码）或
+  /// `p2p:<server>|<code>[|<shareToken>]`，失败返回 null
   ScanPairResult? _parse(String raw) {
+    if (raw.startsWith('p2p-act:')) {
+      // 管理员激活码：p2p-act:<server>|<8位码>（电脑端「用户管理」页展示）
+      final parts = raw.substring(8).split('|');
+      if (parts.length != 2) return null;
+      final server = parts[0].trim();
+      final code = parts[1].trim().toUpperCase();
+      if (!server.startsWith('http://') && !server.startsWith('https://')) {
+        return null;
+      }
+      if (!kActCodeRegExp.hasMatch(code)) return null;
+      return ScanPairResult.act(server, code);
+    }
     final body = raw.substring(4);
     final parts = body.split('|');
     if (parts.length < 2 || parts.length > 3) return null;
@@ -125,7 +152,7 @@ class _ScanPageState extends State<ScanPage> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    '二维码由电脑端软件在配对码下方显示',
+                    '二维码由电脑端「共享文件夹管理」页生成',
                     style: TextStyle(color: Colors.white38, fontSize: 12),
                   ),
                 ],

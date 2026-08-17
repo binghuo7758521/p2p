@@ -25,9 +25,8 @@ class UsersPage extends StatefulWidget {
 class _ShareResult {
   final String folder; // 电脑端文件夹绝对路径
   final List<String> perms; // download / upload / delete
-  final String? targetPhone; // 指定手机号（null=公开二维码）
 
-  const _ShareResult(this.folder, this.perms, {this.targetPhone});
+  const _ShareResult(this.folder, this.perms);
 }
 
 class _UsersPageState extends State<UsersPage> {
@@ -51,8 +50,7 @@ class _UsersPageState extends State<UsersPage> {
     });
   }
 
-  /// 共享创建成功（_lastShareResult 非空）：公开共享显示二维码，
-  /// 指定手机号则提示结果（对方在线已生效 / 离线待登录后生效）
+  /// 共享创建成功（_lastShareResult 非空）：公开共享显示二维码
   void _checkShareResult(AppController controller) {
     final share = controller.lastShareResult;
     if (share == null) return;
@@ -61,15 +59,6 @@ class _UsersPageState extends State<UsersPage> {
       if (!mounted) return;
       if (share.isPublic) {
         _showQrDialog(share);
-      } else {
-        final bound = share.targetDeviceId != null;
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(bound
-              ? '已共享「${share.name}」给 ${share.targetPhone ?? '指定用户'}'
-              : '已共享「${share.name}」给 ${share.targetPhone ?? '指定用户'}，'
-                  '对方登录连接后自动生效'),
-          duration: const Duration(seconds: 3),
-        ));
       }
     });
   }
@@ -86,23 +75,25 @@ class _UsersPageState extends State<UsersPage> {
     );
   }
 
-  /// 打开共享文件夹选择对话框（目录选择 + 权限勾选 + 分享方式）
-  /// [user] 非空时默认指定手机号并预填对方手机号；为空时默认生成公开二维码
-  Future<void> _openShareDialog(Map<String, dynamic>? user) async {
+  /// 打开共享文件夹选择对话框（目录选择 + 权限勾选，v5.4+ 仅二维码方式）
+  Future<void> _openShareDialog() async {
     final result = await showDialog<_ShareResult>(
       context: context,
       builder: (_) => _ShareFolderDialog(
         controller: widget.controller,
-        initialPhone: user?['phone']?.toString() ?? '',
-        initialMode: user != null ? 0 : 1,
       ),
     );
     if (result == null || !mounted) return;
     widget.controller.createShare(
-      targetPhone: result.targetPhone,
       folder: result.folder,
       perms: result.perms,
     );
+  }
+
+  /// 生成管理员激活码（结果经 user:code-result 回传）
+  /// v5.16+ 身份二态化：仅管理员码一种类型
+  Future<void> _generateActCode() async {
+    widget.controller.generateActCode();
   }
 
   /// 踢出/删除用户确认
@@ -132,9 +123,8 @@ class _UsersPageState extends State<UsersPage> {
   Widget _buildShareTile(ShareEntry s) {
     final ctrl = widget.controller;
     final bound = s.targetDeviceId != null || s.isPublic;
-    final desc = s.targetPhone != null
-        ? '手机号 ${s.targetPhone}${bound ? '' : '（待对方登录生效）'}'
-        : '二维码（对方扫码加入）';
+    // v5.4+ 去手机号：仅二维码共享，历史定向数据统一展示为定向共享
+    final desc = s.isPublic ? '二维码（对方扫码加入）' : '定向共享';
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
       child: ListTile(
@@ -255,9 +245,14 @@ class _UsersPageState extends State<UsersPage> {
         title: const Text('共享文件夹管理'),
         actions: [
           IconButton(
+            tooltip: '生成激活码',
+            icon: const Icon(Icons.vpn_key_outlined),
+            onPressed: _generateActCode,
+          ),
+          IconButton(
             tooltip: '新增共享',
             icon: const Icon(Icons.create_new_folder),
-            onPressed: () => _openShareDialog(null),
+            onPressed: _openShareDialog,
           ),
         ],
       ),
@@ -415,16 +410,12 @@ class _QrDialogState extends State<_QrDialog> {
   }
 }
 
-/// 共享文件夹选择对话框：分享方式（指定手机号/二维码）+ 浏览电脑端目录 + 权限勾选
+/// 共享文件夹选择对话框：浏览电脑端目录 + 权限勾选（v5.4+ 仅生成二维码）
 class _ShareFolderDialog extends StatefulWidget {
   final AppController controller;
-  final String initialPhone; // 预填手机号（从用户列表进入）
-  final int initialMode; // 0=指定手机号 1=生成二维码
 
   const _ShareFolderDialog({
     required this.controller,
-    this.initialPhone = '',
-    this.initialMode = 1,
   });
 
   @override
@@ -433,21 +424,12 @@ class _ShareFolderDialog extends StatefulWidget {
 
 class _ShareFolderDialogState extends State<_ShareFolderDialog> {
   final Set<String> _perms = {'download', 'upload', 'delete'}; // 默认全选
-  late int _mode = widget.initialMode; // 0=指定手机号 1=生成二维码
-  int _step = 0; // 0=选择文件夹 1=选择分享方式
-  late final TextEditingController _phoneCtrl =
-      TextEditingController(text: widget.initialPhone);
+  int _step = 0; // 0=选择文件夹 1=确认分享方式
 
   @override
   void initState() {
     super.initState();
     widget.controller.requestPickDirs();
-  }
-
-  @override
-  void dispose() {
-    _phoneCtrl.dispose();
-    super.dispose();
   }
 
   /// 从本步骤返回上一步（选文件夹），保持目录不变
@@ -463,9 +445,7 @@ class _ShareFolderDialogState extends State<_ShareFolderDialog> {
         ? <String>[]
         : controller.pickPath.split('/');
     return AlertDialog(
-      title: Text(_step == 0
-          ? '选择要共享的文件夹'
-          : (_mode == 0 ? '分享（指定手机号）' : '分享（生成二维码）')),
+      title: Text(_step == 0 ? '选择要共享的文件夹' : '分享（生成二维码）'),
       content: SizedBox(
         width: double.maxFinite,
         height: 480,
@@ -492,63 +472,29 @@ class _ShareFolderDialogState extends State<_ShareFolderDialog> {
                   ],
                 ),
                 const SizedBox(height: 10),
-                // 分享方式切换
-                SegmentedButton<int>(
-                  segments: const [
-                    ButtonSegment(
-                        value: 0,
-                        label: Text('指定手机号'),
-                        icon: Icon(Icons.phone_android, size: 16)),
-                    ButtonSegment(
-                        value: 1,
-                        label: Text('生成二维码'),
-                        icon: Icon(Icons.qr_code_2, size: 16)),
-                  ],
-                  selected: {_mode},
-                  showSelectedIcon: false,
-                  style: const ButtonStyle(
-                    visualDensity: VisualDensity.compact,
+                // 二维码说明（v5.4+ 去手机号：仅二维码方式）
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context)
+                        .colorScheme
+                        .secondaryContainer
+                        .withValues(alpha: 0.35),
+                    borderRadius: BorderRadius.circular(8),
                   ),
-                  onSelectionChanged: (s) =>
-                      setState(() => _mode = s.first),
-                ),
-                const SizedBox(height: 10),
-                if (_mode == 0)
-                  TextField(
-                    controller: _phoneCtrl,
-                    keyboardType: TextInputType.phone,
-                    maxLength: 11,
-                    decoration: const InputDecoration(
-                      isDense: true,
-                      counterText: '',
-                      prefixIcon: Icon(Icons.phone_android, size: 18),
-                      hintText: '输入对方注册手机号',
-                      border: OutlineInputBorder(),
-                    ),
-                  )
-                else
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context)
-                          .colorScheme
-                          .secondaryContainer
-                          .withValues(alpha: 0.35),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: const Row(
-                      children: [
-                        Icon(Icons.info_outline, size: 18),
-                        SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            '生成二维码后，对方扫码加入才能看到此共享文件夹',
-                            style: TextStyle(fontSize: 13),
-                          ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.info_outline, size: 18),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '生成二维码后，对方扫码加入才能看到此共享文件夹',
+                          style: TextStyle(fontSize: 13),
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
+                ),
                 const Spacer(),
                 Text(
                   controller.pickPath.isEmpty
@@ -674,24 +620,6 @@ class _ShareFolderDialogState extends State<_ShareFolderDialog> {
               setState(() => _step = 1);
             },
             child: const Text('下一步'),
-          )
-        else if (_mode == 0)
-          FilledButton(
-            onPressed: () {
-              final phone = _phoneCtrl.text.trim();
-              if (phone.isEmpty) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('请输入对方注册手机号')),
-                );
-                return;
-              }
-              Navigator.of(context).pop(_ShareResult(
-                controller.pickPath,
-                _perms.toList(),
-                targetPhone: phone,
-              ));
-            },
-            child: const Text('确认共享'),
           )
         else
           FilledButton.icon(

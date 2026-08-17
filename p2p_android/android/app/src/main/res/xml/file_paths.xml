@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 升级包安装：允许 FileProvider 共享应用私有目录（app_flutter 下保存的 APK） -->
+<!-- 升级包安装：允许 FileProvider 共享应用私有目录下的 APK。
+     v5.7 修复：getApplicationDocumentsDirectory() 在 Android 返回
+     <dataDir>/app_flutter（不在 filesDir 下），仅 files-path 会触发
+     “Failed to find configured root”，故追加 root-path 覆盖整个应用数据目录 -->
 <paths>
+    <root-path name="root" path="." />
     <files-path name="files" path="." />
 </paths>

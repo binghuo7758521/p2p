@@ -3,10 +3,12 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 
 import 'app_log.dart';
+import 'auto_login.dart';
 import 'host_service.dart';
 import 'models.dart';
 import 'protocol.dart';
@@ -27,6 +29,7 @@ class ShareConfig {
   final List<String> perms; // ['download','upload','delete']
   String? targetDeviceId; // 目标用户设备 id（null=未绑定/公开）
   final String? targetPhone; // 目标用户手机号（null=未指定/公开）
+  String remark = ''; // 备注名称（v6.15+：管理员填写，展示优先于文件夹名）
 
   ShareConfig({
     required this.token,
@@ -34,9 +37,11 @@ class ShareConfig {
     required this.perms,
     this.targetDeviceId,
     this.targetPhone,
+    this.remark = '',
   });
 
-  String get name => folder.split('/').last;
+  /// 展示名称：备注优先，其次文件夹末段（“共享给我的”不显示全路径）
+  String get name => remark.isNotEmpty ? remark : folder.split('/').last;
 
   bool get canDownload => perms.contains('download');
   bool get canUpload => perms.contains('upload');
@@ -51,6 +56,7 @@ class ShareConfig {
         'perms': perms,
         if (targetDeviceId != null) 'targetDeviceId': targetDeviceId,
         if (targetPhone != null) 'targetPhone': targetPhone,
+        if (remark.isNotEmpty) 'remark': remark,
       };
 
   factory ShareConfig.fromJson(Map<String, dynamic> json) => ShareConfig(
@@ -61,6 +67,7 @@ class ShareConfig {
             .toList(),
         targetDeviceId: json['targetDeviceId']?.toString(),
         targetPhone: json['targetPhone']?.toString(),
+        remark: json['remark']?.toString() ?? '',
       );
 }
 
@@ -69,9 +76,12 @@ class HostUser {
   String deviceId;
   String name;
   String? clientId; // 当前 socket 会话 id（在线时非空）
-  String phone = ''; // 登录手机号（join 时上报）
+  String phone = ''; // 历史登录手机号（v5.8 及以前；v5.9+ 去手机号后不再上报）
   bool isAdmin;
   bool shareOnly = false; // 共享访客（扫码共享加入）：永不成为管理员
+  String passwordHash = ''; // 连接密码哈希（空=未设置，连接不校验）
+  bool pendingReset = false; // 管理员已重置密码，下次连接需用新密码
+  String remark = ''; // 备注名称（管理员填写，展示优先于设备名）
   final List<ShareConfig> shares = [];
   final DateTime joinedAt;
 
@@ -83,6 +93,9 @@ class HostUser {
     DateTime? joinedAt,
   }) : joinedAt = joinedAt ?? DateTime.now();
 
+  /// 展示名称：备注优先，其次设备上报名
+  String get displayName => remark.isNotEmpty ? remark : name;
+
   bool get online => clientId != null;
 
   Map<String, dynamic> toJson() => {
@@ -91,6 +104,9 @@ class HostUser {
         'phone': phone,
         'isAdmin': isAdmin,
         'shareOnly': shareOnly,
+        'passwordHash': passwordHash,
+        'pendingReset': pendingReset,
+        'remark': remark,
         'online': online,
         'joinedAt': joinedAt.millisecondsSinceEpoch,
         'shares': shares.map((s) => s.toJson()).toList(),
@@ -106,9 +122,44 @@ class HostUser {
       )
         ..phone = json['phone']?.toString() ?? ''
         ..shareOnly = json['shareOnly'] == true
+        ..passwordHash = json['passwordHash']?.toString() ?? ''
+        ..pendingReset = json['pendingReset'] == true
+        ..remark = json['remark']?.toString() ?? ''
         ..shares.addAll((json['shares'] as List? ?? [])
             .whereType<Map>()
             .map((e) => ShareConfig.fromJson(Map<String, dynamic>.from(e))));
+}
+
+/// 激活码（v5.9+）：电脑端本地生成并同步服务器，手机端凭码激活
+class ActCodeEntry {
+  final String code; // 8 位大写字母+数字
+  final String type; // admin=管理员码（v6.14+ 仅此一种）
+  final DateTime createdAt;
+  bool used; // 已被手机端兑换（服务器通知）
+
+  ActCodeEntry({
+    required this.code,
+    required this.type,
+    required this.createdAt,
+    this.used = false,
+  });
+
+  bool get isAdmin => type == 'admin';
+
+  Map<String, dynamic> toJson() => {
+        'code': code,
+        'type': type,
+        'createdAt': createdAt.millisecondsSinceEpoch,
+        'used': used,
+      };
+
+  factory ActCodeEntry.fromJson(Map<String, dynamic> json) => ActCodeEntry(
+        code: json['code']?.toString() ?? '',
+        type: json['type']?.toString() == 'admin' ? 'admin' : 'normal',
+        createdAt: DateTime.fromMillisecondsSinceEpoch(
+            json['createdAt'] is int ? json['createdAt'] as int : 0),
+        used: json['used'] == true,
+      );
 }
 
 /// 单个客户端的接收（上传）状态：多用户各自独立，互不串扰
@@ -155,8 +206,27 @@ class HostController extends ChangeNotifier {
   // ── 多用户管理 ──────────────────────────────────────────
   final Map<String, HostUser> users = {}; // deviceId -> 用户
   final Map<String, ShareConfig> _shareTable = {}; // token -> 共享配置（全局）
-  String? adminDeviceId; // 第一个连接的手机端为管理员
-  String? adminPhone; // 管理员手机号（同一手机号的任何设备都视为管理员）
+  String? adminDeviceId; // 管理员设备（管理员码激活 + 电脑端确认后产生）
+  String? legacyAdminPhone; // 兼容旧版 admin.json 中的手机号记录
+
+  // ── 激活码（v5.9+） ─────────────────────────────────────
+  final Map<String, ActCodeEntry> _actCodes = {}; // code -> 激活码
+
+  /// 全部激活码（管理页展示：类型/状态/时间，可撤销）
+  List<ActCodeEntry> get actCodeList => _actCodes.values.toList();
+
+  /// 待确认的管理员激活/移交请求（UI 弹窗确认后 approve/reject）
+  Map<String, dynamic>? pendingAdminApproval; // {deviceId, name, claim?}
+
+  /// 首启展示的管理员激活码（无管理员时自动生成，激活/撤销后重新生成）
+  String? _bootAdminCode;
+
+  /// 曾通过管理员码授权过的设备（持久化）：被更换降级后重连不再触发
+  /// “更换管理员”弹窗，也免于被 loadUsers 当作历史普通用户清除
+  final Set<String> _grantedAdminDevices = {};
+
+  /// 是否已有管理员（含持久化恢复）
+  bool get hasAdmin => adminDeviceId != null && adminDeviceId!.isNotEmpty;
 
   // ── 传输记录 ────────────────────────────────────────────
   final List<TransferItem> transfers = [];
@@ -171,6 +241,14 @@ class HostController extends ChangeNotifier {
 
   /// 全部共享配置（共享文件夹管理页展示：公开/手机号/设备绑定）
   List<ShareConfig> get shareList => _shareTable.values.toList();
+
+  /// 当前连接方式原始值（'relay'|'direct'|'probing'|''），传输记录快照用
+  String get connTypeRaw {
+    for (final s in _service.sessions.values) {
+      if (s.isOpen) return s.connectionType;
+    }
+    return '';
+  }
 
   /// 当前连接方式标签（取第一个在线用户，用于电脑端 UI 展示）
   String get connTypeLabel {
@@ -207,18 +285,19 @@ class HostController extends ChangeNotifier {
       final clientId = cInfo['id']?.toString() ?? '';
       final deviceId = cInfo['deviceId']?.toString() ?? clientId;
       final name = cInfo['name']?.toString() ?? '手机';
-      final phone = cInfo['phone']?.toString();
+      final activationCode = cInfo['activationCode']?.toString();
       final shareToken = cInfo['shareToken']?.toString();
       final turn = info['turn'];
       _service.turnConfig = turn is Map
           ? Map<String, dynamic>.from(turn)
           : null;
-      AppLog.i('host', '手机端加入: $name (deviceId=$deviceId phone=$phone share=$shareToken)');
+      AppLog.i('host',
+          '手机端加入: $name (deviceId=$deviceId 激活码=${activationCode != null && activationCode.isNotEmpty ? '有' : '无'} share=$shareToken)');
       _ensureUser(
           deviceId: deviceId,
           name: name,
           clientId: clientId,
-          phone: phone,
+          activationCode: activationCode,
           shareToken: shareToken);
       notifyListeners();
       await _service.createPeerConnectionAndOffer(clientId,
@@ -278,141 +357,153 @@ class HostController extends ChangeNotifier {
       notifyListeners();
     };
     _service.onData = _onRawData;
+    // 激活码被手机端兑换：管理页标记已用
+    _service.onCodeUsed = markActCodeUsed;
   }
 
   // ── 用户管理 ────────────────────────────────────────────
-  /// 校验共享目标是否匹配该用户（设备 id 或手机号；均未指定=公开）
-  bool _canBind(ShareConfig share, String deviceId, String phone) {
+  /// 校验共享目标是否匹配该用户（设备 id；未指定=公开）
+  bool _canBind(ShareConfig share, String deviceId) {
     if (share.targetDeviceId != null && share.targetDeviceId != deviceId) {
-      return false;
-    }
-    if (share.targetPhone != null && share.targetPhone != phone) {
       return false;
     }
     return true;
   }
 
-  /// 手机端加入时确保用户存在；
-  /// 管理员从配对连接中产生：首个配对手机端（且无持久化管理员手机号）
-  /// 成为管理员；共享访客（扫码共享加入）永不成为管理员；
-  /// 共享码用户绑定共享；手机号指定共享自动绑定
+  /// 手机端加入时确保用户存在（v6.14+ 身份二态化：仅管理员/共享访客）：
+  /// - 管理员仅从「管理员激活码」产生：无管理员时直接授权（无需电脑端
+  ///   弹窗确认，码由电脑端自己展示）；已有管理员时转为更换申请
+  /// - 共享访客（扫码共享）永不成为管理员；无普通码，非访客非管理员
+  ///   的历史普通用户记录加载时清除
+  /// - 连接密码校验由数据通道 auth:verify 完成（服务器不接触密码）
   void _ensureUser({
     required String deviceId,
     required String name,
     String? clientId,
-    String? phone,
     String? shareToken,
+    String? activationCode,
   }) {
     var user = users[deviceId];
     final shareOnly = shareToken != null && shareToken.isNotEmpty;
+    // 激活码类型判定（管理员码候选）；未知码按普通连接处理
+    final actType = (activationCode != null && activationCode.isNotEmpty)
+        ? _actCodes[activationCode]?.type
+        : null;
+    // 管理员码激活（非共享访客连接）：无管理员直接授权；已有管理员转更换申请
+    final isAdminAct = actType == 'admin' && !shareOnly;
     if (user == null) {
-      // 共享访客不算「首个连接」；管理员只从配对连接中产生，
-      // 且已恢复持久化管理员手机号时不自动指定（由手机号识别恢复身份）
-      final first = !shareOnly &&
-          (users.isEmpty || users.values.every((u) => u.shareOnly)) &&
-          (adminPhone == null || adminPhone!.isEmpty);
       user = HostUser(deviceId: deviceId, name: name, clientId: clientId);
-      if (phone != null && phone.isNotEmpty) user.phone = phone;
       user.shareOnly = shareOnly;
-      if (first) {
-        user.isAdmin = true;
-        adminDeviceId = deviceId;
-        if (phone != null && phone.isNotEmpty) {
-          adminPhone = phone;
-          unawaited(_saveAdminPhone(phone));
+      // 普通连接：校验共享码（共享目标需匹配该设备或公开共享）
+      final share = shareToken != null ? _shareTable[shareToken] : null;
+      if (share != null && _canBind(share, deviceId)) {
+        if (!user.shares.any((s) => s.token == share.token)) {
+          user.shares.add(share);
         }
-        AppLog.i('host', '首个配对手机端成为管理员: $name ($deviceId) phone=$phone');
-      } else {
-        // 普通用户：校验共享码（共享目标需匹配该设备/手机号或公开共享）
-        final share = shareToken != null ? _shareTable[shareToken] : null;
-        if (share != null && _canBind(share, deviceId, user.phone)) {
-          if (!user.shares.any((s) => s.token == share.token)) {
-            user.shares.add(share);
-          }
-          AppLog.i('host', '共享码用户绑定共享: ${share.name}');
-        }
+        AppLog.i('host', '共享码用户绑定共享: ${share.name}');
       }
-      _bindPhoneShares(user);
       users[deviceId] = user;
       notifyListeners();
       unawaited(_saveUsers());
     } else {
       user.name = name;
       user.clientId = clientId;
-      if (phone != null && phone.isNotEmpty && user.phone.isEmpty) {
-        user.phone = phone;
-      }
-      // 共享访客之后用配对码连接：升级为正式用户
-      if (!shareOnly && user.shareOnly) {
-        user.shareOnly = false;
-        // 升级时补选管理员：若此前没有其他正式用户（首个配对连接者）
-        // 且无持久化管理员手机号，则本次配对连接者成为管理员，
-        // 避免“先扫码访客后配对”导致永远选不出管理员
-        if (adminPhone == null || adminPhone!.isEmpty) {
-          final others = users.values
-              .where((u) => u.deviceId != deviceId && !u.shareOnly);
-          if (others.isEmpty) {
-            user.isAdmin = true;
-            adminDeviceId = deviceId;
-            if (user.phone.isNotEmpty) {
-              adminPhone = user.phone;
-              unawaited(_saveAdminPhone(user.phone));
-            }
-            AppLog.i('host',
-                '升级用户补选为管理员（首个配对连接）: $name ($deviceId)');
-          }
-        }
-        AppLog.i('host', '共享访客升级为正式用户: $name ($deviceId)');
-      }
       // 已存在用户带共享码连接：同样校验绑定。老用户（曾配对/历史连接）
       // 扫码加入公开或指定共享时，此处必须补绑定，否则 user.shares 为空
       // 导致“扫码后看不到文件夹”（file:list 返回无访问权限）
       if (shareOnly) {
         final share = _shareTable[shareToken];
-        if (share != null && _canBind(share, deviceId, user.phone)) {
+        if (share != null && _canBind(share, deviceId)) {
           if (!user.shares.any((s) => s.token == share.token)) {
             user.shares.add(share);
             AppLog.i('host', '老用户共享码绑定共享: ${share.name}');
           }
         }
       }
-      _bindPhoneShares(user);
       unawaited(_saveUsers());
+    }
+    // 管理员码激活处理：无管理员直接授权；已有管理员且是新设备转更换申请
+    // （防顶替弹窗）；曾授权的降级管理员重连按普通用户处理，不再弹窗
+    if (isAdminAct) {
+      if (!hasAdmin && pendingAdminApproval == null) {
+        user.shareOnly = false;
+        _grantAdmin(user);
+        AppLog.i('host', '管理员码激活，自动授权: $name ($deviceId)');
+      } else if (hasAdmin &&
+          pendingAdminApproval == null &&
+          !_grantedAdminDevices.contains(deviceId)) {
+        pendingAdminApproval = {
+          'deviceId': deviceId,
+          'name': name,
+          'claim': true,
+        };
+        notifyListeners(); // 电脑端弹出“是否更换管理员”确认窗
+        AppLog.i('host', '已有管理员，管理员码激活转更换申请: $name ($deviceId)');
+      } else {
+        AppLog.w('host',
+            '已有管理员或存在待确认申请，管理员码按普通用户处理: $name');
+      }
     }
   }
 
-  // ── 管理员手机号持久化（电脑端重启后恢复管理员身份） ───────
+  // ── 管理员持久化（电脑端重启后恢复管理员身份） ──────────
   Future<File> _adminFile() async {
     final docs = Platform.environment['USERPROFILE'] ?? '.';
     final dir = Directory('$docs\\Documents\\p2p_desktop_logs');
     await dir.create(recursive: true);
     return File('${dir.path}\\admin.json');
   }
-  /// 启动/重新连接时恢复持久化的管理员手机号
-  Future<void> _loadAdminPhone() async {
+
+  /// 启动/重新连接时恢复管理员设备 id（兼容旧版 adminPhone 记录）
+  Future<void> _loadAdminState() async {
     try {
       final f = await _adminFile();
       if (!await f.exists()) return;
       final json = jsonDecode(await f.readAsString());
-      final phone = (json is Map && json['adminPhone'] is String &&
-              (json['adminPhone'] as String).isNotEmpty)
+      if (json is! Map) return;
+      // 曾授权设备集合（v6.14+）：用于避免降级管理员重连反复触发更换弹窗
+      final granted = json['grantedDevices'];
+      if (granted is List) {
+        for (final d in granted.whereType<String>()) {
+          if (d.isNotEmpty) _grantedAdminDevices.add(d);
+        }
+        if (_grantedAdminDevices.isNotEmpty) {
+          AppLog.i('host',
+              '恢复曾授权设备: ${_grantedAdminDevices.length} 台');
+        }
+      }
+      final did = json['adminDeviceId'] is String &&
+              (json['adminDeviceId'] as String).isNotEmpty
+          ? json['adminDeviceId'] as String
+          : null;
+      if (did != null) {
+        adminDeviceId = did;
+        AppLog.i('host', '从本地文件恢复管理员设备: $did');
+        return;
+      }
+      // 兼容旧格式：adminPhone → 记录后由 _loadUsers 按手机号匹配补管理员
+      final phone = json['adminPhone'] is String &&
+              (json['adminPhone'] as String).isNotEmpty
           ? json['adminPhone'] as String
           : null;
-      if (phone != null && adminPhone != phone) {
-        adminPhone = phone;
-        AppLog.i('host', '从本地文件恢复管理员手机号: $phone');
+      if (phone != null) {
+        legacyAdminPhone = phone;
+        AppLog.i('host', '检测到旧版管理员手机号记录: $phone（用户加载后匹配）');
       }
     } catch (e) {
       AppLog.w('host', '读取管理员文件失败', e);
     }
   }
 
-  Future<void> _saveAdminPhone(String? phone) async {
-    if (phone == null || phone.isEmpty) return;
+  Future<void> _saveAdminState() async {
+    if (adminDeviceId == null || adminDeviceId!.isEmpty) return;
     try {
       final f = await _adminFile();
-      await f.writeAsString(jsonEncode({'adminPhone': phone}));
-      AppLog.i('host', '管理员手机号已保存: $phone');
+      await f.writeAsString(jsonEncode({
+        'adminDeviceId': adminDeviceId,
+        'grantedDevices': _grantedAdminDevices.toList(),
+      }));
+      AppLog.i('host', '管理员设备已保存: $adminDeviceId');
     } catch (e) {
       AppLog.w('host', '保存管理员文件失败', e);
     }
@@ -437,17 +528,35 @@ class HostController extends ChangeNotifier {
       for (final item in list.whereType<Map>()) {
         final u = HostUser.fromJson(Map<String, dynamic>.from(item));
         if (u.deviceId.isEmpty) continue;
+        // v6.14+ 身份二态化：清除历史普通用户记录（非管理员且非共享访客，
+        // 且从未被管理员码授权过——降级管理员保留，重连不再弹更换申请）
+        if (!u.isAdmin &&
+            !u.shareOnly &&
+            !_grantedAdminDevices.contains(u.deviceId)) {
+          AppLog.i('host', '清除历史普通用户记录: ${u.deviceId} (${u.name})');
+          changed = true;
+          continue;
+        }
         u.clientId = null; // 离线状态，重新 join 时恢复在线
         // 管理员身份一致性校正（防历史脏数据/误标）：共享访客永不可能是
-        // 管理员；已持久化管理员手机号时，仅同一手机号的用户保留管理员标记
+        // 管理员；管理员设备 id 已恢复时，仅同一设备的用户保留管理员标记
         if (u.isAdmin &&
             (u.shareOnly ||
-                (adminPhone != null &&
-                    adminPhone!.isNotEmpty &&
-                    u.phone != adminPhone))) {
+                (adminDeviceId != null &&
+                    adminDeviceId!.isNotEmpty &&
+                    u.deviceId != adminDeviceId))) {
           u.isAdmin = false;
           AppLog.w('host',
-              '校正管理员标记: ${u.deviceId} (shareOnly=${u.shareOnly} phone=${u.phone})');
+              '校正管理员标记: ${u.deviceId} (shareOnly=${u.shareOnly})');
+        }
+        // 兼容旧版 adminPhone：匹配到该手机号的用户补为管理员
+        if (!u.isAdmin &&
+            legacyAdminPhone != null &&
+            legacyAdminPhone!.isNotEmpty &&
+            u.phone == legacyAdminPhone &&
+            !u.shareOnly) {
+          u.isAdmin = true;
+          AppLog.i('host', '旧版管理员手机号匹配，恢复管理员身份: ${u.deviceId}');
         }
         users[u.deviceId] = u;
         if (u.isAdmin && (adminDeviceId == null || adminDeviceId!.isEmpty)) {
@@ -509,10 +618,14 @@ class HostController extends ChangeNotifier {
     }
   }
 
-  /// 全量同步共享到服务器：手机端登录后凭手机号拉取“共享给我的”列表，
+  /// 全量同步共享到服务器：手机端激活后凭设备令牌拉取“共享给我的”列表，
   /// 并通过免配对码信令连接本机浏览/传输
   Future<void> _syncSharesToServer() async {
-    final list = _shareTable.values.map((s) => s.toJson()).toList();
+    // v6.9: 补报电脑端备注名与文件夹名（曾漏报导致服务器存默认值
+    // “电脑/共享文件夹”，手机端“共享给我的”列表无法显示真实名称）
+    final list = _shareTable.values
+        .map((s) => {...s.toJson(), 'hostName': deviceName, 'name': s.name})
+        .toList();
     await _service.syncSharesToServer(list);
   }
 
@@ -522,7 +635,7 @@ class HostController extends ChangeNotifier {
     unawaited(_syncSharesToServer());
   }
 
-  /// 保存用户列表（保存设备身份；shares/clientId 为内存态不落盘）
+  /// 保存用户列表（保存设备身份与连接密码哈希；shares/clientId 为内存态不落盘）
   Future<void> _saveUsers() async {
     try {
       final f = await _usersFile();
@@ -533,6 +646,9 @@ class HostController extends ChangeNotifier {
                 'phone': u.phone,
                 'isAdmin': u.isAdmin,
                 'shareOnly': u.shareOnly,
+                'passwordHash': u.passwordHash,
+                'pendingReset': u.pendingReset,
+                'remark': u.remark,
                 'joinedAt': u.joinedAt.millisecondsSinceEpoch,
               })
           .toList();
@@ -583,37 +699,12 @@ class HostController extends ChangeNotifier {
         ..sort((a, b) => b.startTime.compareTo(a.startTime));
       for (final t in items) {
         // 上次程序退出时正在传输的记录恢复为失败（实际传输已中断）
-        if (t.status == 'transferring') t.status = 'error';
+        if (t.status == 'transferring') t.finish('error');
       }
       transfers.addAll(items);
       AppLog.i('transfer', '加载历史传输记录: ${items.length} 条');
     } catch (e) {
       AppLog.w('transfer', '加载传输记录失败', e);
-    }
-  }
-
-  /// 手机号指定共享：该手机号用户（首次出现或重连）自动绑定对应共享
-  void _bindPhoneShares(HostUser user) {
-    if (user.phone.isEmpty) return;
-    var changed = false;
-    for (final s in _shareTable.values) {
-      if (s.targetPhone != null &&
-          s.targetPhone == user.phone &&
-          s.targetDeviceId == null) {
-        s.targetDeviceId = user.deviceId;
-        if (!user.shares.any((x) => x.token == s.token)) {
-          user.shares.add(s);
-          changed = true;
-        }
-        AppLog.i('host', '手机号共享自动绑定: ${s.name} → ${user.name}');
-      }
-    }
-    if (changed) {
-      // 通知对方立即刷新（离线转在线自动绑定时共享立即可见）
-      if (user.clientId != null) {
-        _sendTo(user.clientId!, {'type': 'user:share-updated'});
-      }
-      notifyListeners();
     }
   }
 
@@ -632,6 +723,97 @@ class HostController extends ChangeNotifier {
       if (s.token == token) return s;
     }
     return null;
+  }
+
+  // ── 激活码管理（v5.9+） ─────────────────────────────────
+  static const String _actChars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  final Random _rnd = Random.secure();
+
+  Future<File> _actCodesFile() async {
+    final docs = Platform.environment['USERPROFILE'] ?? '.';
+    final dir = Directory('$docs\\Documents\\p2p_desktop_logs');
+    await dir.create(recursive: true);
+    return File('${dir.path}\\act-codes.json');
+  }
+
+  /// 启动时恢复激活码（重启不丢；服务器以 host:register/sync 重新同步为准）
+  Future<void> _loadActCodes() async {
+    try {
+      final f = await _actCodesFile();
+      if (!await f.exists()) return;
+      final list = jsonDecode(await f.readAsString());
+      if (list is! List) return;
+      _actCodes.clear();
+      for (final e in list.whereType<Map>()) {
+        final c = ActCodeEntry.fromJson(Map<String, dynamic>.from(e));
+        if (c.code.isNotEmpty) _actCodes[c.code] = c;
+      }
+      AppLog.i('host', '恢复激活码: ${_actCodes.length} 个');
+    } catch (e) {
+      AppLog.w('host', '读取激活码文件失败', e);
+    }
+  }
+
+  Future<void> _persistActCodes() async {
+    try {
+      final f = await _actCodesFile();
+      await f.writeAsString(jsonEncode(
+          _actCodes.values.map((c) => c.toJson()).toList()));
+    } catch (e) {
+      AppLog.w('host', '保存激活码文件失败', e);
+    }
+  }
+
+  /// 生成管理员激活码（8 位大写字母+数字，24 小时有效由服务器强制）
+  /// v6.14+ 身份二态化：仅管理员码一种类型，不再区分普通码
+  String generateActCode() {
+    String code;
+    do {
+      code = List.generate(
+          8, (_) => _actChars[_rnd.nextInt(_actChars.length)]).join();
+    } while (_actCodes.containsKey(code));
+    _actCodes[code] = ActCodeEntry(
+        code: code,
+        type: 'admin',
+        createdAt: DateTime.now());
+    unawaited(_persistActCodes());
+    _syncActCodesToServer();
+    notifyListeners();
+    return code;
+  }
+
+  /// 首启展示的管理员激活码：无管理员时惰性生成并复用（已用/撤销后重生成）
+  String? ensureBootAdminCode() {
+    if (hasAdmin) return null;
+    final cur = _bootAdminCode == null ? null : _actCodes[_bootAdminCode];
+    if (cur == null || cur.used) {
+      _bootAdminCode = generateActCode();
+    }
+    return _bootAdminCode;
+  }
+
+  /// 撤销激活码（服务器同步删除，未使用的码立即失效）
+  void revokeActCode(String code) {
+    if (_actCodes.remove(code) == null) return;
+    unawaited(_persistActCodes());
+    _syncActCodesToServer();
+    notifyListeners();
+  }
+
+  /// 手机端兑换成功后服务器通知（host:code-used），标记已用
+  void markActCodeUsed(String code) {
+    final c = _actCodes[code];
+    if (c == null || c.used) return;
+    c.used = true;
+    unawaited(_persistActCodes());
+    notifyListeners();
+  }
+
+  /// 全量同步激活码到服务器（注册时携带 / 增删后增量同步）
+  void _syncActCodesToServer() {
+    _service.syncActCodes(_actCodes.values
+        .map((c) => {'code': c.code, 'type': c.type})
+        .toList());
   }
 
   /// 管理员踢出用户（仅断开，保留记录可重新扫码加入）
@@ -660,64 +842,119 @@ class HostController extends ChangeNotifier {
     _persistShares();
   }
 
-  /// 管理员共享文件夹：按设备 id / 手机号 / 公开（二维码）三种方式
+  // ── 连接密码 / 备注 / 更换管理员（v5.9+） ─────────────────
+  String _hashPassword(String pwd) {
+    // 连接密码：加盐 SHA-256 后本地存储（等保一级：密码不得明文保存）
+    final salt = List.generate(8, (_) => _rnd.nextInt(10)).join();
+    final h = sha256.convert(utf8.encode('$salt:$pwd')).toString();
+    return '$salt:$h';
+  }
+
+  /// 校验连接密码（未设置密码时直接放行）
+  bool verifyUserPassword(String deviceId, String pwd) {
+    final user = users[deviceId];
+    if (user == null || user.passwordHash.isEmpty) return true;
+    final parts = user.passwordHash.split(':');
+    if (parts.length != 2) return false;
+    return sha256.convert(utf8.encode('${parts[0]}:$pwd')).toString() ==
+        parts[1];
+  }
+
+  /// 重置连接密码：生成 6 位数字新密码，返回明文供管理页一次性展示；
+  /// 在线手机端立即收到新密码并本地保存（pendingReset 标记下次连接生效）
+  String? resetUserPassword(String deviceId) {
+    final user = users[deviceId];
+    if (user == null) return null;
+    final pwd = List.generate(6, (_) => _rnd.nextInt(10)).join();
+    user.passwordHash = _hashPassword(pwd);
+    user.pendingReset = true;
+    unawaited(_saveUsers());
+    if (user.clientId != null) {
+      _sendTo(user.clientId!, {'type': 'admin:pwd-reset', 'password': pwd});
+    }
+    AppLog.i('host', '重置连接密码: ${user.name} ($deviceId)');
+    notifyListeners();
+    return pwd;
+  }
+
+  /// 设置用户备注名称（管理页展示优先于设备名）
+  void setUserRemark(String deviceId, String remark) {
+    final user = users[deviceId];
+    if (user == null) return;
+    user.remark = remark.trim();
+    unawaited(_saveUsers());
+    notifyListeners();
+  }
+
+  /// 管理员移交：目标用户成为管理员（原管理员降级，电脑端管理页操作）
+  void transferAdmin(String deviceId) {
+    final target = users[deviceId];
+    if (target == null || target.shareOnly) return;
+    _grantAdmin(target);
+    AppLog.i('host', '管理员已移交: ${target.name} ($deviceId)');
+  }
+
+  /// 确认管理员激活/移交申请（UI 弹窗确认后调用）
+  void approveAdmin(String deviceId) {
+    final user = users[deviceId];
+    if (user == null) return;
+    _grantAdmin(user);
+    pendingAdminApproval = null;
+    AppLog.i('host', '管理员确认: ${user.name} ($deviceId)');
+  }
+
+  void _grantAdmin(HostUser user) {
+    for (final u in users.values) {
+      u.isAdmin = false;
+    }
+    user.isAdmin = true;
+    _bootAdminCode = null; // 首启码已生效，不再展示
+    _grantedAdminDevices.add(user.deviceId);
+    adminDeviceId = user.deviceId;
+    unawaited(_saveAdminState());
+    unawaited(_saveUsers());
+    // 推送最新身份给所有在线客户端（原管理员手机端实时降级）
+    for (final u in users.values.where((u) => u.online)) {
+      _pushUserList(u.clientId!);
+    }
+    notifyListeners();
+  }
+
+  /// 拒绝管理员激活/移交申请：清除待确认；未确认的新激活设备踢出并移除
+  void rejectAdmin(String deviceId) {
+    final claim = pendingAdminApproval?['claim'] == true;
+    pendingAdminApproval = null;
+    final user = users[deviceId];
+    if (user == null) return;
+    if (claim) {
+      _sendTo(user.clientId!, {
+        'type': 'user:claim-result',
+        'ok': false,
+        'error': '管理员申请已被电脑端拒绝',
+      });
+    } else {
+      if (user.clientId != null) _service.kickClient(user.clientId!);
+      users.remove(deviceId);
+      unawaited(_saveUsers());
+    }
+    notifyListeners();
+  }
+
+  /// 管理员共享文件夹：按设备 id / 公开（二维码）两种方式
   /// - deviceId 指定：直接共享给该设备用户
-  /// - phone 指定：匹配在线用户则直接绑定；否则待该手机号加入时自动绑定
   /// - 两者皆空：公开共享（扫码即可加入）
+  /// v5.9+ 去手机号：不再支持手机号指定共享
   ShareConfig? createShare({
     String? deviceId,
-    String? phone,
     required String folder,
     required List<String> perms,
+    String remark = '',
   }) {
     // 路径必须是绝对路径且存在
     final dir = Directory(folder.replaceAll('/', Platform.pathSeparator));
     if (!dir.existsSync()) return null;
 
-    // 手机号指定：匹配已登记用户；未匹配则创建待绑定共享
-    if (phone != null && phone.isNotEmpty) {
-      HostUser? target;
-      for (final u in users.values) {
-        if (u.phone == phone) {
-          target = u;
-          break;
-        }
-      }
-      if (target != null) deviceId = target.deviceId;
-      // 不重复共享：已绑定用户按用户查，待绑定按手机号查
-      if (deviceId != null && deviceId.isNotEmpty) {
-        for (final s in users[deviceId]!.shares) {
-          if (s.folder == folder) return s;
-        }
-      } else {
-        for (final s in _shareTable.values) {
-          if (s.targetPhone == phone && s.folder == folder) return s;
-        }
-      }
-      final share = ShareConfig(
-        token: _genToken(),
-        folder: folder,
-        perms: perms,
-        targetDeviceId: deviceId != null && deviceId.isNotEmpty ? deviceId : null,
-        targetPhone: phone,
-      );
-      if (deviceId != null && deviceId.isNotEmpty) {
-        final bound = users[deviceId]!;
-        bound.shares.add(share);
-        // 通知对方立即刷新（手机号方式：对方直接就能看到共享内容）
-        if (bound.clientId != null) {
-          _sendTo(bound.clientId!, {'type': 'user:share-updated'});
-        }
-      }
-      _shareTable[share.token] = share;
-      AppLog.i('host', '创建共享(手机号): $phone -> $folder token=${share.token} '
-          'perms=$perms ${deviceId != null ? '已绑定' : '待绑定'}');
-      notifyListeners();
-      _persistShares();
-      return share;
-    }
-
-    // 设备指定（原逻辑）或公开共享
+    // 设备指定或公开共享
     final user = deviceId != null && deviceId.isNotEmpty ? users[deviceId] : null;
     if (user == null && (deviceId != null && deviceId.isNotEmpty)) return null;
     if (user != null) {
@@ -730,14 +967,25 @@ class HostController extends ChangeNotifier {
         token: _genToken(),
         folder: folder,
         perms: perms,
-        targetDeviceId: deviceId);
+        targetDeviceId: deviceId,
+        remark: remark.trim());
     user?.shares.add(share);
     _shareTable[share.token] = share;
     AppLog.i('host', '创建共享: ${user?.name ?? '公开二维码'} -> $folder '
-        'token=${share.token} perms=$perms');
+        'token=${share.token} perms=$perms${remark.trim().isNotEmpty ? ' 备注=${remark.trim()}' : ''}');
     notifyListeners();
     _persistShares();
     return share;
+  }
+
+  /// 修改共享备注名称（管理页操作，本地落盘 + 服务器同步）
+  void setShareRemark(String token, String remark) {
+    final share = _shareTable[token];
+    if (share == null) return;
+    share.remark = remark.trim();
+    AppLog.i('host', '修改共享备注: ${share.name} token=$token 备注=${share.remark}');
+    notifyListeners();
+    _persistShares();
   }
 
   /// 管理员取消共享（从所有用户移除）
@@ -778,8 +1026,8 @@ class HostController extends ChangeNotifier {
     final share = _shareTable[token];
     if (user == null || share == null) return false;
     if (!user.shares.any((s) => s.token == token)) {
-      // 校验共享目标：共享给该用户（设备/手机号）或公开
-      if (!_canBind(share, user.deviceId, user.phone)) {
+      // 校验共享目标：共享给该设备或公开
+      if (!_canBind(share, user.deviceId)) {
         return false;
       }
       user.shares.add(share);
@@ -805,8 +1053,10 @@ class HostController extends ChangeNotifier {
     state = HostState.idle;
     errorMessage = null;
     notifyListeners();
-    // 重新连接时恢复持久化的管理员手机号（进程内断开重连场景）
-    await _loadAdminPhone();
+    // 重新连接时恢复持久化的管理员设备 id（进程内断开重连场景）
+    await _loadAdminState();
+    // 恢复激活码（重启不丢），并同步服务器
+    await _loadActCodes();
     // 恢复用户列表（离线），手机端重新加入时更新在线状态
     await _loadUsers();
     // 恢复共享配置（重启不丢），并给已绑定用户补回 shares 列表
@@ -857,13 +1107,55 @@ class HostController extends ChangeNotifier {
     }
   }
 
+  // ── 关闭窗口行为（v6.10） ──────────────────────────────
+  // 与 C++ runner 层共享 %APPDATA%\p2p_desktop\close_action 记忆文件：
+  // minimize=最小化到托盘 / quit=退出应用 / ask=每次询问（删除文件）
+  String get closeAction {
+    try {
+      final base = Platform.environment['APPDATA'] ??
+          Platform.environment['HOME'] ??
+          Directory.systemTemp.path;
+      final f = File('$base/p2p_desktop/close_action');
+      if (f.existsSync()) {
+        final v = f.readAsStringSync().trim();
+        if (v == 'minimize' || v == 'quit') return v;
+      }
+    } catch (e) {
+      AppLog.w('host', '读取关闭窗口行为失败', e);
+    }
+    return 'ask';
+  }
+
+  /// 设置关闭窗口行为：ask=每次询问（删除记忆）/ minimize=最小化到托盘 /
+  /// quit=退出应用；与 C++ 层 WM_CLOSE 处理共用记忆文件
+  Future<void> setCloseAction(String action) async {
+    final clean = action.trim();
+    if (clean != 'ask' && clean != 'minimize' && clean != 'quit') return;
+    try {
+      final base = Platform.environment['APPDATA'] ??
+          Platform.environment['HOME'] ??
+          Directory.systemTemp.path;
+      final dir = Directory('$base/p2p_desktop');
+      dir.createSync(recursive: true);
+      final f = File('${dir.path}/close_action');
+      if (clean == 'ask') {
+        if (f.existsSync()) f.deleteSync();
+      } else {
+        await f.writeAsString(clean);
+      }
+      AppLog.i('host', '关闭窗口行为已保存: $clean');
+    } catch (e) {
+      AppLog.e('host', '保存关闭窗口行为失败', e);
+    }
+  }
+
   Future<void> disconnect() async {
     await _service.dispose();
     state = HostState.idle;
     pairCode = '';
     users.clear();
     adminDeviceId = null;
-    adminPhone = null;
+    pendingAdminApproval = null;
     _shareTable.clear();
     _recvStates.clear();
     _sendingClients.clear();
@@ -889,7 +1181,7 @@ class HostController extends ChangeNotifier {
       await _service.goOffline();
       state = HostState.offline;
       pairCode = '';
-      // 仅清理传输态内存，保留 users/shares/transfers/adminPhone
+      // 仅清理传输态内存，保留 users/shares/transfers/激活码等本地数据
       _recvStates.clear();
       _sendingClients.clear();
       notifyListeners();
@@ -902,7 +1194,7 @@ class HostController extends ChangeNotifier {
     // 断开/超时：该客户端的进行中传输记录标记失败，避免界面永久显示「正在发送」
     for (final t in transfers) {
       if (t.clientId == clientId && t.status == 'transferring') {
-        t.status = 'error';
+        t.finish('error', connType: connTypeRaw);
       }
     }
     unawaited(_saveTransfers());
@@ -1216,6 +1508,24 @@ class HostController extends ChangeNotifier {
       case 'user:claim-admin':
         _handleClaimAdmin(clientId);
         break;
+      case 'user:power':
+        _handleRemotePower(clientId, msg.data);
+        break;
+      case 'user:auto-login':
+        _handleRemoteAutoLogin(clientId, msg.data);
+        break;
+      case 'user:create-code':
+        _handleCreateActCode(clientId, msg.data);
+        break;
+      case 'user:revoke-code':
+        _handleRevokeActCode(clientId, msg.data);
+        break;
+      case 'auth:verify':
+        _handleAuthVerify(clientId, msg.data);
+        break;
+      case 'auth:change-pwd':
+        _handleAuthChangePwd(clientId, msg.data);
+        break;
       default:
         break;
     }
@@ -1224,38 +1534,8 @@ class HostController extends ChangeNotifier {
   bool _isAdmin(String clientId) {
     final user = _userByClientId(clientId);
     if (user == null) return false;
-    if (user.isAdmin) return true;
-    // 管理员手机号识别：同一手机号登录的任何设备都视为管理员
-    // （换手机/重装应用导致 deviceId 变化后仍保有管理员身份）
-    if (adminPhone != null && adminPhone!.isNotEmpty && user.phone == adminPhone) {
-      user.isAdmin = true;
-      adminDeviceId ??= user.deviceId;
-      AppLog.i('host', '管理员手机号识别: ${user.name} (${user.phone})');
-      _pushUserList(clientId);
-      return true;
-    }
-    // 管理员身份兜底：仅当从未设置过持久化管理员手机号时启用
-    // （管理员离线时不自动更换，避免任何在线用户意外接管管理权）；
-    // 共享访客（扫码加入）永不参与兜底，防止扫码者获得管理员
-    if (adminPhone != null && adminPhone!.isNotEmpty) return false;
-    final online = users.values
-        .where((u) => u.online && !u.shareOnly)
-        .toList()
-      ..sort((a, b) => a.joinedAt.compareTo(b.joinedAt));
-    if (online.isNotEmpty && online.first.clientId == clientId) {
-      user.isAdmin = true;
-      adminDeviceId ??= user.deviceId;
-      // 兜底选中即持久化：避免电脑端每次重启后管理员身份再次丢失
-      // （无持久化管理员时，首个在线用户成为管理员并固定下来）
-      if (user.phone.isNotEmpty) {
-        adminPhone = user.phone;
-        unawaited(_saveAdminPhone(user.phone));
-      }
-      AppLog.i('host', '无管理员在线，自动升级为首个在线用户: ${user.name}');
-      _pushUserList(clientId);
-      return true;
-    }
-    return false;
+    // v5.9+：管理员身份仅由「管理员码激活 + 电脑端确认」产生，无手机号识别/兜底
+    return user.isAdmin;
   }
 
   /// 向指定客户端推送完整用户列表（含全量共享），用于身份/状态即时同步
@@ -1277,11 +1557,7 @@ class HostController extends ChangeNotifier {
   }
 
   /// 纯判定：不做任何身份升级/推送（供 _pushUserList 使用，避免递归）
-  bool _isAdminRaw(HostUser user) =>
-      user.isAdmin ||
-      (adminPhone != null &&
-          adminPhone!.isNotEmpty &&
-          user.phone == adminPhone);
+  bool _isAdminRaw(HostUser user) => user.isAdmin;
 
   Future<void> _sendTo(String clientId, Map<String, dynamic> json) async {
     await _service.sendJsonTo(clientId, json);
@@ -1291,23 +1567,7 @@ class HostController extends ChangeNotifier {
   void _handleUserList(String clientId) {
     final admin = _isAdmin(clientId);
     final me = _userByClientId(clientId);
-    // 已有其他管理员（按手机号识别）且当前为配对用户：告知手机端现任管理员
-    // 手机号，便于提示“是否更换管理员”（共享访客无权更换）
-    String? occupiedBy;
-    if (!admin &&
-        adminPhone != null &&
-        adminPhone!.isNotEmpty &&
-        me != null &&
-        !me.shareOnly &&
-        me.phone.isNotEmpty &&
-        me.phone != adminPhone) {
-      final owner = users.values
-          .where((u) => u.phone == adminPhone && !u.shareOnly)
-          .toList();
-      occupiedBy = owner.isNotEmpty ? owner.first.phone : adminPhone;
-      AppLog.i('host',
-          '已有管理员 ${me.name}: 现任=$occupiedBy 请求者=${me.phone} → 提示更换');
-    }
+    // v5.9+：管理员设备 id 告知手机端（手机端可提示“更换管理员”由电脑端确认）
     _sendTo(clientId, {
       'type': 'user:list-result',
       // 非管理员（含共享访客）只返回自己条目，避免暴露其他用户信息
@@ -1316,44 +1576,301 @@ class HostController extends ChangeNotifier {
           : (me != null ? [me.toJson()] : <dynamic>[]),
       'myDeviceId': me?.deviceId ?? '',
       'isAdmin': admin,
-      'adminPhone': ?occupiedBy,
+      'adminDeviceId': admin ? null : adminDeviceId,
       // 管理员额外返回全部共享配置（共享文件夹管理页）
       if (admin)
         'shares': _shareTable.values.map((s) => s.toJson()).toList(),
     });
   }
 
-  /// 更换管理员：配对用户申请成为本电脑端管理员
-  /// （覆盖持久化管理员手机号；原管理员下次连接自动降级为普通用户）
+  /// 更换管理员：正式用户申请成为本电脑端管理员（电脑端弹窗确认后生效）
   void _handleClaimAdmin(String clientId) {
     final user = _userByClientId(clientId);
-    if (user == null || user.shareOnly || user.phone.isEmpty) {
+    if (user == null || user.shareOnly) {
       _sendTo(clientId, {
         'type': 'user:claim-result',
         'ok': false,
-        'error': '仅配对连接用户可更换管理员',
+        'error': '仅正式用户可申请成为管理员',
       });
       return;
     }
-    if (adminPhone == user.phone) {
-      // 已是该手机号的管理员：补齐标记即可
-      user.isAdmin = true;
-    } else {
-      // 原管理员降级（包括 isAdmin 标记与持久化手机号）
-      for (final u in users.values) {
-        if (u.isAdmin) u.isAdmin = false;
+    if (user.isAdmin) {
+      _sendTo(clientId, {'type': 'user:claim-result', 'ok': true});
+      return;
+    }
+    if (pendingAdminApproval != null) {
+      _sendTo(clientId, {
+        'type': 'user:claim-result',
+        'ok': false,
+        'error': '已有待确认的申请，请稍后再试',
+      });
+      return;
+    }
+    pendingAdminApproval = {
+      'deviceId': user.deviceId,
+      'name': user.name,
+      'claim': true,
+    };
+    AppLog.i('host', '管理员更换申请待确认: ${user.name} (${user.deviceId})');
+    notifyListeners();
+  }
+
+  /// 远程电源控制（v6.2）：仅管理员可执行；关机/重启延迟 15 秒执行，
+  /// 期间手机端可发送 cancel（shutdown /a）中止；先回执再等待进程退出校验
+  Future<void> _handleRemotePower(
+      String clientId, Map<String, dynamic> msg) async {
+    final user = _userByClientId(clientId);
+    if (user == null || !user.isAdmin) {
+      _sendTo(clientId, {
+        'type': 'user:power-result',
+        'ok': false,
+        'error': '仅管理员可执行电源控制',
+      });
+      return;
+    }
+    final action = msg['action']?.toString() ?? '';
+    switch (action) {
+      case 'shutdown':
+      case 'reboot':
+        try {
+          final p = await Process.start('shutdown', [
+            action == 'shutdown' ? '/s' : '/r',
+            '/t',
+            '15',
+          ]);
+          // 先回执：手机端进入 15 秒取消窗口
+          _sendTo(clientId, {
+            'type': 'user:power-result',
+            'ok': true,
+            'action': action,
+            'delaySeconds': 15,
+          });
+          AppLog.i('host',
+              '远程${action == 'shutdown' ? '关机' : '重启'}已受理 (15s后执行)');
+          final code = await p.exitCode;
+          if (code != 0) {
+            AppLog.w('host', '远程电源执行异常退出: code=$code');
+            _sendTo(clientId, {
+              'type': 'user:power-result',
+              'ok': false,
+              'error': '执行失败（退出码 $code），可能权限不足',
+            });
+          }
+        } catch (e) {
+          AppLog.w('host', '远程电源执行异常: $e');
+          _sendTo(clientId, {
+            'type': 'user:power-result',
+            'ok': false,
+            'error': '执行失败: $e',
+          });
+        }
+        break;
+      case 'cancel':
+        // 取消挂起的关机/重启（无挂起时 shutdown /a 退出码非 0，无需提示）
+        try {
+          await Process.run('shutdown', ['/a']);
+          _sendTo(clientId, {
+            'type': 'user:power-result',
+            'ok': true,
+            'action': 'cancel',
+          });
+          AppLog.i('host', '远程电源操作已取消');
+        } catch (e) {
+          AppLog.w('host', '远程电源取消失败: $e');
+          _sendTo(clientId, {
+            'type': 'user:power-result',
+            'ok': false,
+            'error': '取消失败: $e',
+          });
+        }
+        break;
+      default:
+        _sendTo(clientId, {
+          'type': 'user:power-result',
+          'ok': false,
+          'error': '未知电源操作: $action',
+        });
+    }
+  }
+
+  /// 远程自动登录设置（v6.6）：仅管理员可操作；写 HKLM 需管理员权限，
+  /// 电脑端须以管理员身份运行（已提权直接写，无 UAC 弹窗）；
+  /// 密码仅在本机注册表落盘，不经日志；旧版电脑端静默忽略此消息
+  Future<void> _handleRemoteAutoLogin(
+      String clientId, Map<String, dynamic> msg) async {
+    final user = _userByClientId(clientId);
+    if (user == null || !user.isAdmin) {
+      _sendTo(clientId, {
+        'type': 'user:auto-login-result',
+        'ok': false,
+        'error': '仅管理员可设置自动登录',
+      });
+      return;
+    }
+    final action = msg['action']?.toString() ?? '';
+    try {
+      switch (action) {
+        case 'status':
+          _sendTo(clientId, {
+            'type': 'user:auto-login-result',
+            'ok': true,
+            'enabled': await AutoLoginService.isEnabled(),
+            'elevated': await AutoLoginService.isElevated(),
+          });
+          break;
+        case 'enable':
+          if (!await AutoLoginService.isElevated()) {
+            _sendTo(clientId, {
+              'type': 'user:auto-login-result',
+              'ok': false,
+              'error': '电脑端未以管理员身份运行，请在电脑上右键本程序选择'
+                  '“以管理员身份运行”后重试',
+            });
+            return;
+          }
+          final pwd = msg['password']?.toString() ?? '';
+          if (pwd.isEmpty) {
+            _sendTo(clientId, {
+              'type': 'user:auto-login-result',
+              'ok': false,
+              'error': '密码不能为空',
+            });
+            return;
+          }
+          final ok = await AutoLoginService.enable(pwd);
+          _sendTo(clientId, {
+            'type': 'user:auto-login-result',
+            'ok': ok,
+            'enabled': ok,
+            'error': ok ? null : '注册表写入失败，请检查电脑端权限',
+          });
+          if (ok) AppLog.i('host', '远程自动登录已开启（发送者 $user.name）');
+          break;
+        case 'disable':
+          if (!await AutoLoginService.isElevated()) {
+            _sendTo(clientId, {
+              'type': 'user:auto-login-result',
+              'ok': false,
+              'error': '电脑端未以管理员身份运行，请在电脑上右键本程序选择'
+                  '“以管理员身份运行”后重试',
+            });
+            return;
+          }
+          final ok = await AutoLoginService.disable();
+          _sendTo(clientId, {
+            'type': 'user:auto-login-result',
+            'ok': ok,
+            'enabled': false,
+            'error': ok ? null : '注册表清理失败，请检查电脑端权限',
+          });
+          if (ok) AppLog.i('host', '远程自动登录已关闭（发送者 $user.name）');
+          break;
+        default:
+          _sendTo(clientId, {
+            'type': 'user:auto-login-result',
+            'ok': false,
+            'error': '未知操作: $action',
+          });
       }
-      adminPhone = user.phone;
-      adminDeviceId = user.deviceId;
-      user.isAdmin = true;
-      unawaited(_saveAdminPhone(user.phone));
-      AppLog.i('host', '管理员已更换: ${user.name} (${user.phone})');
+    } catch (e) {
+      AppLog.w('host', '远程自动登录处理异常: $e');
+      _sendTo(clientId, {
+        'type': 'user:auto-login-result',
+        'ok': false,
+        'error': '执行异常: $e',
+      });
     }
-    // 推送最新身份给所有在线客户端（原管理员手机端实时降级）
-    for (final u in users.values.where((u) => u.online)) {
-      _pushUserList(u.clientId!);
+  }
+
+  /// 手机端远程生成激活码（v5.9+：管理员 App 内发码，无需到电脑前）
+  void _handleCreateActCode(String clientId, Map<String, dynamic> msg) {
+    if (!_isAdmin(clientId)) {
+      _sendTo(clientId, {
+        'type': 'user:code-result',
+        'ok': false,
+        'error': '仅管理员可生成激活码',
+      });
+      return;
     }
-    _sendTo(clientId, {'type': 'user:claim-result', 'ok': true});
+    // v6.14+ 身份二态化：仅生成管理员码（手机端消息的 admin 字段不再区分）
+    final code = generateActCode();
+    _sendTo(clientId, {'type': 'user:code-result', 'ok': true, 'code': code});
+  }
+
+  /// 手机端远程撤销激活码
+  void _handleRevokeActCode(String clientId, Map<String, dynamic> msg) {
+    if (!_isAdmin(clientId)) {
+      _sendTo(clientId, {
+        'type': 'user:code-result',
+        'ok': false,
+        'error': '仅管理员可撤销激活码',
+      });
+      return;
+    }
+    final code = msg['code']?.toString() ?? '';
+    if (!_actCodes.containsKey(code)) {
+      _sendTo(clientId, {
+        'type': 'user:code-result',
+        'ok': false,
+        'error': '激活码不存在或已使用',
+      });
+      return;
+    }
+    revokeActCode(code);
+    _sendTo(clientId, {'type': 'user:code-result', 'ok': true});
+  }
+
+  /// 数据通道连接密码校验（v5.9+；服务器全程不接触密码）
+  void _handleAuthVerify(String clientId, Map<String, dynamic> msg) {
+    final user = _userByClientId(clientId);
+    if (user == null) return;
+    final pwd = msg['password']?.toString() ?? '';
+    if (verifyUserPassword(user.deviceId, pwd)) {
+      user.pendingReset = false;
+      unawaited(_saveUsers());
+      _sendTo(clientId, {'type': 'auth:ok'});
+    } else {
+      AppLog.w('host', '连接密码校验失败: ${user.name} (${user.deviceId})');
+      _sendTo(clientId, {
+        'type': 'auth:denied',
+        'error': user.pendingReset
+            ? '连接密码已被管理员重置，请获取新密码'
+            : '连接密码错误',
+      });
+      // 稍等片刻让对方收到错误提示后断开
+      Future.delayed(const Duration(milliseconds: 500), () {
+        _service.kickClient(clientId);
+      });
+    }
+  }
+
+  /// 手机端主动修改连接密码（管理员可自行更换，同步到电脑端）
+  void _handleAuthChangePwd(String clientId, Map<String, dynamic> msg) {
+    final user = _userByClientId(clientId);
+    if (user == null) return;
+    final oldPwd = msg['oldPassword']?.toString() ?? '';
+    final newPwd = msg['newPassword']?.toString() ?? '';
+    if (newPwd.length < 6 || newPwd.length > 16) {
+      _sendTo(clientId, {
+        'type': 'auth:pwd-result',
+        'ok': false,
+        'error': '新密码需 6-16 位',
+      });
+      return;
+    }
+    if (!verifyUserPassword(user.deviceId, oldPwd)) {
+      _sendTo(clientId, {
+        'type': 'auth:pwd-result',
+        'ok': false,
+        'error': '原密码错误',
+      });
+      return;
+    }
+    user.passwordHash = _hashPassword(newPwd);
+    user.pendingReset = false;
+    unawaited(_saveUsers());
+    AppLog.i('host', '连接密码已修改: ${user.name} (${user.deviceId})');
+    _sendTo(clientId, {'type': 'auth:pwd-result', 'ok': true});
   }
 
   void _handleCreateShare(String clientId, Map<String, dynamic> msg) {
@@ -1363,7 +1880,6 @@ class HostController extends ChangeNotifier {
       return;
     }
     final deviceId = msg['deviceId']?.toString() ?? '';
-    final phone = msg['phone']?.toString() ?? '';
     final folder = msg['folder']?.toString() ?? '';
     final perms = (msg['perms'] as List? ?? [])
         .map((e) => e.toString())
@@ -1371,7 +1887,6 @@ class HostController extends ChangeNotifier {
         .toList();
     final share = createShare(
       deviceId: deviceId.isEmpty ? null : deviceId,
-      phone: phone.isEmpty ? null : phone,
       folder: folder,
       perms: perms,
     );
@@ -1696,7 +2211,7 @@ class HostController extends ChangeNotifier {
       // 发送失败必须感知（丢失会导致手机端卡住直至 30s 超时续传）
       await _sendTo(clientId,
           {'type': 'file-complete', 'fileName': fileName, 'fileSize': size});
-      t.status = 'done';
+      t.finish('done', connType: connTypeRaw);
       unawaited(_saveTransfers());
       AppLog.i('download', '发送完成: $fileName (${t.transferred}/${size}B) [$clientId]');
       notifyListeners();
@@ -1706,7 +2221,7 @@ class HostController extends ChangeNotifier {
       // 发送中止/异常：进行中的记录标记失败并落盘，避免重启后残留「正在发送」
       for (final t in transfers) {
         if (t.clientId == clientId && t.status == 'transferring') {
-          t.status = 'error';
+          t.finish('error', connType: connTypeRaw);
         }
       }
       unawaited(_saveTransfers());
@@ -2057,7 +2572,7 @@ class HostController extends ChangeNotifier {
       // 用户选择跳过：无文件落地，告知手机端
       rs.skipUploading = false;
       if (item != null) {
-        item.status = 'error';
+        item.finish('error', connType: connTypeRaw);
       }
       unawaited(_saveTransfers());
       _sendTo(clientId, {
@@ -2077,7 +2592,7 @@ class HostController extends ChangeNotifier {
       final saveName = fileName; // 正常接收时保存名即文件名
       AppLog.i('upload', '接收完成: $fileName $recvBytes/$recvExpected B 溢出=${overflow}B => ${ok ? '成功' : '失败(字节数不匹配/超量)'} [$clientId]');
       if (item != null) {
-        item.status = ok ? 'done' : 'error';
+        item.finish(ok ? 'done' : 'error', connType: connTypeRaw);
       }
       unawaited(_saveTransfers());
       // 成功：.part 重命名为正式文件名；失败：删除残留 part
@@ -2202,6 +2717,8 @@ class HostController extends ChangeNotifier {
       startTime: DateTime.now(),
       clientName: user?.name ?? '手机',
       clientId: clientId,
+      // 创建时快照连接方式（历史记录显示固定，不再随实时连接变化）
+      connType: connTypeRaw,
     );
     transfers.add(t);
     unawaited(_saveTransfers());

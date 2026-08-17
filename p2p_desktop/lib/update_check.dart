@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -69,6 +70,7 @@ void openDownloadUrl(String relativeUrl) {
 /// 下载升级包到本地文件（带进度回调：已下载字节/总字节）
 ///
 /// 失败时抛出异常，由调用方决定回退策略。
+/// v6.17：连接后总下载超时 10 分钟，OSS 异常/网络卡死时避免进度条永久挂起
 Future<void> downloadUpgradeZip(
   String relativeUrl,
   String targetPath,
@@ -76,6 +78,10 @@ Future<void> downloadUpgradeZip(
 ) async {
   final uri = Uri.parse('$defaultServerUrl$relativeUrl');
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+  // 总超时：强制关闭连接会中断下载流并抛异常，由调用方回退手动下载
+  final deadline = Timer(const Duration(minutes: 10), () {
+    client.close(force: true);
+  });
   try {
     final req = await client.getUrl(uri);
     final resp = await req.close();
@@ -96,6 +102,7 @@ Future<void> downloadUpgradeZip(
       await sink.close();
     }
   } finally {
+    deadline.cancel();
     client.close();
   }
 }

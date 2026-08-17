@@ -8,7 +8,7 @@
     <!-- 安装升级包：Android 8+ 拉起系统安装器必需（v5.2 修复升级无法安装） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <application
-        android:label="P2P 文件助手"
+        android:label="无限大盘"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">

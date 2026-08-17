@@ -23,7 +23,7 @@ bool TrayIcon::Create(HWND owner) {
   nid.uCallbackMessage = kTrayCallbackMessage;
   nid.hIcon =
       ::LoadIconW(::GetModuleHandleW(nullptr), MAKEINTRESOURCE(IDI_APP_ICON));
-  wcscpy_s(nid.szTip, L"P2P 文件助手");
+  wcscpy_s(nid.szTip, L"无限大盘");
 
   created_ = ::Shell_NotifyIconW(NIM_ADD, &nid) == TRUE;
   return created_;
@@ -71,7 +71,7 @@ void TrayIcon::HideMainWindow() {
   nid.uID = kTrayIconId;
   nid.uFlags = NIF_INFO;
   nid.dwInfoFlags = NIIF_INFO;
-  wcscpy_s(nid.szInfoTitle, L"P2P 文件助手");
+  wcscpy_s(nid.szInfoTitle, L"无限大盘");
   wcscpy_s(nid.szInfo, L"已最小化到系统托盘，双击托盘图标恢复窗口；\n右键图标可选择退出系统。");
   ::Shell_NotifyIconW(NIM_MODIFY, &nid);
 }

@@ -58,9 +58,9 @@ class _ShareManagePageState extends State<ShareManagePage> {
             separatorBuilder: (_, _) => const SizedBox(height: 8),
             itemBuilder: (context, i) {
               final s = shares[i];
-              final targetName = s.targetPhone != null
-                  ? '手机号 ${s.targetPhone}'
-                  : (s.isPublic ? '二维码（扫码加入）' : '指定设备');
+              // v5.9+ 不再按手机号定向共享：历史 targetPhone 数据统一展示为定向共享
+              final targetName =
+                  s.isPublic ? '二维码（扫码加入）' : '定向共享';
               final bound = s.targetDeviceId != null || s.isPublic;
               return Card(
                 margin: EdgeInsets.zero,
@@ -96,7 +96,7 @@ class _ShareManagePageState extends State<ShareManagePage> {
                                     icon: Icons.security,
                                     text: s.isPublic
                                         ? '公开'
-                                        : (bound ? '已生效' : '待对方登录生效')),
+                                        : (bound ? '已生效' : '待对方扫码加入')),
                                 if (s.canDownload)
                                   const _Chip(
                                       icon: Icons.download, text: '下载'),
@@ -115,6 +115,8 @@ class _ShareManagePageState extends State<ShareManagePage> {
                           switch (v) {
                             case 'qr':
                               _showQr(s);
+                            case 'remark':
+                              _editRemark(s);
                             case 'perms':
                               _editPerms(s);
                             case 'del':
@@ -125,6 +127,8 @@ class _ShareManagePageState extends State<ShareManagePage> {
                           if (s.isPublic)
                             const PopupMenuItem(
                                 value: 'qr', child: Text('查看共享二维码')),
+                          const PopupMenuItem(
+                              value: 'remark', child: Text('备注名称')),
                           const PopupMenuItem(
                               value: 'perms', child: Text('修改权限')),
                           const PopupMenuItem(
@@ -138,6 +142,50 @@ class _ShareManagePageState extends State<ShareManagePage> {
             },
           );
         },
+      ),
+    );
+  }
+
+  /// 编辑共享备注名称（留空恢复为文件夹末段，同步到手机端“共享给我的”展示）
+  void _editRemark(ShareConfig share) {
+    final ctrl = TextEditingController(text: share.remark);
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('备注名称 - ${share.name}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              maxLength: 30,
+              decoration: const InputDecoration(
+                labelText: '备注名称（留空则显示文件夹名）',
+                hintText: '例如：工作资料',
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(share.folder,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12, color: Colors.grey)),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('取消')),
+          FilledButton(
+            onPressed: () {
+              widget.controller.setShareRemark(share.token, ctrl.text);
+              Navigator.of(ctx).pop();
+              _toast('备注已更新');
+            },
+            child: const Text('保存'),
+          ),
+        ],
       ),
     );
   }
@@ -244,16 +292,17 @@ class _ShareManagePageState extends State<ShareManagePage> {
     );
   }
 
-  /// 新增共享对话框：选择文件夹 + 分享方式（手机号/二维码）+ 权限
+  /// 新增共享对话框：选择文件夹 + 公开二维码方式 + 权限（v5.9+ 去手机号）
+  /// 指定设备共享请用手机端管理页（管理员操作）
   Future<void> _openCreateDialog() async {
     final path = await FilePicker.platform.getDirectoryPath(
       dialogTitle: '选择要共享的文件夹',
     );
     if (path == null || !mounted) return;
 
-    final mode = ValueNotifier<int>(1); // 0=指定手机号 1=生成二维码
-    final phoneCtrl = TextEditingController();
     final perms = <String>{'download', 'upload', 'delete'};
+    final remarkCtrl = TextEditingController(
+        text: path.split(RegExp(r'[/\\]')).last); // 默认预填文件夹末段
 
     await showDialog<bool>(
       context: context,
@@ -279,61 +328,39 @@ class _ShareManagePageState extends State<ShareManagePage> {
                   ],
                 ),
                 const SizedBox(height: 12),
-                SegmentedButton<int>(
-                  segments: const [
-                    ButtonSegment(
-                        value: 0,
-                        label: Text('指定手机号'),
-                        icon: Icon(Icons.phone_android, size: 16)),
-                    ButtonSegment(
-                        value: 1,
-                        label: Text('生成二维码'),
-                        icon: Icon(Icons.qr_code_2, size: 16)),
-                  ],
-                  selected: {mode.value},
-                  showSelectedIcon: false,
-                  onSelectionChanged: (s) =>
-                      setState(() => mode.value = s.first),
-                ),
-                const SizedBox(height: 10),
-                if (mode.value == 0)
-                  TextField(
-                    controller: phoneCtrl,
-                    keyboardType: TextInputType.phone,
-                    maxLength: 11,
-                    decoration: const InputDecoration(
-                      isDense: true,
-                      counterText: '',
-                      prefixIcon: Icon(Icons.phone_android, size: 18),
-                      hintText: '输入对方注册手机号',
-                      border: OutlineInputBorder(),
-                    ),
-                  )
-                else
-                  Container(
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: Theme.of(ctx)
-                          .colorScheme
-                          .secondaryContainer
-                          .withValues(alpha: 0.35),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: const Row(
-                      children: [
-                        Icon(Icons.info_outline, size: 18),
-                        SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            '生成二维码后，对方扫码加入才能看到此共享文件夹',
-                            style: TextStyle(fontSize: 12),
-                          ),
-                        ),
-                      ],
-                    ),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Theme.of(ctx)
+                        .colorScheme
+                        .secondaryContainer
+                        .withValues(alpha: 0.35),
+                    borderRadius: BorderRadius.circular(8),
                   ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.qr_code_2, size: 18),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '生成二维码后，对方扫码加入才能看到此共享文件夹',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
                 const SizedBox(height: 12),
-                const Text('用户对该文件夹的权限：',
+                TextField(
+                  controller: remarkCtrl,
+                  maxLength: 30,
+                  decoration: const InputDecoration(
+                    labelText: '备注名称（对方看到的名称，可修改）',
+                    isDense: true,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text('权限设置：',
                     style: TextStyle(fontSize: 13)),
                 Row(
                   children: [
@@ -371,37 +398,23 @@ class _ShareManagePageState extends State<ShareManagePage> {
               child: const Text('取消')),
           FilledButton(
             onPressed: () {
-              final phone = phoneCtrl.text.trim();
-              if (mode.value == 0 && phone.isEmpty) {
-                ScaffoldMessenger.of(ctx).showSnackBar(
-                  const SnackBar(content: Text('请输入对方注册手机号')),
-                );
-                return;
-              }
               Navigator.of(ctx).pop(true);
               final share = widget.controller.createShare(
-                phone: mode.value == 0 ? phone : null,
                 folder: path,
                 perms: perms.toList(),
+                remark: remarkCtrl.text,
               );
               if (share == null) {
                 _toast('创建共享失败');
                 return;
               }
-              if (share.isPublic) {
-                _showQr(share);
-              } else {
-                _toast('已共享「${share.name}」'
-                    '${share.targetDeviceId != null ? '，对方已可访问' : '，待对方登录后生效'}');
-              }
+              _showQr(share);
             },
-            child: Text(mode.value == 0 ? '确认共享' : '生成共享二维码'),
+            child: const Text('生成共享二维码'),
           ),
         ],
       ),
     );
-    phoneCtrl.dispose();
-    mode.dispose();
   }
 
   void _toast(String msg) {

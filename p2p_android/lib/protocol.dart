@@ -40,6 +40,23 @@ const List<String> kKnownMsgTypes = [
   'user:remove-result',
   // 电脑端已有其他管理员时：更换管理员申请结果（配对连接用户可申请）
   'user:claim-result',
+  // 管理员远程生成/撤销激活码（v5.4+）
+  'user:create-code',
+  'user:revoke-code',
+  // 远程电源控制（v5.9）：shutdown/reboot/cancel
+  'user:power',
+  'user:power-result',
+  // 远程自动登录设置（v5.13）：status/enable/disable（重启后免输密码）
+  'user:auto-login',
+  'user:auto-login-result',
+  'user:code-result',
+  // 连接密码（v5.4+，数据通道内校验，服务器不接触密码）
+  'auth:verify',
+  'auth:ok',
+  'auth:denied',
+  'auth:change-pwd',
+  'auth:pwd-result',
+  'admin:pwd-reset',
 ];
 
 /// 解析后的控制消息

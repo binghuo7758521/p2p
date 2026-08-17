@@ -22,11 +22,37 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
       nullptr, FALSE, L"Local\\P2P_Desktop_Single_Instance");
   (void)mutex;  // 句柄存活即可，进程退出时内核自动释放互斥体
   if (::GetLastError() == ERROR_ALREADY_EXISTS) {
-    ::MessageBoxW(
-        nullptr,
-        L"P2P 文件助手已在运行（可能最小化在任务栏/托盘中）。\n"
-        L"请先关闭已打开的窗口，再重新启动程序。",
-        L"P2P 文件助手", MB_OK | MB_ICONINFORMATION);
+    // 已有实例（v6.3）：不再弹提示，直接激活其主窗口后退出
+    // 标题前缀“无限大盘”匹配（标题动态含版本号，如“无限大盘 - 局域网 v6.3”），
+    // 枚举时无捕获 lambda 经 lParam 回传目标窗口句柄
+    HWND existing = nullptr;
+    ::EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+          wchar_t title[64] = {0};
+          ::GetWindowTextW(hwnd, title, 64);
+          if (wcsncmp(title, L"无限大盘", 4) == 0) {
+            *reinterpret_cast<HWND*>(lp) = hwnd;
+            return FALSE;  // 找到即停止枚举
+          }
+          return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&existing));
+    if (existing != nullptr) {
+      // 最小化 → 还原；托盘隐藏（SW_HIDE）→ 重新显示；最后置前激活
+      if (::IsIconic(existing)) {
+        ::ShowWindow(existing, SW_RESTORE);
+      } else if (!::IsWindowVisible(existing)) {
+        ::ShowWindow(existing, SW_SHOW);
+      }
+      ::SetForegroundWindow(existing);
+    } else {
+      // 极端情况（枚举不到主窗口）兕底：保留原提示，保证用户知情
+      ::MessageBoxW(
+          nullptr,
+          L"无限大盘已在运行（可能最小化在任务栏/托盘中）。\n"
+          L"请先关闭已打开的窗口，再重新启动程序。",
+          L"无限大盘", MB_OK | MB_ICONINFORMATION);
+    }
     return 0;
   }
 

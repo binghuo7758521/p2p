@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -12,10 +13,12 @@ import 'app_controller.dart';
 import 'app_log.dart';
 import 'auth_service.dart';
 import 'connect_page.dart';
+import 'download_banner.dart';
 import 'models.dart';
 import 'protocol.dart';
 import 'scan_page.dart';
 import 'share_browse_page.dart';
+import 'update_check.dart';
 import 'share_center_page.dart';
 import 'users_page.dart';
 import 'version.dart';
@@ -35,6 +38,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   int _tab = 0;
   bool _claimDialogShowing = false; // 管理员更换确认弹窗防重复
+  bool _powerNoticeShowing = false; // 电源控制提示条防重复
 
   @override
   void initState() {
@@ -43,10 +47,16 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 冷启动（主页为登录后第一页）：有历史配对信息则自动直连；
-  /// 无配对信息（没有自己的电脑）停留未连接视图，可手动连接或浏览共享
+  /// 无配对信息（没有自己的电脑）停留未连接视图，可手动连接或浏览共享；
+  /// v5.11+：非管理员启动时不自动连接任何电脑端，
+  /// 避免扫码加入多个共享后后台逐个连电脑，改为点击共享/历史条目时才连接
   Future<void> _maybeAutoConnect() async {
     final c = widget.controller;
     if (c.state != ConnectState.idle) return; // 已在连接/已连接/重连中
+    if (AuthService.instance.type != 'admin') {
+      AppLog.i('connect', '非管理员，跳过启动自动直连');
+      return;
+    }
     final info = await c.loadPairInfo();
     if (!mounted || info == null) return;
     c.autoMode = true;
@@ -63,6 +73,11 @@ class _HomePageState extends State<HomePage> {
     final ctrl = widget.controller;
     AppLog.i('share',
         '扫码: server=${result.server} code=${result.code} token=${result.shareToken}');
+    // v5.23+：管理员激活码（p2p-act:）——已激活手机成为另一台电脑管理员
+    if (result.isAct) {
+      await _activateNewHost(ctrl, result);
+      return;
+    }
     if (result.shareToken != null &&
         ctrl.state == ConnectState.peerConnected &&
         result.server == ctrl.lastServerUrl &&
@@ -87,6 +102,80 @@ class _HomePageState extends State<HomePage> {
         pendingShareToken: result.shareToken,
       ),
     ));
+  }
+
+  /// v5.23+：已激活手机扫码电脑端管理员码，成为另一台电脑管理员。
+  /// 激活后旧电脑的共享列表失效（设备令牌被替换），配对记录保留可直连；
+  /// 确认后覆盖本地激活态并自动连接新电脑
+  Future<void> _activateNewHost(AppController ctrl, ScanPairResult result) async {
+    final code = result.code.toUpperCase();
+    AppLog.i('auth', '扫码管理员码: server=${result.server} code=$code');
+    // 已连接同一台电脑：无需重新激活
+    if (ctrl.state == ConnectState.peerConnected &&
+        result.server == ctrl.lastServerUrl &&
+        code == ctrl.lastPairCode?.toUpperCase()) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('已连接该电脑，无需重复激活')));
+      return;
+    }
+    // v5.17+ 激活前即时校验：已使用的码提示失效，不弹确认
+    final valid = await AuthService.instance
+        .checkActCodeValid(result.server, code);
+    if (!mounted) return;
+    if (!valid) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('激活码已失效（已被使用），请重新获取')));
+      return;
+    }
+    // 确认弹窗：明确告知原电脑共享列表将失效、直连保留
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('成为这台电脑的管理员？'),
+        content: const Text(
+            '激活后将接管该电脑的管理权限，并自动连接。\n\n'
+            '注意：原电脑的共享列表将失效（管理员身份被替换），'
+            '但电脑配对记录会保留，可随时切换连接。'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('确认激活')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      final act = await AuthService.instance
+          .activate(result.server, code, ctrl.deviceId);
+      await AuthService.instance.save(
+        deviceToken: act.deviceToken,
+        pairCode: act.pairCode,
+        type: act.type,
+        activationCode: code,
+      );
+      AppLog.i('auth', '扫码激活成功，连接新电脑: ${act.pairCode}');
+      // 激活即自动直连新电脑（失败时主页显示重连视图）
+      ctrl.autoMode = true;
+      await ctrl.connect(result.server, act.pairCode);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('激活成功，已连接新电脑'),
+          duration: Duration(seconds: 2)));
+    } catch (e) {
+      if (!mounted) return;
+      final msg = e.toString();
+      AppLog.e('auth', '扫码激活失败', e);
+      // v5.6+ 强制升级：旧版被服务器拒绝激活，弹不可跳过的升级窗
+      if (msg == 'APP_VERSION_REQUIRED') {
+        unawaited(handleVersionRequired(context));
+        return;
+      }
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('激活失败: $msg')));
+    }
   }
 
   // ── 主页内切换连接目标（电脑/共享文件夹） ────────────────
@@ -129,7 +218,7 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     if (list.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('暂无历史记录，请先扫码或输入配对码连接')));
+          content: Text('暂无历史记录，请先使用激活码激活电脑')));
       return;
     }
     final history = List<PairInfo>.from(list);
@@ -187,8 +276,9 @@ class _HomePageState extends State<HomePage> {
                                   ? c.hostName!
                                   : _historyTitle(h)),
                           subtitle: Text(
-                            '${h.isShare ? '' : '配对码 ${h.code}'}'
-                            '${_fmtTime(h.lastAt).isEmpty ? '' : ' · ${_fmtTime(h.lastAt)}'}',
+                            (_fmtTime(h.lastAt).isEmpty
+                                ? ''
+                                : '最近连接 · ${_fmtTime(h.lastAt)}'),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                           ),
@@ -296,6 +386,166 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  /// 远程电源控制确认（v5.9）：仅管理员入口可见；确认后发送指令
+  Future<void> _confirmRemotePower(String value) async {
+    final shutdown = value == 'power_shutdown';
+    final label = shutdown ? '关机' : '重启';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('远程$label'),
+        content: Text('确认要远程$label电「${widget.controller.hostName ?? '电脑'}」吗？\n\n'
+            '未保存的工作可能会丢失！执行后 15 秒内可在手机端取消。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: Text('确认$label'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true && mounted) {
+      widget.controller.remotePower(shutdown ? 'shutdown' : 'reboot');
+    }
+  }
+
+  /// 远程自动登录设置（v5.13）：仅管理员入口可见；
+  /// 电脑端须以管理员身份运行方可远程写入（回执会明确提示）
+  Future<void> _openAutoLoginDialog() async {
+    final c = widget.controller;
+    if (!c.isAdmin) return;
+    // 先查询当前状态
+    final status = await c.remoteAutoLogin('status');
+    if (!mounted) return;
+    if (status == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('无响应：电脑端版本过旧或未连接，请升级电脑端后重试'),
+      ));
+      return;
+    }
+    if (status['ok'] != true) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(status['error']?.toString() ?? '查询自动登录状态失败'),
+      ));
+      return;
+    }
+    final enabled = status['enabled'] == true;
+    final elevated = status['elevated'] == true;
+    final pwdCtrl = TextEditingController();
+    final act = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('自动登录设置'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('电脑端：${c.hostName ?? '未知'}\n'
+                  '当前状态：${enabled ? '已开启' : '已关闭'}'),
+              if (!elevated)
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: Text(
+                    '⚠ 电脑端未以管理员身份运行，无法远程设置：'
+                    '请在电脑上右键程序图标选择“以管理员身份运行”后重试',
+                    style: TextStyle(color: Colors.orange, fontSize: 12),
+                  ),
+                ),
+              if (!enabled) ...[
+                const SizedBox(height: 12),
+                TextField(
+                  controller: pwdCtrl,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Windows 登录密码',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: Text(
+                    '⚠ 密码将以明文存储于电脑注册表（HKLM\\...\\Winlogon），'
+                    '仅建议在可信环境使用；若系统盘启用 BitLocker 加密，'
+                    '重启时仍需先解锁磁盘，本功能无效',
+                    style: TextStyle(color: Colors.orange, fontSize: 12),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop('close'),
+            child: const Text('取消'),
+          ),
+          if (enabled)
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop('disable'),
+              child: const Text('关闭自动登录'),
+            )
+          else
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop('enable'),
+              child: const Text('开启'),
+            ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (act == null || act == 'close') return;
+    if (act == 'enable' && pwdCtrl.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('请输入 Windows 登录密码')));
+      return;
+    }
+    final r = await c.remoteAutoLogin(
+      act == 'enable' ? 'enable' : 'disable',
+      password: act == 'enable' ? pwdCtrl.text : null,
+    );
+    if (!mounted) return;
+    final msg = r == null
+        ? '无响应：电脑端版本过旧或未连接，请升级电脑端后重试'
+        : (r['ok'] == true
+            ? (act == 'enable'
+                ? '已开启重启后自动登录，下次重启生效'
+                : '已关闭重启后自动登录，下次重启需输入密码')
+            : (r['error']?.toString() ?? '设置失败'));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  /// 远程电源控制回执提示（v5.9）：执行后倒计时内可点“取消”中止
+  void _showPowerNotice(AppController c) {
+    final n = c.powerNotice;
+    if (n == null || _powerNoticeShowing || !mounted) return;
+    _powerNoticeShowing = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(
+            content: Text(n.text),
+            duration: Duration(seconds: n.delaySeconds),
+            // 执行类操作在倒计时内可取消（cancel 回执不显示按钮）
+            action: n.delaySeconds > 3
+                ? SnackBarAction(
+                    label: '取消',
+                    onPressed: () => c.remotePower('cancel'),
+                  )
+                : null,
+          ))
+          .closed.then((_) {
+        _powerNoticeShowing = false;
+        c.clearPowerNotice();
+      });
+    });
+  }
+
   /// 电脑端已有其他管理员：弹出更换确认（确认后申请成为管理员）
   void _maybeShowAdminClaimDialog(AppController c) {
     final req = c.adminClaimRequest;
@@ -308,8 +558,8 @@ class _HomePageState extends State<HomePage> {
         barrierDismissible: false,
         builder: (ctx) => AlertDialog(
           title: const Text('更换管理员'),
-          content: Text('该电脑端已有管理员（${req.maskedPhone}）\n\n'
-              '是否将管理员更换为您？原管理员将自动降级为普通用户。'),
+          content: Text('该电脑端已有管理员（${req.adminName}）\n\n'
+              '是否将管理员更换为您？原管理员将自动降级，失去管理权限。'),
           actions: [
             TextButton(
               onPressed: () {
@@ -328,6 +578,69 @@ class _HomePageState extends State<HomePage> {
           ],
         ),
       ).then((_) => _claimDialogShowing = false);
+    });
+  }
+
+  /// 连接密码校验失败：弹出密码输入框（v5.4+），
+  /// 确认后重新连接并自动验证；取消则断开保持未连接
+  void _maybeShowPasswordDialog(AppController c) {
+    final err = c.authError;
+    if (err == null || _claimDialogShowing || !mounted) return;
+    _claimDialogShowing = true;
+    final ctrl = TextEditingController();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: const Text('连接密码'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(err, style: const TextStyle(fontSize: 13)),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                autofocus: true,
+                obscureText: true,
+                maxLength: 16,
+                decoration: const InputDecoration(
+                  labelText: '连接密码',
+                  hintText: '由电脑端管理员设置/重置',
+                  border: OutlineInputBorder(),
+                  counterText: '',
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                c.consumeAuthError();
+              },
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final pwd = ctrl.text;
+                Navigator.of(ctx).pop();
+                if (pwd.isEmpty) {
+                  c.consumeAuthError();
+                  return;
+                }
+                c.submitPassword(pwd);
+              },
+              child: const Text('确定'),
+            ),
+          ],
+        ),
+      ).then((_) {
+        ctrl.dispose();
+        _claimDialogShowing = false;
+      });
     });
   }
 
@@ -350,7 +663,6 @@ class _HomePageState extends State<HomePage> {
         final uri = Uri.parse('$server/log-upload').replace(queryParameters: {
           'deviceId': widget.controller.deviceId,
           'version': appVersion,
-          'phone': AuthService.instance.phone ?? '',
         });
         final req = await client.postUrl(uri);
         req.headers.contentType =
@@ -472,7 +784,7 @@ class _HomePageState extends State<HomePage> {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('P2P 文件助手 v$appVersion',
+                Text('无限大盘 v$appVersion',
                     style: const TextStyle(fontSize: 18)),
                 // 电脑名称与连接方式同行显示：名称过长时省略号截断，
                 // 不再溢出截断（v5.1 标题区优化）
@@ -501,9 +813,9 @@ class _HomePageState extends State<HomePage> {
           },
         ),
         actions: [
-          // “共享给我的”入口（v4.8+）：登录后常显，免配对码连接服务器共享
-          if (AuthService.instance.token != null &&
-              AuthService.instance.token!.isNotEmpty)
+          // “共享给我的”入口（v5.4+）：激活后常显，免配对码连接服务器共享；
+          // v5.19+：共享访客（无激活令牌）同样显示
+          if (AuthService.instance.activated || controller.isShareGuest)
             IconButton(
               tooltip: '共享给我的',
               icon: const Icon(Icons.inbox_outlined),
@@ -538,6 +850,11 @@ class _HomePageState extends State<HomePage> {
                   controller.refreshUserList();
                   Navigator.of(context).push(MaterialPageRoute(
                       builder: (_) => UsersPage(controller: controller)));
+                case 'power_shutdown':
+                case 'power_reboot':
+                  await _confirmRemotePower(value);
+                case 'auto_login':
+                  await _openAutoLoginDialog();
                 case 'copy_log':
                   final logText = await AppLog.readLog();
                   if (!context.mounted) return;
@@ -554,11 +871,15 @@ class _HomePageState extends State<HomePage> {
               final connected =
                   controller.state == ConnectState.peerConnected;
               return [
-                const PopupMenuItem(
-                  value: 'switch',
-                  child: _MenuRow(
-                      icon: Icons.swap_horiz, label: '切换连接目标'),
-                ),
+                // v5.20+：切换连接目标仅管理员可见（本地管理员身份判定，
+                // 断开连接后仍可切换）——该功能用于管理员在多台电脑间
+                // 切换；访客/无权限用户走「共享给我的」，无需此入口
+                if (AuthService.instance.type == 'admin')
+                  const PopupMenuItem(
+                    value: 'switch',
+                    child: _MenuRow(
+                        icon: Icons.swap_horiz, label: '切换连接目标'),
+                  ),
                 if (connected && controller.isAdmin)
                   const PopupMenuItem(
                     value: 'manage',
@@ -566,6 +887,23 @@ class _HomePageState extends State<HomePage> {
                         icon: Icons.folder_shared_outlined,
                         label: '共享文件夹管理'),
                   ),
+                if (connected && controller.isAdmin) ...[
+                  const PopupMenuItem(
+                    value: 'power_shutdown',
+                    child: _MenuRow(
+                        icon: Icons.power_settings_new, label: '远程关机'),
+                  ),
+                  const PopupMenuItem(
+                    value: 'power_reboot',
+                    child: _MenuRow(
+                        icon: Icons.restart_alt, label: '远程重启'),
+                  ),
+                  const PopupMenuItem(
+                    value: 'auto_login',
+                    child: _MenuRow(
+                        icon: Icons.lock_open, label: '自动登录设置'),
+                  ),
+                ],
                 const PopupMenuItem(
                   value: 'copy_log',
                   child: _MenuRow(
@@ -586,8 +924,10 @@ class _HomePageState extends State<HomePage> {
         listenable: controller,
         builder: (context, _) {
           _showActionMessage(controller);
+          _showPowerNotice(controller);
           _showDownloadDone(controller);
           _maybeShowAdminClaimDialog(controller);
+          _maybeShowPasswordDialog(controller);
           if (controller.state == ConnectState.lost) {
             return _LostView(controller: controller);
           }
@@ -832,7 +1172,10 @@ class _BrowseTab extends StatelessWidget {
         ),
         // 下载进度提示
         if (controller.activeDownloadName != null)
-          _DownloadBanner(controller: controller),
+          DownloadBanner(controller: controller),
+        // v5.25+：上传进度提示（上传页签之外也可见）
+        if (controller.activeUploadName != null)
+          UploadBanner(controller: controller),
         // 文件列表
         Expanded(child: _buildList(context, controller)),
       ],
@@ -1037,57 +1380,6 @@ class _FileTile extends StatelessWidget {
               : null),
       onTap: onTap,
       onLongPress: onLongPress,
-    );
-  }
-}
-
-class _DownloadBanner extends StatelessWidget {
-  final AppController controller;
-
-  const _DownloadBanner({required this.controller});
-
-  @override
-  Widget build(BuildContext context) {
-    final total = controller.activeDownloadSize;
-    final done = controller.activeDownloadBytes;
-    final progress = total > 0 ? (done / total).clamp(0.0, 1.0) : 0.0;
-    return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.download, size: 18, color: Colors.blue),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text('正在下载: ${controller.activeDownloadName}',
-                      maxLines: 1, overflow: TextOverflow.ellipsis),
-                ),
-                if (controller.connectionType.isNotEmpty) ...[  // 下载时显示当前传输方式
-                  const SizedBox(width: 6),
-                  _ConnChip(label: controller.connTypeLabel),
-                ],
-                const SizedBox(width: 8),
-                Text('${formatSize(done)} / ${formatSize(total)}',
-                    style: const TextStyle(fontSize: 12)),
-                const SizedBox(width: 4),
-                // 手动停止下载：发送中止消息 + 清理 .part（防误触样式与删除一致）
-                IconButton(
-                  icon: const Icon(Icons.stop_circle_outlined,
-                      color: Colors.redAccent, size: 20),
-                  tooltip: '停止下载',
-                  onPressed: () => controller.stopDownload(),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            LinearProgressIndicator(value: progress, minHeight: 6),
-          ],
-        ),
-      ),
     );
   }
 }
@@ -1376,7 +1668,7 @@ class _UploadTabState extends State<_UploadTab> {
                       const Text('当前传输方式:',
                           style: TextStyle(fontSize: 12, color: Colors.grey)),
                       const SizedBox(width: 6),
-                      _ConnChip(label: controller.connTypeLabel),
+                      ConnChip(label: controller.connTypeLabel),
                     ],
                   ),
                 ],
@@ -1577,7 +1869,7 @@ class _TransferTile extends StatelessWidget {
           // 连接方式彩色徽标（醒目标题行）：绿=点对点直连 橙=服务器中转
           if (connLabel != null && connLabel!.isNotEmpty) ...[
             const SizedBox(width: 6),
-            _ConnChip(label: connLabel!),
+            ConnChip(label: connLabel!),
           ],
         ],
       ),
@@ -1618,41 +1910,7 @@ class _TransferTile extends StatelessWidget {
   }
 }
 
-/// 连接方式徽标：绿=点对点直连 橙=服务器中转（传输记录/下载横幅/上传中复用）
-class _ConnChip extends StatelessWidget {
-  final String label;
-
-  const _ConnChip({required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    final direct = label.contains('直连');
-    final color = direct ? Colors.green.shade700 : Colors.orange.shade800;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: (direct ? Colors.green : Colors.orange).withValues(alpha: 0.15),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(direct ? Icons.link : Icons.hub,
-              size: 12, color: color),
-          const SizedBox(width: 3),
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 10,
-              color: color,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
+/// 连接方式徽标：绿=点对点直连 橙=服务器中转（v5.24+ 已迁移至 download_banner.dart 公共组件）
 
 /// 通用提示视图
 class _MessageView extends StatelessWidget {

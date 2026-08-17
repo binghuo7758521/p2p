@@ -25,6 +25,7 @@ class ShareEntry {
   final List<String> perms; // download / upload / delete
   final String? targetDeviceId; // 目标设备 id（null=未绑定/公开）
   final String? targetPhone; // 目标手机号（null=未指定/公开）
+  final String remark; // 备注名称（v5.21+：电脑端管理员填写，展示优先于文件夹名）
 
   const ShareEntry({
     required this.token,
@@ -32,6 +33,7 @@ class ShareEntry {
     required this.perms,
     this.targetDeviceId,
     this.targetPhone,
+    this.remark = '',
   });
 
   factory ShareEntry.fromJson(Map<String, dynamic> json) => ShareEntry(
@@ -42,9 +44,11 @@ class ShareEntry {
             .toList(),
         targetDeviceId: json['targetDeviceId']?.toString(),
         targetPhone: json['targetPhone']?.toString(),
+        remark: json['remark']?.toString() ?? '',
       );
 
-  String get name => folder.split('/').last;
+  /// 展示名称：备注优先，其次文件夹末段（不显示全路径）
+  String get name => remark.isNotEmpty ? remark : folder.split('/').last;
   bool get canDownload => perms.contains('download');
   bool get canUpload => perms.contains('upload');
   bool get canDelete => perms.contains('delete');

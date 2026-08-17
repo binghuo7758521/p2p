@@ -47,3 +47,7 @@ Thumbs.db
 
 # ── 构建产物 / 安装包（不提交） ─────────────
 *.zip
+p2p_desktop_setup.exe
+
+# ── 敏感数据备份（含用户/令牌，切勿提交） ────
+backup_p2p_data_*/

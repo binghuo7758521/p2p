@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import 'dart:io';
 
 import 'app_log.dart';
+import 'auto_login.dart';
 import 'auto_start.dart';
 import 'home_page.dart';
 import 'host_controller.dart';
@@ -12,7 +14,7 @@ import 'update_check.dart';
 import 'usb_drives.dart';
 import 'version.dart';
 
-/// 电脑端连接页：共享目录 + 配对码展示
+/// 电脑端连接页：共享目录 + 等待手机激活连接（v6.13+ 配对码内部化，不再展示）
 class ConnectPage extends StatefulWidget {
   final HostController controller;
 
@@ -29,6 +31,11 @@ class _ConnectPageState extends State<ConnectPage> {
   bool _autoStart = false;
   bool _autoStartLoading = true;
 
+  // 重启后自动登录开关状态
+  bool _autoLogin = false;
+  bool _autoLoginLoading = true;
+  bool _elevated = false; // 当前进程是否以管理员身份运行（远程设置前置条件）
+
   // 已检测到的 U 盘（启动时枚举一次，卷序列号可作本机标识）
   List<UsbDriveInfo> _usbDrives = [];
   bool _usbLoading = true;
@@ -42,6 +49,7 @@ class _ConnectPageState extends State<ConnectPage> {
   void initState() {
     super.initState();
     _loadAutoStart();
+    _loadAutoLogin();
     _loadUsbDrives();
     // 启动流程：先 U盘授权验证，通过后再自动注册上线
     // （等首帧渲染完成再发起，避免 setState 时机问题）
@@ -65,6 +73,101 @@ class _ConnectPageState extends State<ConnectPage> {
       _autoStart = enabled;
       _autoStartLoading = false;
     });
+  }
+
+  Future<void> _loadAutoLogin() async {
+    final enabled = await AutoLoginService.isEnabled();
+    final elevated = await AutoLoginService.isElevated();
+    if (!mounted) return;
+    setState(() {
+      _autoLogin = enabled;
+      _autoLoginLoading = false;
+      _elevated = elevated;
+    });
+  }
+
+  /// 重启后自动登录开关：开启需输入 Windows 登录密码（UAC 提权写注册表），
+  /// 关闭即删除密码项恢复普通登录
+  Future<void> _toggleAutoLogin(bool v) async {
+    if (v) {
+      final pwd = await _askAutoLoginPassword();
+      if (pwd == null) return; // 用户取消
+      setState(() => _autoLoginLoading = true);
+      final ok = await AutoLoginService.enable(pwd);
+      if (!mounted) return;
+      setState(() {
+        _autoLogin = ok;
+        _autoLoginLoading = false;
+      });
+      if (ok) {
+        _showTip('已开启重启后自动登录，下次重启生效');
+      } else {
+        _showError('开启自动登录失败（UAC 未确认或注册表写入失败）');
+      }
+    } else {
+      setState(() => _autoLoginLoading = true);
+      final ok = await AutoLoginService.disable();
+      if (!mounted) return;
+      setState(() {
+        _autoLogin = ok ? false : true; // 失败时保持开启
+        _autoLoginLoading = false;
+      });
+      if (!ok) _showError('关闭自动登录失败（UAC 未确认）');
+    }
+  }
+
+  /// 输入 Windows 登录密码弹窗（仅写入本机注册表，明文存储风险提示）
+  Future<String?> _askAutoLoginPassword() {
+    final ctrl = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.lock_open, color: Color(0xFF38BDF8)),
+        title: const Text('开启重启后自动登录'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: ctrl,
+              obscureText: true,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Windows 登录密码',
+                hintText: '请输入开机登录时用的密码',
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              '密码将以明文存储于本机注册表（HKLM\\...\\Winlogon），'
+              '本机其他管理员可读取，建议仅在可信环境开启。\n'
+              '若系统盘启用了 BitLocker 加密，重启时仍需先解锁磁盘，本功能无效。',
+              style: TextStyle(fontSize: 12, color: Colors.orange),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (ctrl.text.isEmpty) return;
+              Navigator.of(ctx).pop(ctrl.text);
+            },
+            child: const Text('开启'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 轻提示（开关操作成功反馈）
+  void _showTip(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      duration: const Duration(seconds: 3),
+    ));
   }
 
   Future<void> _toggleAutoStart(bool v) async {
@@ -133,10 +236,9 @@ class _ConnectPageState extends State<ConnectPage> {
         );
         return;
       }
-      // 已有管理员（本地持久化过 adminPhone）：不再停留扫码页，
+      // 已有管理员（本地持久化过 adminDeviceId）：不再停留扫码页，
       // 直接进入主页面等待手机连接（状态变化由 ListenableBuilder 自动刷新）
-      if (s == HostState.registered &&
-          (c.adminPhone?.isNotEmpty ?? false)) {
+      if (s == HostState.registered && c.hasAdmin) {
         if (!mounted) return;
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
@@ -291,7 +393,7 @@ class _ConnectPageState extends State<ConnectPage> {
                       const Icon(Icons.swap_horiz_rounded,
                           size: 64, color: Color(0xFF38BDF8)),
                       const SizedBox(height: 12),
-                      Text('P2P 文件助手 - 电脑端',
+                      Text('无限大盘 - 电脑端',
                           textAlign: TextAlign.center,
                           style: theme.textTheme.headlineMedium
                               ?.copyWith(fontWeight: FontWeight.bold)),
@@ -412,7 +514,40 @@ class _ConnectPageState extends State<ConnectPage> {
                       ),
                       const SizedBox(height: 16),
 
-                      // 开始按钮 / 配对码展示
+                      // 重启后自动登录开关（v6.5+：配合开机自启实现无人值守）
+                      Card(
+                        margin: EdgeInsets.zero,
+                        child: SwitchListTile(
+                          value: _autoLogin,
+                          onChanged: _autoLoginLoading
+                              ? null
+                              : _toggleAutoLogin,
+                          secondary: const Icon(Icons.lock_open),
+                          title: const Text('重启后自动登录'),
+                          subtitle: Text(
+                            _autoLoginLoading
+                                ? '读取中...'
+                                : (_autoLogin
+                                    ? '已开启：重启后免输密码直接进入桌面'
+                                    : '已关闭：重启后需输入 Windows 密码'),
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ),
+                      // v6.6+：远程设置前置条件提示（未提权时）
+                      if (!_elevated)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Text(
+                            '提示：手机端远程设置自动登录需本程序以管理员身份运行，'
+                            '请右键程序图标选择“以管理员身份运行”后重试',
+                            style: const TextStyle(
+                                fontSize: 12, color: Colors.orange),
+                          ),
+                        ),
+                      const SizedBox(height: 16),
+
+                      // 开始按钮 / 等待手机激活连接
                       if (!registered && !connected)
                         FilledButton.icon(
                           onPressed: _connecting ? null : _start,
@@ -424,84 +559,53 @@ class _ConnectPageState extends State<ConnectPage> {
                                       strokeWidth: 2),
                                 )
                               : const Icon(Icons.link),
-                          label: Text(_connecting
-                              ? '连接中...'
-                              : '连接并生成配对码'),
+                          label: Text(_connecting ? '连接中...' : '开始使用'),
                           style: FilledButton.styleFrom(
                               padding:
                                   const EdgeInsets.symmetric(vertical: 14)),
                         ),
 
                       if (registered && !connected) ...[
-                        Container(
-                          padding: const EdgeInsets.all(20),
-                          decoration: BoxDecoration(
-                            color: theme.colorScheme.surfaceContainerHighest
-                                .withValues(alpha: 0.5),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Column(
-                            children: [
-                              Text('请在手机上输入配对码',
-                                  style: theme.textTheme.bodyMedium),
-                              const SizedBox(height: 8),
-                              Text(
-                                c.pairCode,
-                                style: theme.textTheme.headlineSmall
-                                    ?.copyWith(
-                                  fontWeight: FontWeight.bold,
-                                  letterSpacing: 4,
-                                  color: const Color(0xFFF59E0B),
-                                  fontFeatures: const [
-                                    FontFeature.tabularFigures()
+                        // v6.14+：首次无管理员直接展示管理员激活码；有管理员时等待手机连接
+                        if (!c.hasAdmin)
+                          _BootCodeCard(
+                            controller: c,
+                            theme: theme,
+                            code: c.ensureBootAdminCode() ?? '',
+                          )
+                        else
+                          Container(
+                            padding: const EdgeInsets.all(20),
+                            decoration: BoxDecoration(
+                              color: theme.colorScheme.surfaceContainerHighest
+                                  .withValues(alpha: 0.5),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: const Column(
+                              children: [
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(
+                                            strokeWidth: 2)),
+                                    SizedBox(width: 8),
+                                    Text('等待手机连接...',
+                                        style: TextStyle(fontSize: 13)),
                                   ],
                                 ),
-                              ),
-                              const SizedBox(height: 12),
-                              // 扫码配对二维码：p2p:<服务器地址>|<配对码>
-                              Container(
-                                padding: const EdgeInsets.all(12),
-                                decoration: BoxDecoration(
-                                  color: Colors.white,
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                child: QrImageView(
-                                  data:
-                                      'p2p:${c.serverUrl}|${c.pairCode}',
-                                  version: QrVersions.auto,
-                                  size: 160,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text('手机端扫码自动填入配对码',
+                                SizedBox(height: 8),
+                                Text(
+                                  '新设备需管理员在「手机端管理」页生成激活码后\n扫码激活，激活后自动连接本电脑',
                                   style: TextStyle(
-                                      fontSize: 12, color: Colors.grey)),
-                              const SizedBox(height: 8),
-                              const Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  SizedBox(
-                                      width: 16,
-                                      height: 16,
-                                      child: CircularProgressIndicator(
-                                          strokeWidth: 2)),
-                                  SizedBox(width: 8),
-                                  Text('等待手机连接...',
-                                      style: TextStyle(fontSize: 13)),
-                                ],
-                              ),
-                              const SizedBox(height: 4),
-                              TextButton.icon(
-                                onPressed: () {
-                                  c.resetPairCode();
-                                  _showError('已重新生成配对码，手机端需用新码/新二维码重新配对');
-                                },
-                                icon: const Icon(Icons.refresh, size: 18),
-                                label: const Text('重新生成配对码'),
-                              ),
-                            ],
+                                      fontSize: 12, color: Colors.grey),
+                                  textAlign: TextAlign.center,
+                                ),
+                              ],
+                            ),
                           ),
-                        ),
                         const SizedBox(height: 8),
                         TextButton(
                           onPressed: () async {
@@ -545,6 +649,60 @@ class _ConnectPageState extends State<ConnectPage> {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 首启管理员激活码卡片：大字码 + 二维码（p2p-act:server|code）+ 复制
+class _BootCodeCard extends StatelessWidget {
+  final HostController controller;
+  final ThemeData theme;
+  final String code;
+
+  const _BootCodeCard({
+    required this.controller,
+    required this.theme,
+    required this.code,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final qrData = 'p2p-act:${controller.serverUrl}|$code';
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest
+            .withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        children: [
+          const Text('首次使用：手机扫码激活成为管理员',
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 12),
+          QrImageView(data: qrData, size: 160),
+          const SizedBox(height: 12),
+          SelectableText(
+            code,
+            style: const TextStyle(
+                fontSize: 24,
+                letterSpacing: 4,
+                fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 4),
+          const Text('24 小时内有效，使用一次后作废',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          TextButton.icon(
+            icon: const Icon(Icons.copy, size: 16),
+            label: const Text('复制激活码'),
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: code));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                  content: Text('已复制'), duration: Duration(seconds: 1)));
+            },
+          ),
+        ],
       ),
     );
   }

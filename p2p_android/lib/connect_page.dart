@@ -1,15 +1,18 @@
 import 'package:flutter/material.dart';
 
+import 'activate_page.dart';
 import 'app_controller.dart';
 import 'app_log.dart';
 import 'auth_service.dart';
 import 'home_page.dart';
-import 'login_page.dart';
-import 'scan_page.dart';
 import 'update_check.dart';
 import 'version.dart';
 
-/// 连接页：输入配对码（服务器地址内置，不展示）
+/// 配对码格式：10 位数字/字母（内部标识，不展示给用户）
+final RegExp _pairCodeRegExp = RegExp(r'^[A-Za-z0-9]{10}$');
+
+/// 连接页：自动连接已激活的电脑（v5.15+ 配对码内部化，仅激活码入口）
+/// 新电脑通过激活码加入；本页不再提供配对码输入/扫码配对
 class ConnectPage extends StatefulWidget {
   final AppController controller;
 
@@ -40,7 +43,8 @@ class ConnectPage extends StatefulWidget {
 class _ConnectPageState extends State<ConnectPage> {
   /// 当前使用的服务器地址（默认内置公网服务器，不展示）
   String _server = defaultServerUrl;
-  final _codeCtrl = TextEditingController();
+  /// 当前实际连接的配对码（内部标识，保存历史/重连用，不展示给用户）
+  String _currentCode = '';
   bool _submitted = false;
 
   /// 配对历史（最近连接过的电脑/共享文件夹）
@@ -56,9 +60,6 @@ class _ConnectPageState extends State<ConnectPage> {
     if (widget.initialServer != null && widget.initialServer!.isNotEmpty) {
       _server = widget.initialServer!;
     }
-    if (widget.initialCode != null && widget.initialCode!.isNotEmpty) {
-      _codeCtrl.text = widget.initialCode!.toUpperCase();
-    }
     if (widget.autoConnect) {
       // 冷启动自动直连：失败自动重试（电脑端未开/服务器重启都能自动恢复）
       widget.controller.autoMode = true;
@@ -67,12 +68,14 @@ class _ConnectPageState extends State<ConnectPage> {
       // 扫描共享二维码：立即连接（携带共享码加入共享目录）
       widget.controller.autoMode = false;
       _connectShareToken = widget.pendingShareToken;
-      _connect(shareToken: widget.pendingShareToken);
+      _connect(
+          shareToken: widget.pendingShareToken, code: widget.initialCode);
     }
   }
 
   /// 读取配对历史并决定是否自动直连：
   /// 仅一台电脑记录 → 自动直连（与旧版行为一致）；
+  /// 无历史但已激活 → 直连激活时返回的电脑；
   /// 多台电脑/有共享记录 → 停留连接页展示列表供用户选择
   Future<void> _loadSavedAndAutoConnect() async {
     AppLog.i('connect', '冷启动自动直连模式，读取配对历史…');
@@ -83,12 +86,24 @@ class _ConnectPageState extends State<ConnectPage> {
       _historyLoaded = true;
     });
     final pcList = list.where((p) => !p.isShare).toList();
-    if (pcList.length != 1) return; // 0 台停留连接页；多台让用户选择
+    if (pcList.isEmpty) {
+      // 无历史电脑：直连激活时返回的电脑（激活码体系的默认连接目标）
+      final actCode = AuthService.instance.pairCode;
+      if (actCode == null || actCode.isEmpty) return;
+      _currentCode = actCode.trim().toUpperCase();
+      AppLog.i('connect', '无历史电脑，自动直连激活电脑');
+      setState(() => _submitted = true);
+      await widget.controller.connect(_server, _currentCode);
+      if (!mounted) return;
+      await _waitForPair();
+      return;
+    }
+    if (pcList.length != 1) return; // 多台让用户选择
     final info = pcList.first;
     AppLog.i('connect',
         '自动直连: server=${info.server} (autoMode=${widget.controller.autoMode})');
     _server = info.server;
-    _codeCtrl.text = info.code.toUpperCase();
+    _currentCode = info.code.toUpperCase();
     setState(() => _submitted = true);
     // 直接调用 connect（不走 _connect：它会关闭自动重试模式，
     // 导致电脑端未上线时既不重试也不进入主页面）
@@ -99,7 +114,6 @@ class _ConnectPageState extends State<ConnectPage> {
 
   @override
   void dispose() {
-    _codeCtrl.dispose();
     super.dispose();
   }
 
@@ -108,7 +122,7 @@ class _ConnectPageState extends State<ConnectPage> {
     // 手动选择：失败立即提示，不自动重试
     widget.controller.autoMode = false;
     _server = info.server;
-    _codeCtrl.text = info.code.toUpperCase();
+    _currentCode = info.code.toUpperCase();
     _connectShareToken = info.shareToken;
     setState(() => _submitted = true);
     AppLog.i('connect',
@@ -144,40 +158,28 @@ class _ConnectPageState extends State<ConnectPage> {
         (h) => h.server == info.server && h.code == info.code));
   }
 
-  Future<void> _connect({String? shareToken}) async {
-    // 手动/扫码连接：失败立即提示，不自动重试
+  /// 连接当前激活的电脑（或共享码扫码时用二维码内配对码）
+  Future<void> _connect({String? shareToken, String? code}) async {
+    // 手动连接：失败立即提示，不自动重试
     widget.controller.autoMode = false;
     if (shareToken != null) _connectShareToken = shareToken;
     final server = _server.trim().replaceAll(RegExp(r'/$'), '');
-    final code = _codeCtrl.text.trim().toUpperCase();
-    if (!kPairCodeRegExp.hasMatch(code)) {
-      _showError('配对码为 10 位数字/字母');
+    // 共享码扫码优先用二维码内的配对码，否则用激活时返回的电脑
+    final actCode = code ?? AuthService.instance.pairCode;
+    final finalCode = actCode?.trim().toUpperCase() ?? '';
+    if (!_pairCodeRegExp.hasMatch(finalCode)) {
+      _showError('未找到可连接的电脑，请先使用激活码激活');
       return;
     }
+    _currentCode = finalCode;
     AppLog.i('connect',
-        '手动连接: server=$server${shareToken != null ? ' (带共享码)' : ''} (autoMode=${widget.controller.autoMode})');
+        '发起连接: server=$server${shareToken != null ? ' (带共享码)' : ''} (autoMode=${widget.controller.autoMode})');
     setState(() => _submitted = true);
-    await widget.controller.connect(server, code, shareToken: shareToken);
+    await widget.controller.connect(server, finalCode, shareToken: shareToken);
     if (!mounted) return;
 
     // 等待配对结果
     await _waitForPair();
-  }
-
-  /// 扫码配对：扫描电脑端二维码，自动填入服务器地址与配对码并连接
-  Future<void> _scanPair() async {
-    final result = await Navigator.of(context).push<ScanPairResult>(
-      MaterialPageRoute(builder: (_) => const ScanPage()),
-    );
-    if (result == null || !mounted) {
-      AppLog.i('connect', '扫码取消或未识别');
-      return;
-    }
-    AppLog.i('connect',
-        '扫码成功: server=${result.server}${result.shareToken != null ? ' (共享码)' : ''}');
-    _server = result.server;
-    _codeCtrl.text = result.code.toUpperCase();
-    await _connect(shareToken: result.shareToken);
   }
 
   Future<void> _waitForPair() async {
@@ -186,20 +188,21 @@ class _ConnectPageState extends State<ConnectPage> {
       final s = widget.controller.state;
       if (s == ConnectState.paired || s == ConnectState.peerConnected) {
         final share = _connectShareToken;
-        // 配对成功：保存历史（共享访客带共享码标记，仅列表可选，
-        // 不会成为下次启动自动直连的目标）
-        // 名称优先用电脑端备注名（hostName），其次码尾/共享文件夹名
-        final hostName = widget.controller.hostName;
-        AppLog.i('connect',
-            '配对成功，进入主页${share != null ? '（共享访客）' : ''}');
-        await widget.controller.savePairInfo(
-          _server.trim(),
-          _codeCtrl.text.trim().toUpperCase(),
-          name: (hostName != null && hostName != '电脑')
-              ? hostName
-              : _displayName(_codeCtrl.text.trim().toUpperCase(), share),
-          shareToken: share,
-        );
+        // 配对成功：管理员连接保存历史（电脑记录）；
+        // v5.20+：共享连接不保存——访客入口为「共享给我的」
+        // （服务器 join-relations 绑定），避免非管理员电脑出现在
+        // 「切换连接目标」列表
+        if (share == null) {
+          final hostName = widget.controller.hostName;
+          AppLog.i('connect', '配对成功，保存电脑记录');
+          await widget.controller.savePairInfo(
+            _server.trim(),
+            _currentCode,
+            name: (hostName != null && hostName != '电脑') ? hostName : null,
+          );
+        } else {
+          AppLog.i('connect', '配对成功（共享访客），不保存配对历史');
+        }
         if (!mounted) return;
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
@@ -223,8 +226,8 @@ class _ConnectPageState extends State<ConnectPage> {
         AppLog.w('connect', '配对失败: $err');
         setState(() {
           _submitted = false;
-          // 配对码无效：旧码已失效，清空输入框，引导重新扫码配对
-          if (err.contains('配对码无效')) _codeCtrl.clear();
+          // 配对码无效：旧码已失效，清空内部记录，引导重新激活
+          if (err.contains('配对码无效')) _currentCode = '';
         });
         return;
       }
@@ -234,17 +237,6 @@ class _ConnectPageState extends State<ConnectPage> {
   void _showError(String msg) {
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  /// 历史条目标题：电脑用码尾 4 位区分；共享用共享文件夹名
-  String _displayName(String code, String? shareToken) {
-    if (shareToken != null && shareToken.isNotEmpty) {
-      for (final s in widget.controller.shares) {
-        if (s.token == shareToken) return s.name;
-      }
-      return '共享文件夹';
-    }
-    return '电脑 ${_codeSuffix(code)}';
   }
 
   /// 配对码尾 4 位（多台电脑区分标识）
@@ -261,13 +253,14 @@ class _ConnectPageState extends State<ConnectPage> {
     return '${d.inDays} 天前';
   }
 
-  /// 退出登录：清除本地 token 并返回登录页
+  /// 退出激活状态：清除本地记录并返回激活页
   Future<void> _logout() async {
     widget.controller.dispose();
     await AuthService.instance.clear();
     if (!mounted) return;
     Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(builder: (_) => const LoginPage()),
+      MaterialPageRoute(
+          builder: (_) => ActivatePage(controller: AppController())),
       (route) => false,
     );
   }
@@ -298,13 +291,13 @@ class _ConnectPageState extends State<ConnectPage> {
                         child: TextButton.icon(
                           onPressed: busy ? null : _logout,
                           icon: const Icon(Icons.logout, size: 18),
-                          label: const Text('退出登录'),
+                          label: const Text('退出激活'),
                         ),
                       ),
                       const Icon(Icons.swap_horiz_rounded,
                           size: 64, color: Color(0xFF38BDF8)),
                       const SizedBox(height: 12),
-                      Text('P2P 文件助手 v$appVersion',
+                      Text('无限大盘 v$appVersion',
                           textAlign: TextAlign.center,
                           style: theme.textTheme.headlineMedium
                               ?.copyWith(fontWeight: FontWeight.bold)),
@@ -341,8 +334,9 @@ class _ConnectPageState extends State<ConnectPage> {
                                       ? '共享文件夹'
                                       : '电脑 ${_codeSuffix(h.code)}')),
                               subtitle: Text(
-                                '${h.isShare ? '' : '配对码 ${h.code}'}'
-                                '${_fmtTime(h.lastAt).isEmpty ? '' : ' · ${_fmtTime(h.lastAt)}'}',
+                                (_fmtTime(h.lastAt).isEmpty
+                                    ? ''
+                                    : '最近连接 · ${_fmtTime(h.lastAt)}'),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                               ),
@@ -361,32 +355,6 @@ class _ConnectPageState extends State<ConnectPage> {
                           ),
                         const SizedBox(height: 16),
                       ],
-
-                      TextField(
-                        controller: _codeCtrl,
-                        enabled: !busy,
-                        maxLength: 10,
-                        textCapitalization: TextCapitalization.characters,
-                        decoration: const InputDecoration(
-                          labelText: '配对码',
-                          hintText: '10 位数字/字母',
-                          prefixIcon: Icon(Icons.pin_outlined),
-                          border: OutlineInputBorder(),
-                          counterText: '',
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-
-                      // 扫码配对
-                      OutlinedButton.icon(
-                        onPressed: busy ? null : _scanPair,
-                        style: OutlinedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(vertical: 14),
-                        ),
-                        icon: const Icon(Icons.qr_code_scanner),
-                        label: const Text('扫码配对'),
-                      ),
-                      const SizedBox(height: 12),
 
                       FilledButton.icon(
                         onPressed: busy ? null : _connect,
@@ -420,7 +388,7 @@ class _ConnectPageState extends State<ConnectPage> {
                                 const Padding(
                                   padding: EdgeInsets.only(top: 4),
                                   child: Text(
-                                    '请点击上方「扫码配对」扫描电脑端二维码，\n或输入电脑端显示的最新配对码',
+                                    '配对码已变更，请重新激活或联系电脑端管理员',
                                     textAlign: TextAlign.center,
                                     style: TextStyle(
                                         fontSize: 12, color: Colors.grey),
@@ -446,8 +414,8 @@ class _ConnectPageState extends State<ConnectPage> {
                                     ?.copyWith(fontWeight: FontWeight.bold)),
                             const SizedBox(height: 8),
                             const Text(
-                              '1. 电脑打开 P2P 软件，界面显示 10 位配对码\n'
-                              '2. 手机扫码自动填入，或手动输入配对码\n'
+                              '1. 激活码由电脑端 P2P 软件「用户管理」页生成\n'
+                              '2. 激活后自动连接电脑，无需手动配对\n'
                               '3. 连接成功即可浏览/传输电脑文件',
                               style: TextStyle(fontSize: 13, height: 1.6),
                             ),

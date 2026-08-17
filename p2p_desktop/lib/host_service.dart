@@ -60,7 +60,7 @@ class PeerSession {
   final String clientId; // 服务器 socket id（信令路由标识）
   String deviceId; // 手机端设备唯一标识（用户标识，可能为空）
   String clientName;
-  String? shareToken; // 首次加入时携带的共享码（普通用户）
+  String? shareToken; // 首次加入时携带的共享码（共享访客）
   RTCPeerConnection? pc;
   RTCDataChannel? channel;
   SendRateLimiter? rateLimiter;
@@ -228,12 +228,17 @@ class HostService {
   void Function(String clientId, String type)? onConnectionType;
   /// 被服务器/管理员踢出
   void Function(String reason)? onKicked;
+  /// 激活码被手机端兑换（服务器通知，电脑端管理页标记已用）
+  void Function(String code)? onCodeUsed;
 
   /// 当前在线手机端会话列表（clientId -> session）
   Map<String, PeerSession> get sessions => _sessions;
 
   /// 设备名称（用户可备注，注册时上报，手机端选择连接时展示）
   String deviceName = '电脑-桌面';
+
+  /// 当前未用激活码列表（v5.9+：注册时全量携带，增删后 syncActCodes 增量同步）
+  List<Map<String, String>> activationCodes = [];
 
   /// 服务器中转时的最大发送速率：500KB/s
   static const double relayMaxRate = 500 * 1024;
@@ -276,6 +281,8 @@ class HostService {
         'deviceId': MachineId.get(),
         // 主机令牌：共享同步 HTTP 接口认证（v5.0+）
         'hostToken': hostToken,
+        // 激活码列表（v5.9+）：服务器据此响应手机端 /api/activate
+        'activationCodes': activationCodes,
       });
     });
 
@@ -297,6 +304,16 @@ class HostService {
       AppLog.i('host', '收到 host:client-joined');
       onClientJoined?.call(
           data is Map ? Map<String, dynamic>.from(data) : <String, dynamic>{});
+    });
+
+    // 激活码被手机端兑换（v5.9+）：管理页标记已用
+    _socket!.on('host:code-used', (data) {
+      final code =
+          data is Map ? data['code']?.toString() ?? '' : '';
+      if (code.isNotEmpty) {
+        AppLog.i('host', '激活码已被手机端使用: $code');
+        onCodeUsed?.call(code);
+      }
     });
 
     _socket!.on('signal:server→host', (data) {
@@ -531,8 +548,16 @@ class HostService {
     _socket?.emit('pair:reset');
   }
 
+  /// 同步激活码到服务器（v5.9+）：生成/撤销后增量同步，幂等覆盖本机码表
+  void syncActCodes(List<Map<String, String>> codes) {
+    activationCodes = codes;
+    if (!isConnected) return;
+    _socket!.emit('host:sync-codes', {'codes': codes});
+    AppLog.i('host', '激活码已同步服务器: ${codes.length} 个');
+  }
+
   /// 全量同步共享配置到服务器（v5.0+）：创建/删除/改权限/启动注册后调用，
-  /// 手机端登录后凭手机号拉取“共享给我的”列表，并免配对码连接共享所在电脑
+  /// 手机端激活后凭设备令牌拉取“共享给我的”列表，并免配对码连接共享所在电脑
   Future<Map<String, dynamic>> syncSharesToServer(
       List<Map<String, dynamic>> shares) async {
     try {

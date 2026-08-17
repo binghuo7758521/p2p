@@ -31,19 +31,22 @@ class SignalingService {
   bool get isConnected => _socket?.connected ?? false;
 
   /// 连接信令服务器并加入配对
+  /// [activationCode] 激活码（v5.4+）：电脑端据此识别手机身份（管理员）
+  /// [deviceToken] 设备令牌（v5.4+）：免配对码共享连接时的服务器鉴权凭证
   Future<void> connect({
     required String serverUrl,
     required String pairCode,
     required String deviceName,
     String deviceId = '',
     String? shareToken,
-    String? phone,
+    String? activationCode,
+    String? deviceToken,
     bool joinByShare = false,
   }) async {
     AppLog.i('signal', '连接信令服务器: $serverUrl code=$pairCode'
         '${joinByShare ? ' join-by-share' : ''}'
         '${shareToken != null ? ' share=$shareToken' : ''}'
-        '${phone != null ? ' phone=$phone' : ''}');
+        '${activationCode != null ? ' act=$activationCode' : ''}');
     _socket?.dispose();
     _socket = io.io(
       serverUrl,
@@ -62,7 +65,8 @@ class SignalingService {
           'deviceName': deviceName,
           'version': appVersion,
           if (deviceId.isNotEmpty) 'deviceId': deviceId,
-          if (phone != null && phone.isNotEmpty) 'phone': phone,
+          if (deviceToken != null && deviceToken.isNotEmpty)
+            'deviceToken': deviceToken,
         });
         return;
       }
@@ -72,9 +76,10 @@ class SignalingService {
         'deviceName': deviceName,
         // 版本号：服务器配对日志记录客户端版本，便于排查版本差异问题
         'version': appVersion,
-        // 设备唯一标识（多用户身份）、登录手机号与共享码（普通用户扫码加入）
+        // 设备唯一标识（多用户身份）、激活码（身份判定）与共享码（共享访客加入）
         if (deviceId.isNotEmpty) 'deviceId': deviceId,
-        if (phone != null && phone.isNotEmpty) 'phone': phone,
+        if (activationCode != null && activationCode.isNotEmpty)
+          'activationCode': activationCode,
         if (shareToken != null && shareToken.isNotEmpty)
           'shareToken': shareToken,
       });

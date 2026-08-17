@@ -146,7 +146,7 @@ String _buildBat(String appDir, String newDir, String zipPath) {
     'set "APP_DIR=$appDir"',
     'set "NEW_DIR=$newDir"',
     'set "ZIP_FILE=$zipPath"',
-    'rem ===== P2P 文件助手静默升级 =====',
+    'rem ===== 无限大盘静默升级 =====',
     'rem 等待旧进程完全退出（解除 exe 文件锁），最长 10 秒',
     'set /a n=0',
     ':wait_loop',

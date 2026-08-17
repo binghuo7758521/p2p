@@ -2,6 +2,7 @@
 
 #include <optional>
 
+#include "close_choice.h"
 #include "flutter/generated_plugin_registrant.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
@@ -62,10 +63,21 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     return 0;
   }
 
-  // 点击关闭按钮 → 隐藏主窗口到托盘（程序继续后台运行，收发文件不受影响）；
-  // 需彻底退出时通过托盘右键「退出系统」（唯一退出途径）
+  // 点击关闭按钮 → 首次弹选择框（最小化到托盘 / 退出应用，可记住选择）；
+  // 已记住时直接按记忆执行；彻底退出也可通过托盘右键「退出系统」
   if (message == WM_CLOSE) {
-    tray_.HideMainWindow();
+    switch (close_choice::HandleClose(hwnd)) {
+      case close_choice::Action::Minimize:
+        tray_.HideMainWindow();
+        break;
+      case close_choice::Action::Quit:
+        // 直接终止进程：flutter_windows.dll 引擎析构阶段存在崩溃风险
+        // （与托盘菜单退出方案一致）
+        ::ExitProcess(0);
+        break;
+      default:
+        break;  // 用户取消：窗口保持打开
+    }
     return 0;
   }
 

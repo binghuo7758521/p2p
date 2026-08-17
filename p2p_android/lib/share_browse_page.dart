@@ -2,6 +2,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import 'app_controller.dart';
+import 'download_banner.dart';
 import 'models.dart';
 import 'protocol.dart';
 
@@ -239,6 +240,12 @@ class _ShareBrowsePageState extends State<ShareBrowsePage> {
               children: [
                 _breadcrumbs(controller),
                 const Divider(height: 1),
+                // v5.24+：共享目录下载进度横幅（与主页一致，含实时速度/停止）
+                if (controller.activeDownloadName != null)
+                  DownloadBanner(controller: controller),
+                // v5.25+：共享目录上传进度横幅（上传中即时反馈，含实时速度/停止）
+                if (controller.activeUploadName != null)
+                  UploadBanner(controller: controller),
                 Expanded(child: _buildList(controller)),
               ],
             );

@@ -135,29 +135,6 @@
       <div id="hostEmpty" class="empty-state">暂无电脑端在线（已注册设备也会显示在此）</div>
     </div>
 
-    <!-- 用户管理 -->
-    <div class="card">
-      <div class="card-title">👥 注册用户管理</div>
-      <div class="toolbar">
-        <input type="text" id="searchInput" placeholder="按手机号搜索...">
-        <button class="btn-primary" id="searchBtn" style="width:auto">搜索</button>
-        <button class="btn-ghost" id="resetSearchBtn">重置</button>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>手机号</th>
-            <th>状态</th>
-            <th>注册时间</th>
-            <th>最后登录</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="userTable"></tbody>
-      </table>
-      <div id="userEmpty" class="empty-state">暂无用户</div>
-    </div>
-
     <!-- U盘授权管理（加密狗白名单） -->
     <div class="card">
       <div class="card-title">🔑 U盘授权管理
@@ -257,7 +234,6 @@ async function doLogin() {
     $('mainView').classList.remove('hidden');
     refreshStats();
     loadHosts();
-    loadUsers();
     loadUsbIds();
   } catch (e) {
     errBox.textContent = e.message;
@@ -303,53 +279,6 @@ async function loadHosts() {
       tbody.appendChild(tr);
     }
   } catch (e) { /* 忽略，下一轮重试 */ }
-}
-
-async function loadUsers(keyword = '') {
-  try {
-    const data = await api('/api/admin/users' + (keyword ? '?keyword=' + encodeURIComponent(keyword) : ''));
-    const tbody = $('userTable');
-    tbody.innerHTML = '';
-    $('userEmpty').classList.toggle('hidden', data.users.length > 0);
-    for (const u of data.users) {
-      const tr = document.createElement('tr');
-      const active = u.status === 'active';
-      tr.innerHTML = `
-        <td class="phone">${u.phone}</td>
-        <td><span class="badge ${active ? 'badge-active' : 'badge-disabled'}">${active ? '正常' : '已禁用'}</span></td>
-        <td>${fmtTime(u.createdAt)}</td>
-        <td>${fmtTime(u.lastLoginAt)}</td>
-        <td><div class="actions"></div></td>`;
-      const actions = tr.querySelector('.actions');
-      // 启用/禁用
-      const toggleBtn = document.createElement('button');
-      toggleBtn.className = 'btn-sm ' + (active ? 'btn-red' : 'btn-green');
-      toggleBtn.textContent = active ? '禁用' : '启用';
-      toggleBtn.onclick = async () => {
-        try {
-          await api(`/api/admin/users/${u.phone}/status`, {
-            method: 'POST',
-            body: JSON.stringify({ status: active ? 'disabled' : 'active' }),
-          });
-          loadUsers(keyword);
-        } catch (e) { alert(e.message); }
-      };
-      actions.appendChild(toggleBtn);
-      // 删除
-      const delBtn = document.createElement('button');
-      delBtn.className = 'btn-sm btn-red';
-      delBtn.textContent = '删除';
-      delBtn.onclick = async () => {
-        if (!confirm(`确定删除用户 ${u.phone} 吗？\n删除后该用户将无法登录。`)) return;
-        try {
-          await api(`/api/admin/users/${u.phone}`, { method: 'DELETE' });
-          loadUsers(keyword);
-        } catch (e) { alert(e.message); }
-      };
-      actions.appendChild(delBtn);
-      tbody.appendChild(tr);
-    }
-  } catch (e) { alert(e.message); }
 }
 
 // ── U盘授权管理 ──
@@ -420,9 +349,6 @@ async function batchUsb() {
 $('loginBtn').onclick = doLogin;
 $('loginPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
 $('logoutBtn').onclick = logout;
-$('searchBtn').onclick = () => loadUsers($('searchInput').value.trim());
-$('searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadUsers($('searchInput').value.trim()); });
-$('resetSearchBtn').onclick = () => { $('searchInput').value = ''; loadUsers(); };
 $('usbAddBtn').onclick = addUsb;
 $('usbIdInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addUsb(); });
 $('usbBatchBtn').onclick = batchUsb;
@@ -456,7 +382,6 @@ setInterval(() => {
       $('mainView').classList.remove('hidden');
       refreshStats();
       loadHosts();
-      loadUsers();
       loadUsbIds();
       return;
     } catch (e) { logout(); }

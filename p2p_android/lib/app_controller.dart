@@ -120,15 +120,21 @@ class PairInfo {
 
 /// 电脑端已有其他管理员时的更换确认请求（UI 弹窗展示）
 class AdminClaimRequest {
-  /// 现任管理员手机号（原始值，显示时打码）
-  final String adminPhone;
+  /// 现任管理员展示名（备注优先，无则设备名）
+  final String adminName;
 
-  const AdminClaimRequest({required this.adminPhone});
+  const AdminClaimRequest({required this.adminName});
+}
 
-  /// 打码展示：151****2255
-  String get maskedPhone => adminPhone.length >= 7
-      ? '${adminPhone.substring(0, 3)}****${adminPhone.substring(adminPhone.length - 4)}'
-      : adminPhone;
+/// 远程电源控制回执提示（v5.9）：成功执行后延迟秒数内可取消
+class PowerNotice {
+  /// 提示文案（如“已执行：电脑将在 15 秒后关机”）
+  final String text;
+
+  /// 展示时长（秒）；执行类操作同时是取消窗口期
+  final int delaySeconds;
+
+  const PowerNotice({required this.text, required this.delaySeconds});
 }
 
 /// 全局控制器：编排信令、WebRTC 数据通道与文件传输
@@ -140,6 +146,10 @@ class AppController extends ChangeNotifier {
   ConnectState state = ConnectState.idle;
   String? errorMessage;
   String? hostName;
+
+  /// v5.6+ 强制升级：服务器拒绝旧版（APP_VERSION_REQUIRED）时回调，
+  /// 由 UI 层（_AuthGate）弹出不可跳过的强制升级窗
+  void Function()? onVersionRequired;
 
   /// 自动直连模式（App 冷启动自动配对）：连接失败自动重试，不弹错误死局；
   /// 手动扫码/输入配对时置 false，失败立即提示
@@ -170,6 +180,12 @@ class AppController extends ChangeNotifier {
   AdminClaimRequest? _adminClaimRequest; // 已有其他管理员：更换确认请求
   bool _adminClaimDismissed = false; // 本会话已拒绝更换，不再重复弹窗
   AdminClaimRequest? get adminClaimRequest => _adminClaimRequest;
+
+  // ── 连接密码（v5.4+） ──────────────────────────────────
+  /// 连接密码校验失败信息（触发主页密码输入弹窗；消费后置空）
+  String? _authError;
+  String? get authError => _authError;
+  static const _pwdKeyPrefix = 'conn_pwd_'; // 密码按配对码持久化
   final List<ShareEntry> shares = []; // 已加入的共享目录
   final List<ShareEntry> allShares = []; // 管理员：电脑端全部共享配置
   List<Map<String, dynamic>> users = []; // 用户列表（管理员可见）
@@ -251,6 +267,11 @@ class AppController extends ChangeNotifier {
 
   // 内部上传状态
   bool uploading = false;
+  /// 当前正在上传的文件（v5.25+ 全局进度状态，供 UploadBanner 显示）
+  String? activeUploadName;
+  int activeUploadSize = 0;
+  int activeUploadBytes = 0;
+  bool _uploadCancelled = false; // 用户手动停止上传（批次级标志）
   int _uploadBytes = 0;
   int _uploadStartMs = 0;
   int _lastUploadLogBytes = 0; // 上传进度日志节流（每 8MB 记一次）
@@ -277,6 +298,14 @@ class AppController extends ChangeNotifier {
     _signaling.onJoined = _onJoined;
     _signaling.onError = (reason) {
       AppLog.i('signal', '配对错误: $reason (autoMode=$autoMode, manual=$_manualDisconnect)');
+      // v5.6+ 强制升级：旧版被服务器拒绝连接，通知 UI 弹强制升级窗
+      if (reason == 'APP_VERSION_REQUIRED') {
+        state = ConnectState.error;
+        errorMessage = '当前版本已停止服务，请升级后重试';
+        notifyListeners();
+        onVersionRequired?.call();
+        return;
+      }
       // 配对码有效但电脑端未上线（host-offline）且处于自动直连模式：
       // 不报错，转入自动重试循环，等电脑端重新注册后自动恢复
       if (reason == 'host-offline' && !_manualDisconnect && autoMode) {
@@ -287,14 +316,14 @@ class AppController extends ChangeNotifier {
         _startAutoReconnect();
         return;
       }
-      // 配对码无效（已被电脑端重新生成）：保留本地配对信息不删除，
-      // 连接页提示重新扫码；下次启动自动直连仍会用旧码尝试一次，
-      // 失败后再次给出扫码引导（避免误删后连接页空白、用户不知如何重连）
+      // 配对码无效（内部标识被电脑端重新生成）：保留本地配对信息不删除，
+      // 连接页提示重新激活；下次启动自动直连仍会用旧码尝试一次，
+      // 失败后再次给出激活引导（避免误删后连接页空白、用户不知如何重连）
       state = ConnectState.error;
       errorMessage = reason == 'host-offline'
           ? '电脑端未在线，请确认电脑端已启动后重试'
           : reason == '配对码无效'
-              ? '配对码无效或已变更，请重新扫码配对'
+              ? '配对码无效或已变更，请重新激活或联系电脑端管理员'
               : reason;
       notifyListeners();
     };
@@ -330,6 +359,8 @@ class AppController extends ChangeNotifier {
         _requestFileList();
         _requestUserInfo();
         _checkRememberedUploadDir();
+        // 连接密码自动校验（v5.4+）：本地保存过密码则自动验证，未设置则不校验
+        _maybeAuthVerify();
         // 自动重连成功（数据通道恢复）：续传断线时中断的传输
         _resumePendingTransfers();
       } else if (!open && state == ConnectState.peerConnected) {
@@ -414,7 +445,10 @@ class AppController extends ChangeNotifier {
         deviceName: 'Android',
         deviceId: deviceId,
         shareToken: _pendingShareToken,
-        phone: AuthService.instance.phone,
+        activationCode: AuthService.instance.activationCode,
+        // v5.12+：免配对码共享连接（join-by-share）必须携带设备令牌，
+        // 服务器凭 actDevices 校验；此前未传导致列表点击连接恒被拒
+        deviceToken: AuthService.instance.deviceToken,
         joinByShare: _shareConnectMode,
       );
     } catch (e) {
@@ -433,6 +467,22 @@ class AppController extends ChangeNotifier {
   }
 
   void _onJoined(Map<String, dynamic> data) {
+    // v5.19+：共享连接且未激活 → 本地保存共享访客身份（type='guest'，
+    // 纯本地标记，无设备令牌）；之后「共享给我的」列表可免令牌重连
+    // （服务器凭 join-relations 绑定放行）、重启不丢身份
+    if (_pendingShareToken != null &&
+        _pendingShareToken!.isNotEmpty &&
+        !AuthService.instance.activated) {
+      AppLog.i('auth', '共享连接成功，保存共享访客身份');
+      unawaited(AuthService.instance.save(
+        deviceToken: '',
+        pairCode: _lastCode ?? '',
+        type: 'guest',
+        shareToken: _pendingShareToken ?? '',
+      ));
+      isShareGuest = true;
+      notifyListeners();
+    }
     // 服务器下发的 TURN 中继凭证（直连失败时的兜底通道）
     final turn = data['turn'];
     _rtc.turnConfig = turn is Map
@@ -557,7 +607,7 @@ class AppController extends ChangeNotifier {
           deviceName: 'Android',
           deviceId: deviceId,
           shareToken: _pendingShareToken,
-          phone: AuthService.instance.phone,
+          activationCode: AuthService.instance.activationCode,
           joinByShare: _shareConnectMode,
         );
         // 连接成功后 onConnect 自动 client:join；joined → paired 后电脑端发 offer
@@ -1011,13 +1061,26 @@ class AppController extends ChangeNotifier {
         '用户列表更新: 用户数=${users.length} 我的共享=${shares.length} '
         '全量共享=${allShares.length} 管理员=$isAdmin');
     // 电脑端已有其他管理员：提示是否更换（仅配对用户；取消后本会话不再打扰）
-    final occupiedPhone = msg.data['adminPhone']?.toString() ?? '';
+    // v5.16+ 身份二态化：无普通码，激活用户（非共享访客）均有更换资格；
+    // 共享访客被电脑端明确拒绝 claim，弹窗只会造成困扰。
+    final adminDeviceId = msg.data['adminDeviceId']?.toString() ?? '';
     if (isAdmin) {
       _adminClaimRequest = null;
-    } else if (occupiedPhone.isNotEmpty && !_adminClaimDismissed) {
-      _adminClaimRequest =
-          AdminClaimRequest(adminPhone: occupiedPhone);
-      AppLog.i('share', '电脑端已有管理员($occupiedPhone)，等待用户确认更换');
+    } else if (adminDeviceId.isNotEmpty &&
+        !_adminClaimDismissed &&
+        !isShareGuest) {
+      final adminUser = users
+          .where((u) => u['deviceId']?.toString() == adminDeviceId)
+          .toList();
+      String adminName = '管理员';
+      if (adminUser.isNotEmpty) {
+        final remark = adminUser.first['remark']?.toString() ?? '';
+        adminName = remark.isNotEmpty
+            ? remark
+            : (adminUser.first['name']?.toString() ?? '管理员');
+      }
+      _adminClaimRequest = AdminClaimRequest(adminName: adminName);
+      AppLog.i('share', '电脑端已有管理员($adminName)，等待用户确认更换');
     }
   }
 
@@ -1026,7 +1089,7 @@ class AppController extends ChangeNotifier {
     final req = _adminClaimRequest;
     _adminClaimRequest = null;
     if (req == null) return;
-    AppLog.i('share', '确认更换管理员: 现任=${req.adminPhone}');
+    AppLog.i('share', '确认更换管理员: 现任=${req.adminName}');
     _rtc.sendJson({'type': 'user:claim-admin'});
     notifyListeners();
   }
@@ -1036,6 +1099,160 @@ class AppController extends ChangeNotifier {
     _adminClaimRequest = null;
     _adminClaimDismissed = true;
     notifyListeners();
+  }
+
+  // ── 连接密码（v5.4+） ──────────────────────────────────
+  /// 读取本电脑保存的连接密码（按配对码区分；未保存返回 null）
+  Future<String?> _loadSavedPassword() async {
+    final code = _lastCode;
+    if (code == null || code.isEmpty) return null;
+    try {
+      final p = await SharedPreferences.getInstance();
+      return p.getString('$_pwdKeyPrefix$code');
+    } catch (e) {
+      AppLog.w('auth', '读取保存的密码失败', e);
+      return null;
+    }
+  }
+
+  /// 保存本电脑的连接密码
+  Future<void> _savePassword(String pwd) async {
+    final code = _lastCode;
+    if (code == null || code.isEmpty) return;
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString('$_pwdKeyPrefix$code', pwd);
+      AppLog.i('auth', '连接密码已保存(按配对码区分)');
+    } catch (e) {
+      AppLog.w('auth', '保存连接密码失败', e);
+    }
+  }
+
+  /// 清除本电脑保存的连接密码（校验失败时调用，下次需重新输入）
+  Future<void> _clearSavedPassword() async {
+    final code = _lastCode;
+    if (code == null || code.isEmpty) return;
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.remove('$_pwdKeyPrefix$code');
+    } catch (e) {
+      AppLog.w('auth', '清除连接密码失败', e);
+    }
+  }
+
+  /// 数据通道建立后自动校验连接密码：本地有密码则验证，无则不校验
+  /// （共享访客不参与密码校验：仅访问被共享目录，身份由设备令牌保障）
+  void _maybeAuthVerify() {
+    if (isShareGuest) return;
+    _loadSavedPassword().then((pwd) {
+      if (pwd == null || pwd.isEmpty) return;
+      AppLog.i('auth', '自动验证连接密码');
+      _rtc.sendJson({'type': 'auth:verify', 'password': pwd});
+    });
+  }
+
+  /// 提交连接密码（密码输入弹窗确认后调用），成功则保存本地并重新连接
+  void submitPassword(String pwd) {
+    AppLog.i('auth', '提交连接密码');
+    _savePassword(pwd);
+    _authError = null;
+    notifyListeners();
+    if (!_rtc.isOpen) {
+      // 校验失败被踢出后通道已断：用新密码重新建立连接（open 后自动验证）
+      final server = _lastServer;
+      final code = _lastCode;
+      if (server != null && code != null) {
+        _manualDisconnect = false;
+        autoMode = false;
+        connect(server, code, shareToken: _pendingShareToken);
+      }
+    } else {
+      _rtc.sendJson({'type': 'auth:verify', 'password': pwd});
+    }
+  }
+
+  /// 主动修改连接密码（需原密码），结果经 auth:pwd-result 回传
+  void changePassword(String oldPwd, String newPwd) {
+    if (!_rtc.isOpen) return;
+    AppLog.i('auth', '请求修改连接密码');
+    _rtc.sendJson({
+      'type': 'auth:change-pwd',
+      'oldPassword': oldPwd,
+      'newPassword': newPwd,
+    });
+  }
+
+  /// 消费密码错误提示（主页弹窗后置空）
+  void consumeAuthError() {
+    if (_authError == null) return;
+    _authError = null;
+    notifyListeners();
+  }
+
+  // ── 激活码管理（v5.4+，管理员远程发码） ─────────────────
+  /// 生成管理员激活码（电脑端本地生成并同步服务器，结果经 user:code-result 回传）
+  /// v5.16+ 身份二态化：仅管理员码一种类型
+  void generateActCode() {
+    if (!_rtc.isOpen || !isAdmin) return;
+    AppLog.i('auth', '远程生成管理员激活码');
+    _rtc.sendJson({'type': 'user:create-code', 'admin': true});
+  }
+
+  /// 撤销激活码
+  void revokeActCode(String code) {
+    if (!_rtc.isOpen || !isAdmin) return;
+    AppLog.i('auth', '远程撤销激活码: $code');
+    _rtc.sendJson({'type': 'user:revoke-code', 'code': code});
+  }
+
+  /// 远程电源控制（v5.9）：shutdown=关机 / reboot=重启 / cancel=取消挂起操作。
+  /// 仅管理员可执行（电脑端同样校验发送者身份，双重防护）
+  void remotePower(String action) {
+    if (!_rtc.isOpen || !isAdmin) {
+      actionMessage = '连接未就绪或您不是管理员，无法远程电源控制';
+      notifyListeners();
+      return;
+    }
+    AppLog.i('share', '远程电源控制: $action');
+    _rtc.sendJson({'type': 'user:power', 'action': action});
+  }
+
+  /// 远程电源控制回执（v5.9）：执行成功后 15 秒内可在手机端取消
+  PowerNotice? powerNotice;
+
+  void clearPowerNotice() {
+    powerNotice = null;
+    notifyListeners();
+  }
+
+  // ── 远程自动登录设置（v5.13） ──────────────────────────
+  Completer<Map<String, dynamic>>? _autoLoginCompleter;
+
+  /// 发送远程自动登录指令（status/enable/disable），返回回执数据；
+  /// 超时或通道未就绪返回 null。密码仅走 P2P 通道，不经服务器
+  Future<Map<String, dynamic>?> remoteAutoLogin(
+    String action, {
+    String? password,
+  }) async {
+    if (!_rtc.isOpen || !isAdmin) {
+      actionMessage = '连接未就绪或您不是管理员，无法设置自动登录';
+      notifyListeners();
+      return null;
+    }
+    AppLog.i('share', '远程自动登录设置: $action');
+    _autoLoginCompleter = Completer<Map<String, dynamic>>();
+    _rtc.sendJson({
+      'type': 'user:auto-login',
+      'action': action,
+      if (password != null && password.isNotEmpty) 'password': password,
+    });
+    try {
+      return await _autoLoginCompleter!.future
+          .timeout(const Duration(seconds: 12));
+    } catch (_) {
+      _autoLoginCompleter = null;
+      return null;
+    }
   }
 
   /// 管理员：删除共享（对方将立即失去访问权，权限由电脑端校验）
@@ -1050,19 +1267,23 @@ class AppController extends ChangeNotifier {
     _rtc.sendJson({'type': 'user:update-share', 'token': token, 'perms': perms});
   }
 
-  /// 拉取“共享给我的”列表（v4.8+：服务器共享注册表，登录后免配对码可见）
+  /// 拉取“共享给我的”列表（v5.4+：凭激活设备令牌，免配对码可见；
+  /// v5.19+：共享访客无令牌，凭 deviceId + 服务器绑定记录放行）
   Future<List<ServerShare>> fetchMyShares() async {
-    final token = AuthService.instance.token;
-    if (token == null || token.isEmpty) {
-      AppLog.w('share', '未登录，无法拉取共享列表');
+    final token = AuthService.instance.deviceToken ?? '';
+    if (deviceId.isEmpty) {
+      AppLog.w('share', '设备标识为空，无法拉取共享列表');
       return const [];
     }
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 10);
     try {
-      final req = await client
-          .getUrl(Uri.parse('$defaultServerUrl/api/shares/mine'));
-      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      final uri = Uri.parse('$defaultServerUrl/api/shares/mine')
+          .replace(queryParameters: {
+        'deviceId': deviceId,
+        'deviceToken': token,
+      });
+      final req = await client.getUrl(uri);
       final res = await req.close();
       final text = await res.transform(utf8.decoder).join();
       AppLog.i('share', '拉取共享列表: HTTP ${res.statusCode} 共${text.length}字符');
@@ -1213,9 +1434,9 @@ class AppController extends ChangeNotifier {
   }
 
   // ── 管理员操作 ────────────────────────────────────────
-  /// 管理员共享文件夹：指定手机号（targetPhone）或公开二维码（两者皆空）
+  /// 管理员共享文件夹：公开二维码（v5.4+ 去手机号，不再按手机号定向）
   void createShare({
-    String? targetPhone,
+    String? deviceId,
     required String folder,
     required List<String> perms,
   }) {
@@ -1227,11 +1448,10 @@ class AppController extends ChangeNotifier {
     // 管理员校验交由电脑端裁决：本地标志可能滞后（身份同步延迟），
     // 若确实无权限，电脑端会回 share-result ok=false 并附原因提示
     AppLog.i('share',
-        '创建共享: phone=${targetPhone ?? '公开二维码'} 文件夹=$folder 权限=$perms');
+        '创建共享: 目标=${deviceId ?? '公开二维码'} 文件夹=$folder 权限=$perms');
     _rtc.sendJson({
       'type': 'user:create-share',
-      if (targetPhone != null && targetPhone.isNotEmpty)
-        'phone': targetPhone,
+      if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
       'folder': folder,
       'perms': perms,
     });
@@ -1256,6 +1476,37 @@ class AppController extends ChangeNotifier {
     if (!_rtc.isOpen) return;
     AppLog.i('share', '附加共享码: $token');
     _rtc.sendJson({'type': 'user:attach-share', 'token': token});
+    // v5.10+：已连接电脑扫码附加时服务器无感知，主动上报记录扫码加入绑定，
+    // 使该共享持久化出现在“共享给我的”列表（失败不影响附加）
+    _reportShareJoin(token);
+  }
+
+  /// 上报扫码加入绑定（v5.10+）：POST /api/shares/join 记录 deviceId→token，
+  /// 免重复扫码；仅已激活设备可上报（服务器校验设备令牌）
+  Future<void> _reportShareJoin(String token) async {
+    final t = AuthService.instance.deviceToken;
+    if (t == null || t.isEmpty) {
+      AppLog.i('share', '未激活，跳过扫码绑定上报');
+      return;
+    }
+    try {
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 8);
+      try {
+        final req = await client.postUrl(
+            Uri.parse('$defaultServerUrl/api/shares/join'));
+        req.headers.contentType = ContentType.json;
+        req.write(jsonEncode(
+            {'deviceId': deviceId, 'deviceToken': t, 'token': token}));
+        final res = await req.close();
+        final text = await res.transform(utf8.decoder).join();
+        AppLog.i('share', '上报扫码加入: HTTP ${res.statusCode} $text');
+      } finally {
+        client.close(force: true);
+      }
+    } catch (e) {
+      AppLog.w('share', '上报扫码加入失败（不影响附加）', e);
+    }
   }
 
   // ── 管理员共享文件夹选择器 ─────────────────────────────
@@ -1584,12 +1835,14 @@ class AppController extends ChangeNotifier {
     if (!_rtc.isOpen || picked.isEmpty || uploading) return 0;
 
     uploading = true;
+    _uploadCancelled = false; // 重置停止标志
     _activeUploadShare = share; // 记录上传目标（断线续传定位）
     notifyListeners();
     _syncWakelock();
     final ids = <String>[];
 
     for (final file in picked) {
+      if (_uploadCancelled) break; // 用户手动停止：不再处理后续文件
       TransferItem? t;
       try {
         if (file.path == null) continue; // 无路径文件无法流式读取
@@ -1598,6 +1851,11 @@ class AppController extends ChangeNotifier {
         _uploadBytes = 0;
         _uploadStartMs = DateTime.now().millisecondsSinceEpoch;
         _acceptOffset = 0; // 重置：防止上个文件的 accept 残留影响本次定位
+        // v5.25+：同步当前文件到全局进度状态（UploadBanner 显示）
+        activeUploadName = file.name;
+        activeUploadSize = size;
+        activeUploadBytes = 0;
+        notifyListeners();
 
         t = _addTransfer(file.name, 'upload', size, localPath: file.path);
         ids.add(t.id);
@@ -1688,6 +1946,7 @@ class AppController extends ChangeNotifier {
             t.transferred = acceptOff + _uploadBytes;
             t.update(acceptOff + _uploadBytes,
                 DateTime.now().millisecondsSinceEpoch - _uploadStartMs);
+            activeUploadBytes = t.transferred; // v5.25+：横幅进度同步
             notifyListeners();
           }
         } finally {
@@ -1741,14 +2000,35 @@ class AppController extends ChangeNotifier {
     }
 
     uploading = false;
+    _uploadCancelled = false;
     _activeUploadShare = null; // 批次结束清除上传目标记录
     _applyAllAction = null; // 批次结束清除「所有文件」统一处理方式
+    activeUploadName = null;
+    activeUploadSize = 0;
+    activeUploadBytes = 0;
     notifyListeners();
     _syncWakelock();
     return ids
         .where((id) =>
             transfers.any((t) => t.id == id && t.status == 'done'))
         .length;
+  }
+
+  /// 用户手动停止上传（v5.25+）：本地中止发送。
+  /// 发送循环按 `status != 'transferring'` 跳出，批次确认等待自然结束；
+  /// 电脑端无需协议改动——其接收超时兜底会回 ack 失败并清理接收状态。
+  void stopUpload() {
+    if (!uploading || _uploadCancelled) return;
+    _uploadCancelled = true;
+    final name = activeUploadName;
+    AppLog.i('upload', '用户手动停止上传: $name');
+    for (final x in transfers) {
+      if (x.direction == 'upload' && x.status == 'transferring') {
+        x.status = 'error';
+      }
+    }
+    notifyListeners();
+    unawaited(_saveTransfers());
   }
 
   /// 等待电脑端对当前上传文件的 accept/conflict 决策；超时视为 accept（兼容旧电脑端）
@@ -1771,7 +2051,17 @@ class AppController extends ChangeNotifier {
   Future<String> _waitConflictResolve(String name, String requestId) async {
     // 用户已勾选「对本次上传的其他重名文件同样处理」：直接应用，不再弹窗
     final applyAll = _applyAllAction;
-    if (applyAll != null) return applyAll;
+    if (applyAll != null) {
+      // v5.14: 自动应用路径也必须发送 resolve（曾漏发导致电脑端一直等待
+      // 决策、手机端超时误发数据、电脑端不回 ack → 永久卡“上传中”）
+      _rtc.sendJson({
+        'type': 'file:conflict-resolve',
+        'fileName': name,
+        'requestId': requestId,
+        'action': applyAll,
+      });
+      return applyAll;
+    }
     final completer = _conflictWaiters[requestId] = Completer<String>();
     pendingConflict = UploadConflict(fileName: name, requestId: requestId);
     notifyListeners();
@@ -1990,7 +2280,7 @@ class AppController extends ChangeNotifier {
         notifyListeners();
         break;
       case 'user:share-updated':
-        // 电脑端推送：有人向我共享了文件夹（手机号绑定生效），立即刷新
+        // 电脑端推送：共享配置变更，立即刷新列表
         AppLog.i('share', '收到共享更新通知，自动刷新');
         _requestUserInfo();
         break;
@@ -2003,6 +2293,76 @@ class AppController extends ChangeNotifier {
         actionMessage = '已删除该用户';
         _requestUserInfo();
         notifyListeners();
+        break;
+      case 'auth:ok':
+        _authError = null;
+        AppLog.i('auth', '连接密码校验通过');
+        notifyListeners();
+        break;
+      case 'auth:denied':
+        _authError = msg.data['error']?.toString() ?? '连接密码错误';
+        _clearSavedPassword();
+        // 电脑端稍后会踢出本连接：停止自动重连，等待用户输入正确密码
+        _manualDisconnect = true;
+        AppLog.w('auth', '连接密码校验失败: $_authError');
+        notifyListeners();
+        break;
+      case 'auth:pwd-result':
+        if (msg.data['ok'] == true) {
+          actionMessage = '连接密码已修改';
+          _clearSavedPassword(); // 旧密码失效，下次连接需用新密码
+        } else {
+          actionMessage = msg.data['error']?.toString() ?? '修改密码失败';
+        }
+        notifyListeners();
+        break;
+      case 'admin:pwd-reset':
+        // 管理员重置了连接密码：保存新密码并自动重新校验
+        final newPwd = msg.data['password']?.toString() ?? '';
+        if (newPwd.isNotEmpty) {
+          _savePassword(newPwd);
+          if (_rtc.isOpen) {
+            _rtc.sendJson({'type': 'auth:verify', 'password': newPwd});
+          }
+          actionMessage = '连接密码已被管理员重置，已自动更新';
+        }
+        notifyListeners();
+        break;
+      case 'user:code-result':
+        if (msg.data['ok'] == true) {
+          actionMessage = '激活码已生成: ${msg.data['code']}（24小时内有效）';
+        } else {
+          actionMessage = msg.data['error']?.toString() ?? '激活码生成失败';
+        }
+        notifyListeners();
+        break;
+      case 'user:power-result':
+        // 远程电源控制回执（v5.9）：成功且非取消 → 显示可取消提示条
+        if (msg.data['ok'] == true) {
+          final action = msg.data['action']?.toString() ?? '';
+          final delay = msg.data['delaySeconds'] is int
+              ? msg.data['delaySeconds'] as int
+              : 15;
+          final canceled = action == 'cancel';
+          powerNotice = PowerNotice(
+            text: canceled
+                ? '已取消关机/重启'
+                : '已执行：电脑将在 $delay 秒后${action == 'reboot' ? '重启' : '关机'}',
+            delaySeconds: canceled ? 3 : delay,
+          );
+          AppLog.i('share', '远程电源控制成功: ${canceled ? '已取消' : action}');
+        } else {
+          actionMessage =
+              msg.data['error']?.toString() ?? '远程电源控制失败';
+          AppLog.w('share', '远程电源控制失败: ${msg.data['error']}');
+        }
+        notifyListeners();
+        break;
+      case 'user:auto-login-result':
+        // 远程自动登录设置回执（v5.13）：由发起方 await 接收
+        final c = _autoLoginCompleter;
+        _autoLoginCompleter = null;
+        c?.complete(msg.data);
         break;
     }
   }
@@ -2313,6 +2673,15 @@ class AppController extends ChangeNotifier {
           list.add(p);
           await _writePairInfos(list);
         }
+      }
+      // v5.20+：清洗历史共享记录（v5.19 及更早版本的共享连接也会写入
+      // pair_info.json，导致非管理员电脑出现在「切换连接目标」）；
+      // 共享入口已由「共享给我的」（服务器绑定）承担，记录冗余
+      final before = list.length;
+      list.removeWhere((p) => p.isShare);
+      if (list.length != before) {
+        AppLog.i('connect', '清洗历史共享记录: 移除 ${before - list.length} 条');
+        await _writePairInfos(list);
       }
       list.sort((a, b) => (b.lastAt ??
               DateTime.fromMillisecondsSinceEpoch(0))

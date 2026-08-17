@@ -1,16 +1,10 @@
 import 'package:flutter/material.dart';
 
-import 'dart:io';
-
-import 'app_log.dart';
 import 'connect_page.dart';
 import 'host_controller.dart';
 import 'models.dart';
 import 'share_manage_page.dart';
-import 'silent_updater.dart';
-import 'update_check.dart';
 import 'users_manage_page.dart';
-import 'version.dart';
 
 /// 电脑端主界面：共享目录浏览 + 传输记录
 class HomePage extends StatefulWidget {
@@ -23,125 +17,61 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  // v6.12+：升级检查已提升为应用级（UpdateService，main 启动即检测），
+  // 见 update_service.dart；本页面不再承担升级逻辑。
+
   @override
   void initState() {
     super.initState();
-    _checkUpdate();
   }
 
-  /// 启动时检查升级：服务器有新版本时弹窗提示（每次启动检查一次）
-  ///
-  /// 升级检查放在主页面而非连接页：连接页可能被「管理员直进主页」
-  /// pushReplacement 销毁，await 返回后 mounted=false 会跳过弹窗
-  Future<void> _checkUpdate() async {
-    final info = await checkDesktopUpdate();
-    if (!mounted || info == null || !info.needUpdate) return;
-    final hasMd5 = info.md5 != null && info.md5!.isNotEmpty;
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        icon: const Icon(Icons.system_update_alt, color: Color(0xFF38BDF8)),
-        title: Text('发现新版本 v${info.latest}'),
-        content: Text(
-          '当前版本 v$appVersion\n\n${info.notes}\n\n'
-          '升级将自动下载、校验并重启，全程无需手动操作',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('稍后'),
-          ),
-          FilledButton.icon(
-            onPressed: () {
-              Navigator.of(ctx).pop();
-              if (info.url == null) return;
-              if (hasMd5) {
-                _runSilentUpgrade(info);
-              } else {
-                // 服务器未提供校验值：回退手动浏览器下载
-                openDownloadUrl(info.url!);
-                _showUpdateError('服务器未提供升级包校验信息，已为你打开下载页面，'
-                    '请手动下载并解压覆盖程序目录');
-              }
-            },
-            icon: const Icon(Icons.download, size: 18),
-            label: const Text('立即升级'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 静默升级：进度对话框 + 下载/校验/解压/重启编排
-  Future<void> _runSilentUpgrade(UpdateInfo info) async {
-    final progress = ValueNotifier<double?>(null);
-    final status = ValueNotifier<String>('正在准备升级…');
-
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        icon: const Icon(Icons.system_update_alt, color: Color(0xFF38BDF8)),
-        title: const Text('正在升级'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ValueListenableBuilder<double?>(
-              valueListenable: progress,
-              builder: (_, p, _) => LinearProgressIndicator(value: p),
+  /// 管理员移交确认弹窗（v5.9+）：手机端申请更换管理员时弹出，
+  /// 电脑端确认后该设备正式成为管理员
+  void _handlePendingAdmin(HostController c) {
+    final req = c.pendingAdminApproval;
+    if (req == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (c.pendingAdminApproval == null) return; // 已被处理
+      final claim = req['claim'] == true;
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          icon: Icon(claim ? Icons.swap_horiz : Icons.shield,
+              color: const Color(0xFF38BDF8)),
+          title: Text(claim ? '更换管理员申请' : '管理员激活确认'),
+          content: Text(claim
+              ? '「${req['name']}」申请成为本电脑的管理员，是否同意？\n'
+                  '同意后原管理员自动降级，失去管理权限。'
+              : '「${req['name']}」使用管理员激活码连接了本电脑，\n'
+                  '是否确认其为管理员？\n\n'
+                  '确认后仅此设备可管理本电脑；拒绝将断开该设备。'),
+          actions: [
+            TextButton(
+              onPressed: () {
+                c.rejectAdmin(req['deviceId']?.toString() ?? '');
+                Navigator.of(ctx).pop();
+              },
+              child: const Text('拒绝'),
             ),
-            const SizedBox(height: 12),
-            ValueListenableBuilder<String>(
-              valueListenable: status,
-              builder: (_, s, _) => Text(s, textAlign: TextAlign.center),
+            FilledButton(
+              onPressed: () {
+                c.approveAdmin(req['deviceId']?.toString() ?? '');
+                Navigator.of(ctx).pop();
+              },
+              child: const Text('确认'),
             ),
           ],
         ),
-      ),
-    );
-
-    final ok = await runSilentUpgrade(
-      downloadUrl: info.url!,
-      expectedMd5: info.md5,
-      onPhase: (phase, p, message) {
-        progress.value = p;
-        status.value = message;
-      },
-    );
-
-    if (!mounted) return;
-    Navigator.of(context).pop(); // 关闭进度对话框
-    if (ok) {
-      // 升级已编排：立即退出主程序，由 update.bat 完成替换与重启
-      AppLog.i('update', '静默升级成功，主程序退出');
-      exit(0);
-    }
-    if (info.url != null) openDownloadUrl(info.url!);
-    _showUpdateError('自动升级失败，已为你打开下载页面，'
-        '请手动下载并解压覆盖程序目录');
-  }
-
-  /// 升级失败提示
-  void _showUpdateError(String message) {
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        icon: const Icon(Icons.error_outline, color: Colors.red),
-        title: const Text('升级失败'),
-        content: Text(message),
-        actions: [
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('知道了'),
-          ),
-        ],
-      ),
-    );
+      );
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     final controller = widget.controller;
+    _handlePendingAdmin(controller);
     return Scaffold(
       appBar: AppBar(
         title: ListenableBuilder(
@@ -159,12 +89,11 @@ class _HomePageState extends State<HomePage> {
             final onlineDesc = onlineUsers.isEmpty
                 ? '未连接'
                 : '已连接 ${onlineUsers.length} 台手机'
-                    '${onlineUsers.length == 1 && onlineUsers.first.isAdmin ? '（管理员）' : ''}'
-                    ' · 配对码 ${controller.pairCode}';
+                    '${onlineUsers.length == 1 && onlineUsers.first.isAdmin ? '（管理员）' : ''}';
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('P2P 文件助手 - 电脑端',
+                Text('无限大盘 - 电脑端',
                     style: const TextStyle(fontSize: 18)),
                 Text(
                   offline
@@ -172,7 +101,7 @@ class _HomePageState extends State<HomePage> {
                       : connected
                           ? onlineDesc
                           : waiting
-                              ? '等待手机连接 · 配对码 ${controller.pairCode}'
+                              ? '等待手机连接'
                               : '未连接',
                   style: TextStyle(
                       fontSize: 12,
@@ -243,6 +172,70 @@ class _HomePageState extends State<HomePage> {
               if (!context.mounted) return;
               ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                   content: Text('名称已保存为「${name.trim()}」，重新连接中…')));
+            },
+          ),
+          // 关闭窗口行为（v6.10）：每次询问 / 最小化到托盘 / 退出应用
+          IconButton(
+            tooltip: '关闭窗口行为',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () async {
+              final cur = controller.closeAction;
+              final choice = await showDialog<String>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('关闭窗口行为'),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('点击窗口右上角关闭按钮时的行为',
+                          style: TextStyle(fontSize: 12, color: Colors.grey)),
+                      const SizedBox(height: 8),
+                      RadioGroup<String>(
+                        groupValue: cur,
+                        onChanged: (v) => Navigator.of(ctx).pop(v),
+                        child: const Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            RadioListTile<String>(
+                              value: 'ask',
+                              title: Text('每次询问'),
+                              subtitle: Text('弹窗选择最小化或退出'),
+                              dense: true,
+                            ),
+                            RadioListTile<String>(
+                              value: 'minimize',
+                              title: Text('最小化到托盘'),
+                              subtitle: Text('程序继续后台运行，收发文件不受影响'),
+                              dense: true,
+                            ),
+                            RadioListTile<String>(
+                              value: 'quit',
+                              title: Text('退出应用'),
+                              subtitle: Text('结束全部进程，不再接收文件'),
+                              dense: true,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.of(ctx).pop(),
+                        child: const Text('取消')),
+                  ],
+                ),
+              );
+              if (choice == null || !context.mounted) return;
+              await controller.setCloseAction(choice);
+              if (!context.mounted) return;
+              final label = switch (choice) {
+                'minimize' => '最小化到托盘',
+                'quit' => '退出应用',
+                _ => '每次询问',
+              };
+              ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('关闭窗口行为已设为「$label」')));
             },
           ),
           ListenableBuilder(
@@ -488,8 +481,8 @@ class _TransfersPanel extends StatelessWidget {
                 )
               : ListView.builder(
                   itemCount: items.length,
-                  itemBuilder: (context, i) => _TransferTile(
-                      item: items[i], connLabel: controller.connTypeLabel),
+                  itemBuilder: (context, i) =>
+                      _TransferTile(item: items[i], controller: controller),
                 ),
         ),
       ],
@@ -524,9 +517,9 @@ class _ConnBadge extends StatelessWidget {
 
 class _TransferTile extends StatelessWidget {
   final TransferItem item;
-  final String connLabel;
+  final HostController controller;
 
-  const _TransferTile({required this.item, required this.connLabel});
+  const _TransferTile({required this.item, required this.controller});
 
   @override
   Widget build(BuildContext context) {
@@ -534,7 +527,17 @@ class _TransferTile extends StatelessWidget {
     final done = item.status == 'done';
     final error = item.status == 'error';
     final icon = isUpload ? Icons.upload : Icons.download;
+    // 进行中：显示实时连接方式（探测可能未完成，随时变化）；
+    // 已完成/失败：显示传输时快照（固定不再变）
+    final connLabel = item.status == 'transferring'
+        ? controller.connTypeLabel
+        : _rawConnLabel(item.connType);
     final direct = connLabel.contains('直连');
+    // 已完成：只显示文件体积；进行中/失败：显示已传输/总大小（失败保留进度便于判断）
+    final sizeText = done
+        ? _fmtSize(item.total)
+        : '${_fmtSize(item.transferred)} / ${_fmtSize(item.total)}'
+            '${item.speed.isNotEmpty ? '  ${item.speed}' : ''}';
 
     return ListTile(
       leading: Icon(
@@ -557,27 +560,40 @@ class _TransferTile extends StatelessWidget {
           Text(
             '${item.clientName.isNotEmpty ? '${item.clientName} · ' : ''}'
             '${isUpload ? '手机 → 电脑' : '电脑 → 手机'}  '
-            '${_fmtSize(item.transferred)} / ${_fmtSize(item.total)}'
-            '${item.speed.isNotEmpty ? '  ${item.speed}' : ''}',
+            '$sizeText',
             style: const TextStyle(fontSize: 12),
           ),
           const SizedBox(height: 2),
           // 连接方式：P2P直连(绿) / 服务器中转(橙)，直观告知用户传输通道
+          // 历史记录显示快照（固定）；完成/失败记录附完成时间
           Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Icon(
-                direct ? Icons.link : Icons.hub,
-                size: 12,
-                color: direct ? Colors.green : Colors.orange,
-              ),
-              const SizedBox(width: 4),
-              Text(
-                connLabel,
-                style: TextStyle(
-                  fontSize: 10,
-                  color: direct ? Colors.green : Colors.orange,
+              if (connLabel.isNotEmpty)
+                Row(
+                  children: [
+                    Icon(
+                      direct ? Icons.link : Icons.hub,
+                      size: 12,
+                      color: direct ? Colors.green : Colors.orange,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      connLabel,
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: direct ? Colors.green : Colors.orange,
+                      ),
+                    ),
+                  ],
                 ),
-              ),
+              if (!done && !error)
+                const Spacer()
+              else if (item.endTime != null)
+                Text(
+                  '完成 ${_fmtTime(item.endTime!)}',
+                  style: const TextStyle(fontSize: 10, color: Colors.grey),
+                ),
             ],
           ),
         ],
@@ -606,4 +622,22 @@ String _fmtSize(int bytes) {
     return '${(bytes / 1048576).toStringAsFixed(1)} MB';
   }
   return '${(bytes / 1073741824).toStringAsFixed(2)} GB';
+}
+
+/// 连接方式快照原始值 → 中文标签（与 HostController.connTypeLabel 一致）
+String _rawConnLabel(String raw) => switch (raw) {
+      'relay' => '服务器中转',
+      'direct' => 'P2P直连',
+      _ => '',
+    };
+
+/// 完成时间显示：当天显示「今天 HH:mm」，跨天显示「MM-dd HH:mm」
+String _fmtTime(DateTime t) {
+  final now = DateTime.now();
+  final hm =
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+  if (t.year == now.year && t.month == now.month && t.day == now.day) {
+    return '今天 $hm';
+  }
+  return '${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')} $hm';
 }
