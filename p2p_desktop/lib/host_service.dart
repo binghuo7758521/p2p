@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
@@ -217,6 +218,10 @@ class HostService {
   int _reconnectAttempts = 0;
   bool _disposed = false;
 
+  /// 网络类型变化监听（A方案）：WiFi↔以太网切换时重启 ICE 重新选路，
+  /// 期望中转会话切回直连（重选失败则维持中转，不影响连接）
+  StreamSubscription<List<ConnectivityResult>>? _netSub;
+
   // ── 对外回调 ────────────────────────────────────────────
   void Function(String pairCode)? onRegistered;
   void Function(Map<String, dynamic> clientInfo)? onClientJoined;
@@ -355,6 +360,45 @@ class HostService {
     });
 
     _socket!.connect();
+    _startNetworkWatch();
+  }
+
+  /// 网络类型变化监听：对当前中转(relay)的会话重启 ICE 重新选路，
+  /// 期望恢复直连（ICE 先试直连后中转）；重选失败维持原路径不中断
+  void _startNetworkWatch() {
+    _netSub ??= Connectivity().onConnectivityChanged.listen((results) {
+      AppLog.i('conn', '网络类型变化: ${results.join(",")}');
+      for (final s in _sessions.values) {
+        if (s.isOpen && s.connectionType == 'relay') {
+          _restartIce(s);
+        }
+      }
+    });
+  }
+
+  void _stopNetworkWatch() {
+    _netSub?.cancel();
+    _netSub = null;
+  }
+
+  /// 重启指定会话的 ICE 重新选路：原生 restartIce 使下次 createOffer 携带
+  /// 新 ice-ufrag（ICE restart 标记），重协商后 ICE 按“先直连后中转”
+  /// 重新尝试；数据通道保持打开，传输短暂停顿后自动恢复
+  /// （失败时维持原路径，不影响连接）
+  Future<void> _restartIce(PeerSession session) async {
+    final pc = session.pc;
+    if (pc == null || !session.isOpen) return;
+    try {
+      AppLog.i('conn', '重启 ICE 重新选路 [${session.clientName}]（期望恢复直连）');
+      await pc.restartIce();
+      // 等待 ICE restart 状态就绪，确保新 offer 包含更新后的 ice-ufrag
+      await Future.delayed(const Duration(milliseconds: 200));
+      final offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      _sendSignal(session.clientId, {'type': 'offer', 'sdp': offer.sdp});
+    } catch (e) {
+      AppLog.w('conn', '重启 ICE 失败 [${session.clientName}]（维持当前路径）', e);
+    }
   }
 
   /// 调度 socket 自动重连（断开后保持等待手机状态）
@@ -499,6 +543,18 @@ class HostService {
     if (pc == null) return;
     final type = signal['type'] as String?;
     switch (type) {
+      case 'offer':
+        // 手机端发起 ICE restart（网络切换）：电脑端生成 answer 配合重选路
+        final offerSdp = signal['sdp'] as String?;
+        if (offerSdp != null) {
+          AppLog.i('host', '收到重新协商 offer，生成 answer [$clientId]');
+          await pc.setRemoteDescription(
+              RTCSessionDescription(offerSdp, 'offer'));
+          final answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          _sendSignal(clientId, {'type': 'answer', 'sdp': answer.sdp});
+        }
+        break;
       case 'answer':
         final sdp = signal['sdp'] as String?;
         if (sdp != null) {
@@ -737,6 +793,7 @@ class HostService {
     _disposed = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _stopNetworkWatch();
     for (final cid in _sessions.keys.toList()) {
       await _closeSession(cid);
     }

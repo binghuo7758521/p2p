@@ -53,8 +53,8 @@ const PORT = process.env.PORT || 3000;
 // - 只要某端代码有修改，该端版本号 +0.1（v1.0 → v1.1 → v1.2 ...）
 // - 本文件同时记录三端最新版本，便于 /version 统一核对
 const SERVER_VERSION = '2.13';  // 服务器端版本
-const DESKTOP_VERSION = '6.18';  // 电脑端版本
-const ANDROID_VERSION = '5.25'; // 手机端版本
+const DESKTOP_VERSION = '6.19';  // 电脑端版本
+const ANDROID_VERSION = '5.29'; // 手机端版本
 // 手机端最低可用版本（v2.7+ 强制升级）：低于此版本的手机端一律拒绝
 // 激活与连接（update-check 返回 force；激活/信令返回 APP_VERSION_REQUIRED），
 // 必须升级到最新版才能正常使用

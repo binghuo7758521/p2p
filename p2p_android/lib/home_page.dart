@@ -1006,18 +1006,24 @@ class _ConnBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final relay = controller.connectionType == 'relay';
+    final type = controller.connectionType;
+    // relay=服务器中转(橙) / direct=P2P直连(绿) / unknown=探测未完成(灰，中性展示)
+    final relay = type == 'relay';
+    final direct = type == 'direct';
+    final color = relay
+        ? Colors.orange
+        : (direct ? Colors.green : Colors.grey);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
       decoration: BoxDecoration(
-        color: (relay ? Colors.orange : Colors.green).withValues(alpha: 0.15),
+        color: color.withValues(alpha: 0.15),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Text(
         controller.connTypeLabel,
         style: TextStyle(
           fontSize: 10,
-          color: relay ? Colors.orange : Colors.green,
+          color: color,
         ),
       ),
     );

@@ -224,11 +224,17 @@ class ConnChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final direct = label.contains('直连');
-    final color = direct ? Colors.green.shade700 : Colors.orange.shade800;
+    final relay = label.contains('中转');
+    // 探测未完成/已连接（方式未知）：灰色中性展示，不误导为已确认的方式
+    final color = direct
+        ? Colors.green.shade700
+        : (relay ? Colors.orange.shade800 : Colors.grey.shade600);
+    final bg =
+        direct ? Colors.green : (relay ? Colors.orange : Colors.grey);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
-        color: (direct ? Colors.green : Colors.orange).withValues(alpha: 0.15),
+        color: bg.withValues(alpha: 0.15),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Row(

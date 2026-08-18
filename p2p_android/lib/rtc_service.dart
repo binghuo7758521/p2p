@@ -2,9 +2,17 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'app_log.dart';
+
+/// 统计字段真值判断：兼容 bool / int / 字符串("true"/"1") 三种类型
+/// （Android 端 flutter_webrtc 的 getStats 返回值类型不稳定）
+bool _isTruthy(Object? v) =>
+    (v is bool && v) ||
+    (v is int && v == 1) ||
+    (v is String && (v == 'true' || v == 'TRUE' || v == '1'));
 
 /// 发送限速器（令牌桶）：仅服务器中转(relay)时启用，P2P 直连不限速
 class SendRateLimiter {
@@ -66,6 +74,10 @@ class RtcService {
   /// 避免首次探测失败/网络切换后一直停留在“探测中…”
   Timer? _connProbeTimer;
 
+  /// 网络类型变化监听（A方案）：WiFi↔移动网络切换时重启 ICE 重新选路，
+  /// 期望从中转切回直连（重选失败则维持中转，不影响连接）
+  StreamSubscription<List<ConnectivityResult>>? _netSub;
+
   void _startConnProbe() {
     _connProbeTimer ??= Timer.periodic(const Duration(seconds: 15), (_) {
       if (!isOpen) {
@@ -79,6 +91,41 @@ class RtcService {
   void _stopConnProbe() {
     _connProbeTimer?.cancel();
     _connProbeTimer = null;
+  }
+
+  void _startNetworkWatch() {
+    _netSub ??= Connectivity().onConnectivityChanged.listen((results) {
+      AppLog.i('conn', '网络类型变化: ${results.join(",")}');
+      // 网络切换（WiFi↔移动网络）：当前中转时重启 ICE 重新选路尝试直连
+      if (isOpen && connectionType == 'relay') {
+        restartIce();
+      }
+    });
+  }
+
+  void _stopNetworkWatch() {
+    _netSub?.cancel();
+    _netSub = null;
+  }
+
+  /// 重启 ICE 重新选路（网络切换后调用）：原生 restartIce 使下次 createOffer
+  /// 携带新 ice-ufrag（ICE restart 标记），重协商后 ICE 按“先直连后中转”
+  /// 重新尝试；数据通道保持打开，传输短暂停顿后自动恢复
+  /// （失败时维持原路径，不影响连接）
+  Future<void> restartIce() async {
+    final pc = _pc;
+    if (pc == null || !isOpen) return;
+    try {
+      AppLog.i('conn', '重启 ICE 重新选路（期望恢复直连）');
+      await pc.restartIce();
+      // 等待 ICE restart 状态就绪，确保新 offer 包含更新后的 ice-ufrag
+      await Future.delayed(const Duration(milliseconds: 200));
+      final offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      sendSignal?.call({'type': 'offer', 'sdp': offer.sdp});
+    } catch (e) {
+      AppLog.w('conn', '重启 ICE 失败（维持当前路径）', e);
+    }
   }
 
   /// 根据连接方式启停发送限速（仅服务器中转限速，直连不限速）
@@ -112,14 +159,19 @@ class RtcService {
         if (r.type != 'candidate-pair') continue;
         final selected = r.values['selected'];
         final nominated = r.values['nominated'];
-        // 只有显式选中/提名的候选对才算当前路径；
-        // selected/nominated 都缺失的对（可能仍在 checking）一律跳过
-        final isSelected = (selected is bool && selected) ||
-            (selected is int && selected == 1) ||
-            (nominated is bool && nominated) ||
-            (nominated is int && nominated == 1);
-        final hasMark = selected != null || nominated != null;
-        if (!hasMark || !isSelected) continue;
+        // 只有显式选中/提名的候选对才算当前路径；兼容字段类型差异
+        // （bool/int/字符串"true"），缺失 selected/nominated 的平台
+        // （Android）用标准 state=='succeeded' 字段兑底；
+        // 最后兑底：有实际收发字节的候选对必为在用路径
+        // （bytesSent/bytesReceived 各平台普遍存在）；
+        // 无任何选中标记的对（可能仍在 checking）一律跳过
+        final sent = r.values['bytesSent'];
+        final received = r.values['bytesReceived'];
+        final hasTraffic =
+            (sent is num && sent > 0) || (received is num && received > 0);
+        final isSelected = _isTruthy(selected) || _isTruthy(nominated) ||
+            r.values['state']?.toString() == 'succeeded' || hasTraffic;
+        if (!isSelected) continue;
         foundSelected = true;
         final local = r.values['localCandidateType']?.toString();
         final remote = r.values['remoteCandidateType']?.toString();
@@ -147,7 +199,16 @@ class RtcService {
       // 未找到显式选中的候选对：ICE 选路尚未稳定，保持原结果等待下一轮复查。
       // 注意：不能用“存在 relay 候选痕迹”兑底判中转——TURN 凭证下发后 relay
       // 候选必然存在，有候选 ≠ 在用，兑底是误判“服务器中转”的根源
-      if (!foundSelected) return;
+      if (!foundSelected) {
+        // 记录候选对报告的原始字段，便于定位平台 stats 差异（Android 常见）
+        final pairSummaries = reports
+            .where((r) => r.type == 'candidate-pair')
+            .map((r) => '${r.id}[${r.values.keys.join(",")}]')
+            .join(' | ');
+        AppLog.w('conn',
+            '连接方式探测未命中选中候选对，stats=${pairSummaries.isEmpty ? '无candidate-pair报告' : pairSummaries}');
+        return;
+      }
       if (type != connectionType) {
         connectionType = type;
         setRelayMode(type == 'relay');
@@ -204,6 +265,8 @@ class RtcService {
 
     _pc = await createPeerConnection(config);
     AppLog.i('rtc', 'PeerConnection 已创建, ICE服务器数=${config['iceServers']?.length ?? 0}');
+    // 网络切换监听（连接期间常驻，断开时在 dispose 中取消）
+    _startNetworkWatch();
     _pc!.onDataChannel = (channel) => _setupChannel(channel);
     _pc!.onIceCandidate = (candidate) {
       sendSignal?.call({
@@ -265,6 +328,12 @@ class RtcService {
     };
     channel.onDataChannelState = (state) {
       AppLog.i('rtc', '数据通道状态: $state');
+      // 数据通道打开后重新探测连接方式：ICE connected 触发探测时
+      // 通道可能尚未打开而被 isOpen 检查跳过，需在通道就绪后再次探测
+      // （与电脑端 host_service 行为对齐）
+      if (state == RTCDataChannelState.RTCDataChannelOpen) {
+        detectConnectionType();
+      }
       _stateController.add(
           state == RTCDataChannelState.RTCDataChannelOpen);
     };
@@ -333,6 +402,7 @@ class RtcService {
     _disconnectGraceTimer?.cancel();
     _disconnectGraceTimer = null;
     _stopConnProbe();
+    _stopNetworkWatch();
     connectionType = 'unknown';
     _rateLimiter = null;
     try {

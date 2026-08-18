@@ -147,6 +147,9 @@ class AppController extends ChangeNotifier {
   String? errorMessage;
   String? hostName;
 
+  /// 连接建立时间（连接方式探测超时兑底文案用）
+  DateTime? _connectedAt;
+
   /// v5.6+ 强制升级：服务器拒绝旧版（APP_VERSION_REQUIRED）时回调，
   /// 由 UI 层（_AuthGate）弹出不可跳过的强制升级窗
   void Function()? onVersionRequired;
@@ -162,8 +165,17 @@ class AppController extends ChangeNotifier {
   String get connTypeLabel => switch (_rtc.connectionType) {
         'relay' => '服务器中转',
         'direct' => 'P2P直连',
-        _ => '探测中…',
+        _ => _unknownConnLabel,
       };
+
+  /// 连接方式未知时的兑底文案：连接建立后 3 秒内为真实探测窗口显示
+  /// “探测中…”，超时仍未探测出则显示中性“已连接”，避免一直停在“探测中…”
+  /// （部分设备 getStats 不返回选中标记，探测可能永久不完成）
+  String get _unknownConnLabel {
+    final t = _connectedAt;
+    if (t == null) return '探测中…';
+    return DateTime.now().difference(t).inSeconds < 3 ? '探测中…' : '已连接';
+  }
 
   // ── 浏览状态 ──────────────────────────────────────────
   final List<String> _path = []; // 面包屑名称栈
@@ -295,6 +307,9 @@ class AppController extends ChangeNotifier {
     _loadRememberedUploadDir();
     _initDeviceId();
     _rtc.sendSignal = _signaling.sendSignal;
+    // 连接方式探测完成：及时刷新 UI（直连/服务器中转徽标），
+    // 否则探测结果要等下次其他刷新事件才能显示（如下拉刷新）
+    _rtc.onConnectionType = (_) => notifyListeners();
     _signaling.onJoined = _onJoined;
     _signaling.onError = (reason) {
       AppLog.i('signal', '配对错误: $reason (autoMode=$autoMode, manual=$_manualDisconnect)');
@@ -354,6 +369,7 @@ class AppController extends ChangeNotifier {
         if (_pendingUserInfo) _requestUserInfo();
       }
       if (open && state != ConnectState.peerConnected) {
+        _connectedAt = DateTime.now();
         state = ConnectState.peerConnected;
         notifyListeners();
         _requestFileList();
@@ -526,6 +542,7 @@ class AppController extends ChangeNotifier {
     AppLog.i('connect', '对端断开触发 (state=$state, manual=$_manualDisconnect)');
     // lost 状态说明已在自动重连中（信令/RTC 重建会再次触发断开回调），不再重复处理
     if (state == ConnectState.idle || state == ConnectState.lost) return;
+    _connectedAt = null;
     if (_manualDisconnect) {
       state = ConnectState.idle;
       errorMessage = null;
