@@ -9,6 +9,7 @@ import 'package:flutter_file_dialog/flutter_file_dialog.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:share_plus/share_plus.dart';
 
+import 'about_page.dart';
 import 'app_controller.dart';
 import 'app_log.dart';
 import 'auth_service.dart';
@@ -865,6 +866,11 @@ class _HomePageState extends State<HomePage> {
                   ));
                 case 'upload_log':
                   _uploadLog();
+                  return;
+                case 'about':
+                  Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => AboutPage(controller: controller)));
+                  return;
               }
             },
             itemBuilder: (context) {
@@ -915,6 +921,11 @@ class _HomePageState extends State<HomePage> {
                       icon: Icons.cloud_upload_outlined,
                       label: '上传日志给开发者'),
                 ),
+                const PopupMenuItem(
+                  value: 'about',
+                  child: _MenuRow(
+                      icon: Icons.info_outline, label: '关于'),
+                ),
               ];
             },
           ),
@@ -936,13 +947,23 @@ class _HomePageState extends State<HomePage> {
             // 不阻塞主页面使用（无电脑端权限的客户端也可浏览分享的共享文件夹）
             return _NotConnectedView(controller: controller);
           }
-          return IndexedStack(
-            // 共享访客模式隐藏「上传」页签（_tab==1）：显示浏览页
-            index: controller.isShareGuest && _tab == 1 ? 0 : _tab,
+          return Column(
             children: [
-              _BrowseTab(controller: controller),
-              _UploadTab(controller: controller),
-              _TransfersTab(controller: controller),
+              // v5.42+：电脑端升级横幅（管理员手机端收到服务器推送后显示，
+              // 可远程确认电脑端静默升级；三态：提示中/已通知/失败）
+              if (controller.desktopUpgrade != null)
+                _DesktopUpgradeBanner(controller: controller),
+              Expanded(
+                child: IndexedStack(
+                  // 共享访客模式隐藏「上传」页签（_tab==1）：显示浏览页
+                  index: controller.isShareGuest && _tab == 1 ? 0 : _tab,
+                  children: [
+                    _BrowseTab(controller: controller),
+                    _UploadTab(controller: controller),
+                    _TransfersTab(controller: controller),
+                  ],
+                ),
+              ),
             ],
           );
         },
@@ -1024,6 +1045,87 @@ class _ConnBadge extends StatelessWidget {
         style: TextStyle(
           fontSize: 10,
           color: color,
+        ),
+      ),
+    );
+  }
+}
+
+/// 电脑端升级横幅（v5.42+）：管理员手机端收到服务器推送后显示，
+/// 可远程确认电脑端升级；三态：notify=提示中 / confirmed=已通知 / failed=失败
+class _DesktopUpgradeBanner extends StatelessWidget {
+  final AppController controller;
+
+  const _DesktopUpgradeBanner({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final up = controller.desktopUpgrade;
+    if (up == null) return const SizedBox.shrink();
+    IconData icon;
+    Color color;
+    String title;
+    String detail;
+    switch (up.status) {
+      case 'confirmed':
+        icon = Icons.check_circle_outline;
+        color = Colors.green;
+        title = '已通知电脑端升级到 v${up.latest}';
+        detail = '电脑将自动下载并重启，请留意电脑端运行状态';
+      case 'failed':
+        icon = Icons.error_outline;
+        color = Colors.red;
+        title = '电脑端升级失败';
+        detail = up.error ?? '升级失败，请到电脑前手动处理';
+      default:
+        icon = up.urgent
+            ? Icons.warning_amber_outlined
+            : Icons.system_update_alt;
+        color = const Color(0xFFF59E0B);
+        title = '电脑端（${up.hostName}）有新版本 v${up.latest}';
+        detail = '当前版本 v${up.current}，可在手机上远程确认升级';
+    }
+    return Material(
+      color: color.withValues(alpha: 0.10),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+        child: Row(
+          children: [
+            Icon(icon, color: color, size: 20),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: color)),
+                  if (detail.isNotEmpty)
+                    Text(detail,
+                        style:
+                            TextStyle(fontSize: 11, color: Colors.grey.shade700)),
+                ],
+              ),
+            ),
+            if (up.status == 'notify')
+              FilledButton(
+                onPressed: controller.confirmDesktopUpgrade,
+                style: FilledButton.styleFrom(
+                  backgroundColor: color,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  minimumSize: Size.zero,
+                ),
+                child: const Text('确认升级', style: TextStyle(fontSize: 12)),
+              ),
+            IconButton(
+              tooltip: '关闭',
+              icon: const Icon(Icons.close, size: 18),
+              onPressed: controller.dismissDesktopUpgrade,
+            ),
+          ],
         ),
       ),
     );
@@ -1137,6 +1239,9 @@ class _BrowseTab extends StatelessWidget {
     if (controller.isShareGuest) {
       return Column(
         children: [
+          // v5.30+：「共享空间」入口（访客模式常显，与 AppBar 收件箱图标同入口）
+          if (AuthService.instance.activated || controller.isShareGuest)
+            _shareFolderEntry(context, controller),
           if (controller.shares.isNotEmpty) _shareEntries(context, controller),
           Expanded(
             child: _MessageView(
@@ -1152,6 +1257,9 @@ class _BrowseTab extends StatelessWidget {
 
     return Column(
       children: [
+        // v5.30+：「共享空间」入口（浏览页常显，与 AppBar 收件箱图标同入口）
+        if (AuthService.instance.activated || controller.isShareGuest)
+          _shareFolderEntry(context, controller),
         // 共享目录入口（扫码加入的共享，点击进入共享浏览页）
         if (controller.shares.isNotEmpty) _shareEntries(context, controller),
         // 路径面包屑
@@ -1162,7 +1270,8 @@ class _BrowseTab extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
             children: [
               ActionChip(
-                label: const Text('远程电脑'),
+                label: Text(controller.hostName ?? '远程电脑',
+                    maxLines: 1, overflow: TextOverflow.ellipsis),
                 onPressed: () => controller.navigateTo(-1),
               ),
               for (var i = 0; i < segments.length; i++)
@@ -1185,6 +1294,33 @@ class _BrowseTab extends StatelessWidget {
         // 文件列表
         Expanded(child: _buildList(context, controller)),
       ],
+    );
+  }
+
+  /// 「共享空间」入口卡片（v5.30+）：浏览页常显，点击进入「共享给我的」列表
+  Widget _shareFolderEntry(BuildContext context, AppController controller) {
+    final theme = Theme.of(context);
+    return Card(
+      margin: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+      elevation: 0,
+      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: ListTile(
+        dense: true,
+        leading: CircleAvatar(
+          backgroundColor: const Color(0xFF38BDF8).withValues(alpha: 0.15),
+          child: const Icon(Icons.inbox_outlined, color: Color(0xFF38BDF8)),
+        ),
+        title: const Text('共享空间',
+            style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500)),
+        subtitle: const Text('从其他电脑分享给你的内容',
+            style: TextStyle(fontSize: 12)),
+        trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+        onTap: () {
+          Navigator.of(context).push(MaterialPageRoute(
+              builder: (_) => ShareCenterPage(controller: controller)));
+        },
+      ),
     );
   }
 
@@ -1547,7 +1683,7 @@ class _UploadTabState extends State<_UploadTab> {
                 onPressed: busy ? null : _pickUploadDir,
                 icon: const Icon(Icons.folder_copy_outlined),
                 label: Text(
-                  '上传到: ${controller.uploadDirPath.isEmpty ? '远程电脑' : controller.uploadDirPath}',
+                  '上传到: ${controller.uploadDirPath.isEmpty ? (controller.hostName ?? '远程电脑') : controller.uploadDirPath}',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
@@ -1736,7 +1872,8 @@ class _UploadDirDialogState extends State<_UploadDirDialog> {
                   scrollDirection: Axis.horizontal,
                   children: [
                     ActionChip(
-                      label: const Text('远程电脑'),
+                      label: Text(controller.hostName ?? '远程电脑',
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
                       onPressed: () => controller.navigateUploadDir(-1),
                     ),
                     for (var i = 0; i < segments.length; i++)
@@ -1792,7 +1929,7 @@ class _UploadDirDialogState extends State<_UploadDirDialog> {
         FilledButton(
           onPressed: () => Navigator.of(context).pop(),
           child: Text(
-              '上传到此目录 (${segments.isEmpty ? '远程电脑' : controller.uploadDirPath})'),
+              '上传到此目录 (${segments.isEmpty ? (controller.hostName ?? '远程电脑') : controller.uploadDirPath})'),
         ),
       ],
     );
@@ -1800,49 +1937,211 @@ class _UploadDirDialogState extends State<_UploadDirDialog> {
 }
 
 /// 传输记录页签
-class _TransfersTab extends StatelessWidget {
+class _TransfersTab extends StatefulWidget {
   final AppController controller;
   final String? filter;
 
   const _TransfersTab({required this.controller, this.filter});
 
   @override
-  Widget build(BuildContext context) {
-    final items = filter == null
-        ? controller.transfers
-        : controller.transfers.where((t) => t.direction == filter).toList();
+  State<_TransfersTab> createState() => _TransfersTabState();
+}
 
+class _TransfersTabState extends State<_TransfersTab> {
+  /// v5.38+ 多选删除：是否处于选择模式
+  bool _selecting = false;
+  /// 已勾选的记录 id 集合
+  final Set<String> _selected = {};
+
+  List<TransferItem> get _items => widget.filter == null
+      ? widget.controller.transfers
+      : widget.controller.transfers
+          .where((t) => t.direction == widget.filter)
+          .toList();
+
+  @override
+  Widget build(BuildContext context) {
+    final items = _items;
     if (items.isEmpty) {
+      // 列表被删空时退出选择模式，避免残留选择栏
+      if (_selecting) {
+        _selecting = false;
+        _selected.clear();
+      }
       return const _MessageView(
         icon: Icons.history,
         text: '暂无传输记录',
       );
     }
-    return ListView.builder(
-      itemCount: items.length,
-      itemBuilder: (context, i) {
-        final item = items[i];
-        // 显示本次传输时的连接方式（记录快照）：已完成的记录固定显示传输时的方式；
-        // 进行中且探测尚未完成（unknown）时回退显示当前方式
-        String? connLabel;
-        if (item.connType == 'relay') {
-          connLabel = '服务器中转';
-        } else if (item.connType == 'direct') {
-          connLabel = 'P2P直连';
-        } else if (item.status == 'transferring') {
-          connLabel = controller.connTypeLabel;
-        }
-        return _TransferTile(item: item, connLabel: connLabel);
-      },
+    return Column(
+      children: [
+        if (_selecting) _buildSelectBar(context),
+        Expanded(
+          child: ListView.builder(
+            itemCount: items.length,
+            itemBuilder: (context, i) {
+              final item = items[i];
+              // 显示本次传输时的连接方式（记录快照）：已完成的记录固定显示传输时的方式；
+              // 进行中且探测尚未完成（unknown）时回退显示当前方式
+              String? connLabel;
+              if (item.connType == 'relay') {
+                connLabel = '服务器中转';
+              } else if (item.connType == 'direct') {
+                connLabel = 'P2P直连';
+              } else if (item.status == 'transferring') {
+                connLabel = widget.controller.connTypeLabel;
+              }
+              final selected = _selected.contains(item.id);
+              return GestureDetector(
+                // v5.38+ 选择模式点选切换；非选择模式长按进入选择并勾选该条
+                onTap: _selecting ? () => _toggleSelect(item.id) : null,
+                onLongPress: _selecting ? null : () => _enterSelect(item.id),
+                child: _TransferTile(
+                  item: item,
+                  connLabel: connLabel,
+                  selecting: _selecting,
+                  selected: selected,
+                ),
+              );
+            },
+          ),
+        ),
+      ],
     );
+  }
+
+  /// 选择模式操作栏：已选 n 项 + 全选/删除/取消
+  Widget _buildSelectBar(BuildContext context) {
+    return Material(
+      color: Theme.of(context).colorScheme.primaryContainer.withOpacity(0.25),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                '已选 ${_selected.length} 项',
+                style: const TextStyle(fontSize: 13),
+              ),
+            ),
+            TextButton(
+              onPressed: () => _selectAll(),
+              child: const Text('全选'),
+            ),
+            TextButton(
+              onPressed:
+                  _selected.isEmpty ? null : () => _confirmBatchDelete(context),
+              child: const Text('删除', style: TextStyle(color: Colors.redAccent)),
+            ),
+            TextButton(
+              onPressed: _exitSelect,
+              child: const Text('取消'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 非选择模式长按：进入选择模式并勾选该条
+  void _enterSelect(String id) {
+    setState(() {
+      _selecting = true;
+      _selected.add(id);
+    });
+  }
+
+  /// 选择模式点选：切换勾选状态
+  void _toggleSelect(String id) {
+    setState(() {
+      if (!_selected.remove(id)) _selected.add(id);
+    });
+  }
+
+  /// 全选/取消全选（按当前列表全部记录）
+  void _selectAll() {
+    setState(() {
+      final all = _items.map((t) => t.id).toSet();
+      if (_selected.length == all.length && _selected.containsAll(all)) {
+        _selected.clear(); // 已全选：再次点击取消全选
+      } else {
+        _selected
+          ..clear()
+          ..addAll(all);
+      }
+    });
+  }
+
+  void _exitSelect() {
+    setState(() {
+      _selecting = false;
+      _selected.clear();
+    });
+  }
+
+  /// 批量删除确认弹窗：确认后逐条删除（含持久化）并退出选择模式
+  Future<void> _confirmBatchDelete(BuildContext context) async {
+    final n = _selected.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除传输记录'),
+        content: Text('确定删除选中的 $n 条传输记录吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      for (final id in _selected.toList()) {
+        widget.controller.removeTransfer(id);
+      }
+      _exitSelect();
+    }
   }
 }
 
 class _TransferTile extends StatelessWidget {
   final TransferItem item;
   final String? connLabel; // 传输时的连接方式（直连/服务器中转）
+  final bool selecting; // v5.38+ 选择模式：leading 显示勾选圈
+  final bool selected; // v5.38+ 当前记录是否已勾选
 
-  const _TransferTile({required this.item, this.connLabel});
+  const _TransferTile({
+    required this.item,
+    this.connLabel,
+    this.selecting = false,
+    this.selected = false,
+  });
+
+  /// v5.37+ 副标题：进行中显示进度+速度；终态显示体积/完成时间/传输对象电脑端名称
+  String _subtitleText(TransferItem item, bool done, bool error, bool skipped) {
+    final peer = item.peerName.isNotEmpty ? item.peerName : '电脑';
+    final end = item.endTime;
+    final endStr = end == null
+        ? ''
+        : '${end.month.toString().padLeft(2, '0')}-${end.day.toString().padLeft(2, '0')} '
+            '${end.hour.toString().padLeft(2, '0')}:${end.minute.toString().padLeft(2, '0')}';
+    if (skipped) return '已跳过（电脑端存在同名文件）';
+    if (done) {
+      return '${formatSize(item.total)}'
+          '${endStr.isNotEmpty ? ' · 完成于 $endStr' : ''} · $peer';
+    }
+    if (error) {
+      final size = '${formatSize(item.transferred)} / ${formatSize(item.total)}';
+      return '$size'
+          '${endStr.isNotEmpty ? ' · 失败于 $endStr' : ''} · $peer';
+    }
+    return '${formatSize(item.transferred)} / ${formatSize(item.total)}'
+        '${item.speed.isNotEmpty ? '  ${item.speed}' : ''}';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1852,20 +2151,27 @@ class _TransferTile extends StatelessWidget {
     final skipped = item.status == 'skipped';
 
     return ListTile(
-      leading: Icon(
-        skipped
-            ? Icons.skip_next
-            : isUpload
-                ? Icons.upload
-                : Icons.download,
-        color: error
-            ? Colors.redAccent
-            : done
-                ? Colors.green
-                : skipped
-                    ? Colors.orange
-                    : Colors.blue,
-      ),
+      // 选择模式下勾选的行浅色高亮（v5.38+）
+      tileColor: selected ? Colors.blue.withOpacity(0.08) : null,
+      leading: selecting
+          ? Icon(
+              selected ? Icons.check_circle : Icons.radio_button_unchecked,
+              color: selected ? Colors.blue : Colors.grey,
+            )
+          : Icon(
+              skipped
+                  ? Icons.skip_next
+                  : isUpload
+                      ? Icons.upload
+                      : Icons.download,
+              color: error
+                  ? Colors.redAccent
+                  : done
+                      ? Colors.green
+                      : skipped
+                          ? Colors.orange
+                          : Colors.blue,
+            ),
       title: Row(
         children: [
           Expanded(
@@ -1887,10 +2193,7 @@ class _TransferTile extends StatelessWidget {
             LinearProgressIndicator(value: item.progress, minHeight: 4),
           const SizedBox(height: 4),
           Text(
-            skipped
-                ? '已跳过（电脑端存在同名文件）'
-                : '${formatSize(item.transferred)} / ${formatSize(item.total)}'
-                    '${item.speed.isNotEmpty ? '  ${item.speed}' : ''}',
+            _subtitleText(item, done, error, skipped),
             style: const TextStyle(fontSize: 12),
           ),
         ],

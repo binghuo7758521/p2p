@@ -25,6 +25,12 @@ class SignalingService {
   /// 对端（电脑端）断开
   void Function()? onPeerDisconnected;
 
+  /// 服务器推送电脑端升级提示（v5.42+）：仅管理员手机端收到
+  void Function(Map<String, dynamic> info)? onDesktopUpgradeNotify;
+
+  /// 电脑端升级结果（v5.42+）：确认回执 / 升级失败转发
+  void Function(Map<String, dynamic> result)? onDesktopUpgradeResult;
+
   /// 连接服务器失败
   void Function(String message)? onConnectError;
 
@@ -131,6 +137,22 @@ class SignalingService {
       onPeerDisconnected?.call();
     });
 
+    // 电脑端升级提示推送（v5.42+）：服务器发布新版/电脑注册时推给管理员手机端
+    _socket!.on('upgrade:desktop-notify', (data) {
+      AppLog.i('signal', '收到电脑端升级提示: $data');
+      if (data is Map) {
+        onDesktopUpgradeNotify?.call(Map<String, dynamic>.from(data));
+      }
+    });
+
+    // 电脑端升级结果（v5.42+）：确认回执或升级失败转发
+    _socket!.on('upgrade:desktop-result', (data) {
+      AppLog.i('signal', '收到电脑端升级结果: $data');
+      if (data is Map) {
+        onDesktopUpgradeResult?.call(Map<String, dynamic>.from(data));
+      }
+    });
+
     _socket!.onConnectError((data) {
       AppLog.e('signal', '连接服务器失败', data.toString());
       onConnectError?.call(data.toString());
@@ -148,6 +170,12 @@ class SignalingService {
   void sendSignal(Map<String, dynamic> signal) {
     AppLog.i('signal', '发送信令: ${signal['type']}');
     _socket?.emit('signal:client→host', {'signal': signal});
+  }
+
+  /// 确认电脑端升级（v5.42+）：服务器校验管理员身份后通知电脑端静默升级
+  void confirmDesktopUpgrade() {
+    AppLog.i('signal', '确认电脑端升级');
+    _socket?.emit('upgrade:confirm');
   }
 
   /// 断开连接

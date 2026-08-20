@@ -3,7 +3,7 @@
 ; 编译: ISCC.exe installer.iss  （输出到 e:\p2p\p2p_desktop_setup.exe）
 ; 注意: 版本号与 lib/version.dart 同步（发布流程版本同步点之一）
 #define MyAppName "无限大盘"
-#define MyAppVersion "6.15.0"
+#define MyAppVersion "6.21.0"
 #define MyAppExeName "p2p_desktop.exe"
 #define MyAppId "8D6B1761-4DC2-4EF4-AD4D-7BB3E9028F73"
 

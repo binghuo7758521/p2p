@@ -137,6 +137,37 @@ class PowerNotice {
   const PowerNotice({required this.text, required this.delaySeconds});
 }
 
+/// 电脑端升级提示（v5.42+）：管理员手机端收到服务器推送后展示横幅，
+/// 确认后服务器通知电脑端静默升级；status 区分提示/已通知/失败三态
+class DesktopUpgradeInfo {
+  /// 电脑端当前版本
+  final String current;
+
+  /// 最新版本
+  final String latest;
+
+  /// 是否重要升级
+  final bool urgent;
+
+  /// 电脑端名称
+  final String hostName;
+
+  /// 状态：notify=提示中 / confirmed=已通知升级 / failed=升级失败
+  final String status;
+
+  /// 失败原因（status=failed 时有值）
+  final String? error;
+
+  const DesktopUpgradeInfo({
+    required this.current,
+    required this.latest,
+    this.urgent = false,
+    this.hostName = '电脑',
+    this.status = 'notify',
+    this.error,
+  });
+}
+
 /// 全局控制器：编排信令、WebRTC 数据通道与文件传输
 class AppController extends ChangeNotifier {
   final SignalingService _signaling = SignalingService();
@@ -189,6 +220,10 @@ class AppController extends ChangeNotifier {
   String deviceId = ''; // 设备唯一标识（持久化，多用户身份）
   bool isAdmin = false; // 是否为该电脑端管理员
   bool isShareGuest = false; // 共享访客（扫码共享连接）：仅可访问分享的共享目录
+
+  // ── 电脑端升级提示（v5.42+）────────────────────────────
+  DesktopUpgradeInfo? _desktopUpgrade;
+  DesktopUpgradeInfo? get desktopUpgrade => _desktopUpgrade;
   AdminClaimRequest? _adminClaimRequest; // 已有其他管理员：更换确认请求
   bool _adminClaimDismissed = false; // 本会话已拒绝更换，不再重复弹窗
   AdminClaimRequest? get adminClaimRequest => _adminClaimRequest;
@@ -359,6 +394,8 @@ class AppController extends ChangeNotifier {
       notifyListeners();
     };
     _signaling.onPeerDisconnected = _onPeerLost;
+    _signaling.onDesktopUpgradeNotify = _onDesktopUpgradeNotify;
+    _signaling.onDesktopUpgradeResult = _onDesktopUpgradeResult;
     _rtc.messages.listen(_onChannelMessage);
     _rtc.stateChanges.listen((open) {
       AppLog.i('rtc', '数据通道状态变化: ${open ? 'OPEN' : 'CLOSED'} (当前state=$state)');
@@ -558,6 +595,81 @@ class AppController extends ChangeNotifier {
     _startAutoReconnect();
   }
 
+  // ── 电脑端升级提示（v5.42+）──────────────────────────
+  /// 服务器推送电脑端升级提示：仅管理员手机端收到。
+  /// 电脑端已是最新（推送时点过后已升级）则清除提示
+  void _onDesktopUpgradeNotify(Map<String, dynamic> info) {
+    final latest = info['latest']?.toString() ?? '';
+    final current = info['current']?.toString() ?? '';
+    if (latest.isEmpty || current.isEmpty) return;
+    if (_verNum(current) >= _verNum(latest)) {
+      if (_desktopUpgrade != null) {
+        AppLog.i('upgrade', '电脑端已是最新 v$current，清除升级提示');
+        _desktopUpgrade = null;
+        notifyListeners();
+      }
+      return;
+    }
+    AppLog.i('upgrade', '收到电脑端升级提示: v$current → v$latest (${info['hostName']})');
+    _desktopUpgrade = DesktopUpgradeInfo(
+      current: current,
+      latest: latest,
+      urgent: info['urgent'] == true,
+      hostName: info['hostName']?.toString() ?? '电脑',
+    );
+    notifyListeners();
+  }
+
+  /// 电脑端升级结果：确认回执（ok=true 已通知升级）或升级失败转发
+  void _onDesktopUpgradeResult(Map<String, dynamic> result) {
+    final up = _desktopUpgrade;
+    if (up == null) return;
+    final ok = result['ok'] == true;
+    if (ok) {
+      AppLog.i('upgrade', '已通知电脑端升级到 v${up.latest}');
+      _desktopUpgrade = DesktopUpgradeInfo(
+        current: up.current,
+        latest: up.latest,
+        urgent: up.urgent,
+        hostName: up.hostName,
+        status: 'confirmed',
+      );
+    } else {
+      AppLog.w('upgrade', '电脑端升级失败: ${result['error']}');
+      _desktopUpgrade = DesktopUpgradeInfo(
+        current: up.current,
+        latest: up.latest,
+        urgent: up.urgent,
+        hostName: up.hostName,
+        status: 'failed',
+        error: result['error']?.toString() ?? '升级失败，请到电脑前手动处理',
+      );
+    }
+    notifyListeners();
+  }
+
+  /// 管理员确认电脑端升级：服务器校验身份后通知电脑端静默升级
+  void confirmDesktopUpgrade() {
+    final up = _desktopUpgrade;
+    if (up == null || up.status == 'confirmed') return;
+    AppLog.i('upgrade', '管理员确认电脑端升级: v${up.current} → v${up.latest}');
+    _signaling.confirmDesktopUpgrade();
+  }
+
+  /// 关闭电脑端升级提示
+  void dismissDesktopUpgrade() {
+    if (_desktopUpgrade == null) return;
+    _desktopUpgrade = null;
+    notifyListeners();
+  }
+
+  /// 版本号转数值（v1.5 → 105）：分段解析避免 double 把 5.10 误判为 5.1
+  static int _verNum(String v) {
+    final parts = v.split('.');
+    return (int.tryParse(parts.isNotEmpty ? parts[0] : '') ?? 0) * 100 +
+        (int.tryParse(parts.length > 1 ? parts[1] : '') ?? 0);
+  }
+
   /// 记录断线时未完成的传输（用于重连后自动续传）
   void _captureResumeState() {
     for (final t in transfers) {
@@ -706,6 +818,7 @@ class AppController extends ChangeNotifier {
       _uploadBytes = 0;
       _uploadStartMs = DateTime.now().millisecondsSinceEpoch;
       t.status = 'transferring';
+      t.endTime = null; // 重新传输：清除上次结束时间（v5.37+）
       // 续传在重连后进行，连接方式可能已变化：记录实际续传方式
       t.connType = _rtc.connectionType;
       _acceptOffset = 0;
@@ -739,7 +852,7 @@ class AppController extends ChangeNotifier {
         });
         await _waitUploadDecision(r.fileName, const Duration(seconds: 3));
       } else if (decision == 'busy' || decision == 'rejected') {
-        t.status = 'error';
+        t.finish('error');
         notifyListeners();
         return false;
       }
@@ -748,7 +861,7 @@ class AppController extends ChangeNotifier {
       if (startOffset > 0 && _acceptOffset == 0) {
         AppLog.e('resume',
             '续传握手未收到accept（请求offset=$startOffset），放弃本次续传: ${r.fileName}');
-        t.status = 'error';
+        t.finish('error');
         notifyListeners();
         return false;
       }
@@ -772,7 +885,7 @@ class AppController extends ChangeNotifier {
           if (start + _uploadBytes + n > t.total) {
             AppLog.e('resume',
                 '续传进度超限: ${start + _uploadBytes + n} > ${t.total}，起点错位终止 ${r.fileName}');
-            t.status = 'error';
+            t.finish('error');
             notifyListeners();
             return false;
           }
@@ -807,7 +920,7 @@ class AppController extends ChangeNotifier {
     } catch (e) {
       debugPrint('续传失败 ${r.fileName}: $e');
       if (t.status == 'transferring') {
-        t.status = 'error';
+        t.finish('error');
         notifyListeners();
       }
       return false;
@@ -1622,6 +1735,35 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  /// 投屏拉流地址（v5.33+）：局域网可达 + token 防盗播；
+  /// 本地 video_player 播放仍用 playUrl（loopback 免 token）。
+  /// 播放服务器未就绪或无法获取局域网 IP 时返回 null。
+  Future<String?> buildCastUrl() async {
+    final p = _playServer.port;
+    if (p == null || _playFile == null || _playServer.castToken.isEmpty) {
+      return null;
+    }
+    try {
+      final ifs = await NetworkInterface.list(
+          type: InternetAddressType.IPv4, includeLoopback: false);
+      InternetAddress? lan;
+      for (final i in ifs) {
+        for (final a in i.addresses) {
+          if (!a.isLoopback && !a.isLinkLocal) {
+            lan = a;
+            break;
+          }
+        }
+        if (lan != null) break;
+      }
+      if (lan == null) return null;
+      return 'http://${lan.address}:$p/play?token=${_playServer.castToken}';
+    } catch (e) {
+      AppLog.w('play', '获取局域网地址失败', e);
+      return null;
+    }
+  }
+
   void _startDownload(ControlMessage msg) {
     final fileName = msg.data['fileName']?.toString() ?? 'unknown';
     final fileSize = (msg.data['fileSize'] as num?)?.toInt() ?? 0;
@@ -1655,6 +1797,7 @@ class AppController extends ChangeNotifier {
             f,
             isFinished: () => playFinished,
             mime: mimeForVideo(fileName),
+            expectedSize: fileSize, // v5.34+ 总大小用于响应头，电视边下边播
           );
           playUrl = 'http://127.0.0.1:$port/play';
           AppLog.i('play', '播放服务器已启动: port=$port mime=${mimeForVideo(fileName)}');
@@ -1811,7 +1954,7 @@ class AppController extends ChangeNotifier {
 
     final t = transfers.where((x) => x.fileName == name).toList();
     for (final item in t) {
-      item.status = success ? 'done' : 'error';
+      item.finish(success ? 'done' : 'error');
       item.transferred = item.total;
     }
     unawaited(_saveTransfers());
@@ -1914,7 +2057,7 @@ class AppController extends ChangeNotifier {
         } else if (decision == 'busy' || decision == 'rejected') {
           // 电脑端拒绝了本次握手（已有其他传输等）：不发送数据块，标记失败
           if (t.status == 'transferring') {
-            t.status = 'error';
+            t.finish('error');
             notifyListeners();
           }
           continue;
@@ -1941,7 +2084,7 @@ class AppController extends ChangeNotifier {
             if (acceptOff + _uploadBytes + n > t.total) {
               AppLog.e('upload',
                   '上传进度超限: ${acceptOff + _uploadBytes + n} > ${t.total}，起点错位终止 ${file.name}');
-              t.status = 'error';
+              t.finish('error');
               notifyListeners();
               break;
             }
@@ -1984,7 +2127,7 @@ class AppController extends ChangeNotifier {
         AppLog.e('upload', '上传异常: ${file.name}', e);
         debugPrint('上传失败 ${file.name}: $e');
         if (t != null && t.status == 'transferring') {
-          t.status = 'error';
+          t.finish('error');
           notifyListeners();
         }
       }
@@ -2006,7 +2149,7 @@ class AppController extends ChangeNotifier {
             }
           }
           if (t != null && t.status == 'transferring') {
-            t.status = 'error';
+            t.finish('error');
             errorMessage = '上传超时，电脑端未确认结果: ${t.fileName}';
           }
         }
@@ -2041,7 +2184,7 @@ class AppController extends ChangeNotifier {
     AppLog.i('upload', '用户手动停止上传: $name');
     for (final x in transfers) {
       if (x.direction == 'upload' && x.status == 'transferring') {
-        x.status = 'error';
+        x.finish('error');
       }
     }
     notifyListeners();
@@ -2138,9 +2281,9 @@ class AppController extends ChangeNotifier {
     }
     if (item == null) return;
     if (reason == 'skipped') {
-      item.status = 'skipped';
+      item.finish('skipped');
     } else {
-      item.status = success ? 'done' : 'error';
+      item.finish(success ? 'done' : 'error');
     }
     if (success || reason == 'skipped') item.transferred = item.total;
     unawaited(_saveTransfers());
@@ -2442,7 +2585,7 @@ class AppController extends ChangeNotifier {
       if (x.direction == 'download' &&
           x.fileName == name &&
           x.status == 'transferring') {
-        x.status = 'error';
+        x.finish('error');
       }
     }
     unawaited(_saveTransfers());
@@ -2559,7 +2702,7 @@ class AppController extends ChangeNotifier {
         ..sort((a, b) => b.startTime.compareTo(a.startTime));
       for (final t in items) {
         // App 进程被杀时正在传输的记录恢复为失败（实际传输已中断）
-        if (t.status == 'transferring') t.status = 'error';
+        if (t.status == 'transferring') t.finish('error');
       }
       transfers.addAll(items);
       AppLog.i('transfer', '加载历史传输记录: ${items.length} 条');
@@ -2584,6 +2727,8 @@ class AppController extends ChangeNotifier {
       // 快照传输创建时的连接方式（传输记录显示的是本次传输实际方式，
       // 而非当前连接状态；续传时在 _resumeUpload 中更新为续传时的方式）
       connType: _rtc.connectionType,
+      // v5.37+ 快照传输对象电脑端名称（完成后显示；无连接时兜底'电脑'）
+      peerName: hostName ?? '电脑',
       // 本地/电脑端文件路径：断点捕获依赖它定位续传文件
       // （曾缺失导致 _captureResumeState 永远捕获不到上传/下载）
       localPath: localPath,
@@ -2592,6 +2737,13 @@ class AppController extends ChangeNotifier {
     transfers.insert(0, t);
     unawaited(_saveTransfers());
     return t;
+  }
+
+  /// 删除单条传输记录（v5.37+ 手动删除，含持久化）
+  void removeTransfer(String id) {
+    transfers.removeWhere((x) => x.id == id);
+    notifyListeners();
+    unawaited(_saveTransfers());
   }
 
   void _cleanupReceive() {

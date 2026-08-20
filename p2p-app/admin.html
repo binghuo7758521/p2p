@@ -172,6 +172,46 @@
       <div id="usbEmpty" class="empty-state">暂无授权 U盘</div>
     </div>
 
+    <!-- 升级管理（重要升级线 / 最低支持版本） -->
+    <div class="card">
+      <div class="card-title">⬆️ 升级管理
+        <span id="upgSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
+      </div>
+      <div class="status status-info" id="upgStatus">加载中...</div>
+      <label>① 重要升级版本（低于此版本的电脑端将立即弹窗提示升级）</label>
+      <div class="toolbar">
+        <input type="text" id="upgVersionInput" placeholder="例如 6.24" style="flex:2">
+        <button class="btn-green" id="upgSetBtn" style="width:auto">设为重要升级</button>
+        <button class="btn-ghost" id="upgClearBtn" style="width:auto">取消重要升级</button>
+      </div>
+      <label>② 最低支持版本（低于此版本 = 不再支持，强制升级 / 拒绝连接）</label>
+      <div class="toolbar">
+        <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">电脑端</span>
+        <input type="text" id="dMinInput" placeholder="例如 6.20（留空 = 不限制）" style="flex:2">
+        <button class="btn-green" id="dMinSetBtn" style="width:auto">设为</button>
+        <button class="btn-ghost" id="dMinClearBtn" style="width:auto">清除</button>
+      </div>
+      <div class="toolbar">
+        <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">手机端</span>
+        <input type="text" id="aMinInput" placeholder="例如 5.6（留空 = 不限制）" style="flex:2">
+        <button class="btn-green" id="aMinSetBtn" style="width:auto">设为</button>
+        <button class="btn-ghost" id="aMinClearBtn" style="width:auto">清除</button>
+      </div>
+      <label>③ 指定停用版本（有故障/有风险的版本精确下架，即使高于最低支持线也拒绝连接）</label>
+      <div class="toolbar">
+        <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">电脑端</span>
+        <input type="text" id="dBlockInput" placeholder="例如 6.18" style="flex:1">
+        <button class="btn-green" id="dBlockAddBtn" style="width:auto">下架此版本</button>
+        <div id="dBlockTags" style="flex:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>
+      </div>
+      <div class="toolbar">
+        <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">手机端</span>
+        <input type="text" id="aBlockInput" placeholder="例如 5.9" style="flex:1">
+        <button class="btn-green" id="aBlockAddBtn" style="width:auto">下架此版本</button>
+        <div id="aBlockTags" style="flex:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>
+      </div>
+    </div>
+
     <div class="refresh-note">状态每 10 秒自动刷新</div>
   </div>
 </div>
@@ -235,6 +275,7 @@ async function doLogin() {
     refreshStats();
     loadHosts();
     loadUsbIds();
+    loadUpgrade();
   } catch (e) {
     errBox.textContent = e.message;
     errBox.classList.remove('hidden');
@@ -345,6 +386,144 @@ async function batchUsb() {
   } catch (e) { alert(e.message); }
 }
 
+// ── 升级管理 ──
+// 当前停用版本列表（来自服务器，每次操作全量提交，避免覆盖其他字段）
+let dBlocked = [];
+let aBlocked = [];
+
+// 收集三个输入框当前值（每次操作全量提交，避免覆盖其他字段）
+function collectUpgrade() {
+  return {
+    desktopUrgentVersion: $('upgVersionInput').value.trim(),
+    desktopMinVersion: $('dMinInput').value.trim(),
+    androidMinVersion: $('aMinInput').value.trim(),
+    desktopBlockedVersions: dBlocked,
+    androidBlockedVersions: aBlocked,
+  };
+}
+
+async function loadUpgrade() {
+  try {
+    const data = await api('/api/admin/upgrade');
+    $('upgSummary').textContent = `最新 v${data.desktopLatest} / v${data.androidLatest}`;
+    $('upgVersionInput').value = data.desktopUrgentVersion || data.desktopLatest;
+    $('dMinInput').value = data.desktopMinVersion || '';
+    $('aMinInput').value = data.androidMinVersion || '';
+    dBlocked = Array.isArray(data.desktopBlockedVersions) ? data.desktopBlockedVersions : [];
+    aBlocked = Array.isArray(data.androidBlockedVersions) ? data.androidBlockedVersions : [];
+    renderBlockTags();
+    const status = $('upgStatus');
+    const urgentTxt = data.urgentActive
+        ? `<b>重要升级：v${data.desktopUrgentVersion} 起</b>（稍后提醒 1 小时、5 分钟高频检查）`
+        : '普通升级（6 小时检查、24 小时稍后提醒）';
+    const dMinTxt = data.desktopMinVersion
+        ? `<b>电脑端最低支持 v${data.desktopMinVersion}</b>：低于此版本拒绝连接并强制升级`
+        : '电脑端最低支持：不限制';
+    const aMinTxt = data.androidMinVersion
+        ? `<b>手机端最低支持 v${data.androidMinVersion}</b>：低于此版本拒绝激活/连接`
+        : '手机端最低支持：不限制';
+    const dBlockTxt = dBlocked.length ? `<b>电脑端停用：v${dBlocked.join('、v')}</b>：该版本拒绝连接` : '';
+    const aBlockTxt = aBlocked.length ? `<b>手机端停用：v${aBlocked.join('、v')}</b>：该版本拒绝激活` : '';
+    status.className = 'status ' + ((data.urgentActive || data.desktopMinVersion || dBlocked.length) ? 'status-err' : 'status-info');
+    status.innerHTML = `${urgentTxt}<br>${dMinTxt}<br>${aMinTxt}${dBlockTxt ? '<br>' + dBlockTxt : ''}${aBlockTxt ? '<br>' + aBlockTxt : ''}`;
+  } catch (e) { /* 忽略，下一轮重试 */ }
+}
+
+// 渲染停用版本标签列表（chip 带 × 可移除）
+function renderBlockTags() {
+  const render = (id, list, platform) => {
+    const box = $(id);
+    box.innerHTML = list.length
+        ? list.map((v) =>
+            `<span style="background:#334155;color:#e2e8f0;padding:2px 10px;border-radius:999px;font-size:0.85em;display:inline-flex;align-items:center;gap:6px">v${v}<span style="cursor:pointer;color:#f87171;font-weight:bold" onclick="removeBlocked('${platform}','${v}')" title="恢复支持">×</span></span>`
+          ).join('')
+        : '<span style="color:#64748b;font-size:0.85em">无停用版本</span>';
+  };
+  render('dBlockTags', dBlocked, 'desktop');
+  render('aBlockTags', aBlocked, 'android');
+}
+
+async function addBlocked(platform) {
+  const inputId = platform === 'desktop' ? 'dBlockInput' : 'aBlockInput';
+  const v = $(inputId).value.trim();
+  if (!v) { alert('请输入版本号（例如 6.18）'); return; }
+  if (!/^\d+\.\d+$/.test(v)) { alert('版本号格式应为 X.Y（例如 6.18）'); return; }
+  const list = platform === 'desktop' ? dBlocked : aBlocked;
+  if (list.includes(v)) { alert(`v${v} 已在停用列表中`); return; }
+  if (!confirm(`确定停用 ${platform === 'desktop' ? '电脑端' : '手机端'} v${v} 吗？\n该版本的客户端将无法连接服务器，必须升级后才能使用。`)) return;
+  if (platform === 'desktop') { dBlocked.push(v); } else { aBlocked.push(v); }
+  $(inputId).value = '';
+  renderBlockTags();
+  await saveUpgrade(collectUpgrade());
+}
+
+async function removeBlocked(platform, v) {
+  if (platform === 'desktop') {
+    dBlocked = dBlocked.filter((x) => x !== v);
+  } else {
+    aBlocked = aBlocked.filter((x) => x !== v);
+  }
+  renderBlockTags();
+  await saveUpgrade(collectUpgrade());
+}
+
+async function saveUpgrade(payload) {
+  try {
+    const data = await api('/api/admin/upgrade', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if (data.changed && data.pushed > 0) {
+      alert(`已生效（在线 ${data.pushed} 台电脑端已收到推送）`);
+    } else {
+      alert('已生效');
+    }
+    loadUpgrade();
+  } catch (e) { alert(e.message); }
+}
+
+async function setUpgrade() {
+  const v = $('upgVersionInput').value.trim();
+  if (!v) { alert('请输入版本号（例如 6.24）'); return; }
+  if (!confirm(`确定将 v${v} 设为重要升级线吗？\n低于 v${v} 的电脑端将立即弹窗提示升级。`)) return;
+  await saveUpgrade(collectUpgrade());
+}
+
+async function clearUpgrade() {
+  if (!confirm('确定取消重要升级吗？\n之后将按普通升级策略提示。')) return;
+  const p = collectUpgrade();
+  p.desktopUrgentVersion = '';
+  await saveUpgrade(p);
+}
+
+async function setDMin() {
+  const v = $('dMinInput').value.trim();
+  if (!v) { alert('请输入版本号（例如 6.20）'); return; }
+  if (!confirm(`确定将电脑端最低支持版本设为 v${v} 吗？\n低于 v${v} 的电脑端将无法连接服务器，必须升级后才能使用。`)) return;
+  await saveUpgrade(collectUpgrade());
+}
+
+async function clearDMin() {
+  if (!confirm('确定清除电脑端最低支持限制吗？')) return;
+  const p = collectUpgrade();
+  p.desktopMinVersion = '';
+  await saveUpgrade(p);
+}
+
+async function setAMin() {
+  const v = $('aMinInput').value.trim();
+  if (!v) { alert('请输入版本号（例如 5.6）'); return; }
+  if (!confirm(`确定将手机端最低支持版本设为 v${v} 吗？\n低于 v${v} 的手机端将无法激活/连接，必须升级后才能使用。`)) return;
+  await saveUpgrade(collectUpgrade());
+}
+
+async function clearAMin() {
+  if (!confirm('确定清除手机端最低支持限制吗？')) return;
+  const p = collectUpgrade();
+  p.androidMinVersion = '';
+  await saveUpgrade(p);
+}
+
 // ── 事件绑定 ──
 $('loginBtn').onclick = doLogin;
 $('loginPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
@@ -353,6 +532,19 @@ $('usbAddBtn').onclick = addUsb;
 $('usbIdInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addUsb(); });
 $('usbBatchBtn').onclick = batchUsb;
 $('usbFileBtn').onclick = () => $('usbFileInput').click();
+$('upgSetBtn').onclick = setUpgrade;
+$('upgVersionInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') setUpgrade(); });
+$('upgClearBtn').onclick = clearUpgrade;
+$('dMinSetBtn').onclick = setDMin;
+$('dMinInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') setDMin(); });
+$('dMinClearBtn').onclick = clearDMin;
+$('aMinSetBtn').onclick = setAMin;
+$('aMinInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') setAMin(); });
+$('aMinClearBtn').onclick = clearAMin;
+$('dBlockAddBtn').onclick = () => addBlocked('desktop');
+$('dBlockInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addBlocked('desktop'); });
+$('aBlockAddBtn').onclick = () => addBlocked('android');
+$('aBlockInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addBlocked('android'); });
 $('usbFileInput').addEventListener('change', (e) => {
   const f = e.target.files[0];
   if (!f) return;
@@ -370,6 +562,7 @@ setInterval(() => {
   if (adminToken && !$('mainView').classList.contains('hidden')) {
     refreshStats();
     loadHosts();
+    loadUpgrade();
   }
 }, 10000);
 
@@ -383,6 +576,7 @@ setInterval(() => {
       refreshStats();
       loadHosts();
       loadUsbIds();
+      loadUpgrade();
       return;
     } catch (e) { logout(); }
   }

@@ -9,6 +9,8 @@ import 'version.dart';
 class UpdateInfo {
   final String latest; // 服务器最新版本
   final bool needUpdate; // 是否需要升级
+  final bool urgent; // v6.23+ 重要升级（服务器紧急线标记，立即弹窗提示）
+  final bool force; // v6.24+ 版本不再支持（服务器下线线标记，强制升级）
   final String? url; // 升级包下载地址（相对路径）
   final String notes; // 更新说明
   final String? md5; // 升级包 MD5（静默升级完整性校验；null 时回退手动下载）
@@ -16,6 +18,8 @@ class UpdateInfo {
   const UpdateInfo({
     required this.latest,
     required this.needUpdate,
+    this.urgent = false,
+    this.force = false,
     this.url,
     this.notes = '',
     this.md5,
@@ -24,6 +28,8 @@ class UpdateInfo {
   factory UpdateInfo.fromJson(Map<String, dynamic> json) => UpdateInfo(
         latest: json['latest']?.toString() ?? '',
         needUpdate: json['needUpdate'] == true,
+        urgent: json['urgent'] == true,
+        force: json['force'] == true,
         url: json['url']?.toString(),
         notes: json['notes']?.toString() ?? '',
         md5: json['md5']?.toString(),
@@ -46,7 +52,7 @@ Future<UpdateInfo?> checkDesktopUpdate() async {
     final info =
         UpdateInfo.fromJson(jsonDecode(body) as Map<String, dynamic>);
     AppLog.i('update', '检查升级: 当前 v$appVersion, 最新 ${info.latest}, '
-        '需升级=${info.needUpdate}');
+        '需升级=${info.needUpdate}, 强制=${info.force}, 重要=${info.urgent}');
     return info;
   } catch (e) {
     AppLog.w('update', '升级检查失败（忽略）', e);

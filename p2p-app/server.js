@@ -21,12 +21,16 @@
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import { randomBytes, scryptSync, timingSafeEqual, createHmac, createHash } from 'crypto';
+import { randomBytes, scryptSync, timingSafeEqual, createHmac, createHash, createCipheriv, createDecipheriv } from 'crypto';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// ── 凭证落盘加密（等保一级整改 v2.14）────────────────────────────
+// ENC_KEY: 32 字节 hex（64 字符），由 env.sh 注入；未配置时明文模式（仅本地开发）
+const ENC_KEY = process.env.ENC_KEY || '';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -52,13 +56,73 @@ const PORT = process.env.PORT || 3000;
 // 规则: 手机端 / 电脑端 / 服务器端 三端版本互相独立（vX.Y）
 // - 只要某端代码有修改，该端版本号 +0.1（v1.0 → v1.1 → v1.2 ...）
 // - 本文件同时记录三端最新版本，便于 /version 统一核对
-const SERVER_VERSION = '2.13';  // 服务器端版本
-const DESKTOP_VERSION = '6.19';  // 电脑端版本
-const ANDROID_VERSION = '5.29'; // 手机端版本
+const SERVER_VERSION = '2.21';  // 服务器端版本
+const DESKTOP_VERSION = '6.27';  // 电脑端版本（与电脑端 version.dart 保持一致）
+const ANDROID_VERSION = '5.42'; // 手机端版本
 // 手机端最低可用版本（v2.7+ 强制升级）：低于此版本的手机端一律拒绝
 // 激活与连接（update-check 返回 force；激活/信令返回 APP_VERSION_REQUIRED），
-// 必须升级到最新版才能正常使用
+// 必须升级到最新版才能正常使用。v2.17+ 改由 upgrade-config.json 配置接管，
+// 此常量仅作为旧配置文件无该字段时的初始默认值（现网行为不变）
 const MIN_ANDROID_VERSION = '5.6';
+// 电脑端重要升级线（v2.15+）：当前版本低于此线时 update-check 返回 urgent=true，
+// 客户端收到后立即弹“重要升级”窗并切换每 5 分钟高频检查，直到升级完成。
+// v2.16+：改为运行时可变状态——管理后台 /api/admin/upgrade 或 release.sh urgent
+// 参数写入 upgrade-config.json 持久化（服务重启不丢失）；下方常量仅作初始默认值
+const DESKTOP_URGENT_VERSION_INIT = '';
+const UPGRADE_CONFIG_FILE = join(__dirname, 'upgrade-config.json');
+
+// v2.17+ 升级/支持策略配置：
+// { desktopUrgentVersion: 电脑端重要升级线, desktopMinVersion: 电脑端最低支持版本,
+//   androidMinVersion: 手机端最低支持版本, desktopBlockedVersions: 电脑端停用版本列表,
+//   androidBlockedVersions: 手机端停用版本列表 }——空串 = 不限制/未启用
+function loadUpgradeConfig() {
+  const cfg = loadJson(UPGRADE_CONFIG_FILE, null);
+  const out = { urgent: '', desktopMin: '', androidMin: null, hasAndroidMin: false,
+    desktopBlocked: [], androidBlocked: [] };
+  if (!cfg || typeof cfg !== 'object') return out;
+  out.urgent = typeof cfg.desktopUrgentVersion === 'string'
+      ? cfg.desktopUrgentVersion.trim() : '';
+  out.desktopMin = typeof cfg.desktopMinVersion === 'string'
+      ? cfg.desktopMinVersion.trim() : '';
+  out.hasAndroidMin = Object.prototype.hasOwnProperty.call(cfg, 'androidMinVersion');
+  out.androidMin = out.hasAndroidMin && typeof cfg.androidMinVersion === 'string'
+      ? cfg.androidMinVersion.trim() : '';
+  const parseList = (v) => Array.isArray(v)
+      ? [...new Set(v.map((x) => String(x).trim()).filter((x) => x !== ''))]
+      : [];
+  out.desktopBlocked = parseList(cfg.desktopBlockedVersions);
+  out.androidBlocked = parseList(cfg.androidBlockedVersions);
+  return out;
+}
+
+const cfg0 = loadUpgradeConfig();
+let desktopUrgentVersion = cfg0.urgent || DESKTOP_URGENT_VERSION_INIT;
+let desktopMinVersion = cfg0.desktopMin; // 电脑端最低支持版本（'' = 不限制）
+// 手机端最低支持版本：旧配置文件无该字段时沿用常量初始值（现网行为不变）；
+// 管理端显式设置空 = 明确取消限制
+let androidMinVersion = cfg0.hasAndroidMin ? cfg0.androidMin : MIN_ANDROID_VERSION;
+// v2.18+ 指定停用版本（黑名单）：精确下架有故障/有风险的特定版本（高于最低线也可停用）
+let desktopBlockedVersions = cfg0.desktopBlocked || [];
+let androidBlockedVersions = cfg0.androidBlocked || [];
+if (desktopUrgentVersion) console.log(`[升级] 重要升级线已加载: v${desktopUrgentVersion}`);
+if (desktopMinVersion) console.log(`[升级] 电脑端最低支持版本已加载: v${desktopMinVersion}`);
+if (desktopBlockedVersions.length) console.log(`[升级] 电脑端停用版本已加载: v${desktopBlockedVersions.join(', v')}`);
+if (androidBlockedVersions.length) console.log(`[升级] 手机端停用版本已加载: v${androidBlockedVersions.join(', v')}`);
+
+// v2.18+ 版本支持判定：黑名单精确命中（指定版本已停用）或低于最低支持线 = 不再支持。
+// 返回 { blocked, reason, minVersion }，reason 区分两种拒绝原因供客户端提示
+function checkVersionBlocked(platform, version) {
+  const minVer = platform === 'android' ? androidMinVersion : desktopMinVersion;
+  const blockedList = platform === 'android' ? androidBlockedVersions : desktopBlockedVersions;
+  const v = String(version || '');
+  if (blockedList.includes(v)) {
+    return { blocked: true, reason: 'VERSION_BLOCKED', minVersion: minVer || '' };
+  }
+  if (minVer && (!v || verNum(v) < verNum(minVer))) {
+    return { blocked: true, reason: 'VERSION_NOT_SUPPORTED', minVersion: minVer };
+  }
+  return { blocked: false, reason: '', minVersion: minVer || '' };
+}
 
 // 版本查询接口：调试时确认各端是否最新
 app.get('/version', (req, res) => {
@@ -176,15 +240,24 @@ app.get('/update-check', async (req, res) => {
   const file = platform === 'android' ? 'app-release.apk' : 'p2p_desktop.zip';
   const hasFile = await upgradeFileExists(file);
   const needUpdate = hasFile && verNum(latest) > verNum(current);
-  // v2.7+ 强制升级：手机端版本低于最低可用版本时标记强制更新
-  const force = platform === 'android' && verNum(current) > 0 &&
-      verNum(current) < verNum(MIN_ANDROID_VERSION);
+  // v2.7+/v2.17+/v2.18+ 不再支持：命中停用版本列表（黑名单）或低于最低支持版本时
+  // 标记 force（手机端沿用拒绝激活/连接机制；电脑端 v6.24+ 客户端弹强制升级窗）。
+  // 由管理后台配置，空 = 不限制
+  const minVer = platform === 'android' ? androidMinVersion : desktopMinVersion;
+  const blk = checkVersionBlocked(platform, current);
+  const force = blk.blocked ||
+      (!!minVer && verNum(current) > 0 && verNum(current) < verNum(minVer));
+  // v2.15+ 重要升级：电脑端当前版本低于紧急线时标记 urgent
+  // （客户端收到后立即弹窗提示并高频检查，普通升级仍按客户端低频策略）
+  const urgent = platform === 'desktop' && needUpdate &&
+      !!desktopUrgentVersion && verNum(current) < verNum(desktopUrgentVersion);
   res.json({
     platform,
     current,
     latest,
     needUpdate: needUpdate || force,
     force,
+    urgent,
     url: hasFile ? `/downloads/${file}` : null,
     // 手机端升级提示附带安装引导：v5.0 及以下老版本无安装权限引导，
     // 需用户先在系统设置手动开启“安装未知应用”（Android 8+ 硬前提）
@@ -258,14 +331,8 @@ function getOrCreatePairCode() {
 const HOST_CODES_FILE = join(process.cwd(), 'host-codes.json');
 
 function loadHostCodes() {
-  try {
-    if (existsSync(HOST_CODES_FILE)) {
-      const codes = JSON.parse(readFileSync(HOST_CODES_FILE, 'utf-8'));
-      if (codes && typeof codes === 'object') return codes;
-    }
-  } catch (e) {
-    console.error(`[配对码] 读取 ${HOST_CODES_FILE} 失败: ${e.message}`);
-  }
+  const codes = loadJsonEnc(HOST_CODES_FILE, {});
+  if (codes && typeof codes === 'object') return codes;
   return {};
 }
 
@@ -280,7 +347,7 @@ function getOrCreateHostCode(deviceId) {
       (existsSync(PAIR_CODE_FILE) && code === readFileSync(PAIR_CODE_FILE, 'utf-8').trim()));
   if (deviceId) {
     codes[deviceId] = code;
-    saveJson(HOST_CODES_FILE, codes);
+    saveJsonEnc(HOST_CODES_FILE, codes);
     console.log(`[配对码] 新设备 ${deviceId} → ${code}`);
   }
   return code;
@@ -295,7 +362,7 @@ function resetHostCode(deviceId) {
   } while (Object.values(codes).includes(code) ||
       (existsSync(PAIR_CODE_FILE) && code === readFileSync(PAIR_CODE_FILE, 'utf-8').trim()));
   codes[deviceId] = code;
-  saveJson(HOST_CODES_FILE, codes);
+  saveJsonEnc(HOST_CODES_FILE, codes);
   console.log(`[配对码] 设备 ${deviceId} 重新生成 → ${code}`);
   return code;
 }
@@ -326,12 +393,12 @@ function getCurrentPairCode() {
 // shareRegistry: { token: { token, deviceId, pairCode, hostName, name,
 //   folder, perms[], targetDeviceId|null, createdAt, updatedAt } }
 const SHARES_FILE = join(process.cwd(), 'shares.json');
-let shareRegistry = loadJson(SHARES_FILE, {});
+let shareRegistry = loadJsonEnc(SHARES_FILE, {});
 if (!shareRegistry || typeof shareRegistry !== 'object') shareRegistry = {};
 
 function saveShares() {
   try {
-    saveJson(SHARES_FILE, shareRegistry);
+    saveJsonEnc(SHARES_FILE, shareRegistry);
   } catch (e) {
     console.error(`[共享] 保存 ${SHARES_FILE} 失败: ${e.message}`);
   }
@@ -343,12 +410,12 @@ function saveShares() {
 // 独立存储：电脑端 /api/shares/sync 全量覆盖不会冲掉绑定关系。
 // 绑定结构: { deviceId: { token: joinedAt } }
 const JOIN_FILE = join(process.cwd(), 'join-relations.json');
-let joinRelations = loadJson(JOIN_FILE, {});
+let joinRelations = loadJsonEnc(JOIN_FILE, {});
 if (!joinRelations || typeof joinRelations !== 'object') joinRelations = {};
 
 function saveJoinRelations() {
   try {
-    saveJson(JOIN_FILE, joinRelations);
+    saveJsonEnc(JOIN_FILE, joinRelations);
   } catch (e) {
     console.error(`[共享] 保存 ${JOIN_FILE} 失败: ${e.message}`);
   }
@@ -357,11 +424,11 @@ function saveJoinRelations() {
 // 电脑端 HTTP 同步认证：host:register 时注册的 hostToken（防伪造共享上报）
 const HOST_TOKENS_FILE = join(process.cwd(), 'host-tokens.json');
 function loadHostTokens() {
-  return loadJson(HOST_TOKENS_FILE, {});
+  return loadJsonEnc(HOST_TOKENS_FILE, {});
 }
 function saveHostTokens(ht) {
   try {
-    saveJson(HOST_TOKENS_FILE, ht);
+    saveJsonEnc(HOST_TOKENS_FILE, ht);
   } catch (e) {
     console.error(`[共享] 保存 ${HOST_TOKENS_FILE} 失败: ${e.message}`);
   }
@@ -417,14 +484,8 @@ const BUY_CONTACT = {
 };
 
 function loadLicenses() {
-  try {
-    if (existsSync(LICENSES_FILE)) {
-      const data = JSON.parse(readFileSync(LICENSES_FILE, 'utf-8'));
-      if (data && Array.isArray(data.usbIds)) return data;
-    }
-  } catch (e) {
-    console.error(`[授权] 读取 ${LICENSES_FILE} 失败: ${e.message}`);
-  }
+  const data = loadJsonEnc(LICENSES_FILE, null);
+  if (data && Array.isArray(data.usbIds)) return data;
   return { usbIds: [] };
 }
 const licenses = loadLicenses();
@@ -445,6 +506,67 @@ function loadJson(file, fallback) {
 
 function saveJson(file, data) {
   writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+// ── 凭证落盘加密（等保一级整改 v2.14）──────────────────────────────
+// 对含 token/pairCode/folder 路径等敏感字段的文件整体加密存储（AES-256-GCM），
+// 密钥 ENC_KEY 仅存于 env.sh（与数据分离）；读取时自动解密，
+// 旧明文文件首次加载时自动迁移为加密存储。
+function encryptJson(data) {
+  if (!ENC_KEY) return data; // 未配置密钥：明文模式（仅本地开发）
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', Buffer.from(ENC_KEY, 'hex'), iv);
+  const enc = Buffer.concat([
+    cipher.update(JSON.stringify(data), 'utf8'),
+    cipher.final(),
+  ]);
+  return {
+    __enc: true,
+    v: 1,
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    data: enc.toString('base64'),
+  };
+}
+
+function decryptJson(raw) {
+  if (!raw || !raw.__enc) return raw;
+  if (!ENC_KEY) throw new Error('ENC_KEY 未配置，无法解密');
+  const decipher = createDecipheriv(
+      'aes-256-gcm',
+      Buffer.from(ENC_KEY, 'hex'),
+      Buffer.from(raw.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(raw.tag, 'base64'));
+  const plain = Buffer.concat([
+    decipher.update(Buffer.from(raw.data, 'base64')),
+    decipher.final(),
+  ]);
+  return JSON.parse(plain.toString('utf8'));
+}
+
+function saveJsonEnc(file, data) {
+  saveJson(file, encryptJson(data));
+}
+
+/** 读取敏感数据文件：加密格式自动解密；旧明文自动迁移为加密存储 */
+function loadJsonEnc(file, fallback) {
+  const raw = loadJson(file, null);
+  if (raw === null) return fallback;
+  if (raw && raw.__enc) {
+    try {
+      return decryptJson(raw);
+    } catch (e) {
+      console.error(`[存储] 解密 ${file} 失败: ${e.message}`);
+      return fallback;
+    }
+  }
+  try {
+    saveJson(file, encryptJson(raw)); // 旧明文 → 自动加密迁移
+    console.log(`[存储] ${file} 已迁移为加密存储`);
+  } catch (e) {
+    console.error(`[存储] 加密迁移 ${file} 失败: ${e.message}`);
+  }
+  return raw;
 }
 
 // 管理后台库: { admin: { username, salt, hash, createdAt } }
@@ -482,10 +604,10 @@ ensureAdmin();
 
 // ── Token 管理 ───────────────────────────────────────────────
 const TOKEN_TTL_MS = 30 * 24 * 3600 * 1000; // 30 天
-const tokens = loadJson(TOKENS_FILE, {});
+const tokens = loadJsonEnc(TOKENS_FILE, {});
 
 function saveTokens() {
-  saveJson(TOKENS_FILE, tokens);
+  saveJsonEnc(TOKENS_FILE, tokens);
 }
 
 function createToken(uid, role) {
@@ -529,12 +651,12 @@ const ACT_CODE_TTL_MS = 24 * 3600 * 1000; // 激活码 24 小时有效
 const actCodes = new Map(); // code -> { pairCode, type, createdAt }
 const usedCodes = new Map(); // code -> usedAt（防重放，保留 24h）
 const ACT_DEVICES_FILE = join(process.cwd(), 'act-devices.json');
-let actDevices = loadJson(ACT_DEVICES_FILE, {}); // deviceId -> { token, createdAt }
+let actDevices = loadJsonEnc(ACT_DEVICES_FILE, {}); // deviceId -> { token, createdAt }
 if (!actDevices || typeof actDevices !== 'object') actDevices = {};
 
 function saveActDevices() {
   try {
-    saveJson(ACT_DEVICES_FILE, actDevices);
+    saveJsonEnc(ACT_DEVICES_FILE, actDevices);
   } catch (e) {
     console.error(`[激活] 保存 ${ACT_DEVICES_FILE} 失败: ${e.message}`);
   }
@@ -586,9 +708,11 @@ function requireAdmin(req, res, next) {
 // - 服务器不存用户个人信息，仅存临时凭证（act-devices.json）
 app.post('/api/activate', (req, res) => {
   const version = String(req.body?.version || '');
-  // v2.7+ 强制升级：旧版手机端（低于最低可用版本）拒绝激活
-  if (!version || verNum(version) < verNum(MIN_ANDROID_VERSION)) {
-    log(`[激活] 拒绝: 旧版手机端 v${version || '未知'}（最低 v${MIN_ANDROID_VERSION}）`);
+  // v2.7+/v2.17+/v2.18+ 强制升级：命中停用版本列表或低于最低支持版本（配置可调）
+  // 的手机端拒绝激活（androidMinVersion 为空 = 不限制；无版本号的异常请求一律拒绝）
+  const blk = checkVersionBlocked('android', version);
+  if (!version || blk.blocked || verNum(version) < verNum(androidMinVersion)) {
+    log(`[激活] 拒绝: 手机端 v${version || '未知'}${blk.reason === 'VERSION_BLOCKED' ? '（版本已停用）' : `（最低 v${androidMinVersion || '未限制'}）`}`);
     return res.json({ ok: false, error: 'APP_VERSION_REQUIRED', latest: ANDROID_VERSION });
   }
   const code = String(req.body?.code || '').trim().toUpperCase();
@@ -847,7 +971,7 @@ app.post('/api/admin/usb/add', requireAdmin, (req, res) => {
     return res.json({ ok: false, error: `ID ${id} 已存在` });
   }
   licenses.usbIds.push({ id, note, createdAt: Date.now() });
-  saveJson(LICENSES_FILE, licenses);
+  saveJsonEnc(LICENSES_FILE, licenses);
   console.log(`[授权] 添加U盘ID: ${id} ${note ? `(${note})` : ''}`);
   res.json({ ok: true });
 });
@@ -874,7 +998,7 @@ app.post('/api/admin/usb/batch', requireAdmin, (req, res) => {
     licenses.usbIds.push({ id: row, note: '', createdAt: Date.now() });
     added++;
   }
-  saveJson(LICENSES_FILE, licenses);
+  saveJsonEnc(LICENSES_FILE, licenses);
   console.log(`[授权] 批量添加: 成功 ${added} / 跳过重复 ${skipped} / 无效 ${invalid.length}`);
   res.json({ ok: true, added, skipped, invalid });
 });
@@ -887,9 +1011,103 @@ app.delete('/api/admin/usb/:id', requireAdmin, (req, res) => {
   if (licenses.usbIds.length === before) {
     return res.json({ ok: false, error: 'ID 不存在' });
   }
-  saveJson(LICENSES_FILE, licenses);
+  saveJsonEnc(LICENSES_FILE, licenses);
   console.log(`[授权] 删除U盘ID: ${id}`);
   res.json({ ok: true });
+});
+
+// ── 升级管理（v2.16+）────────────────────────────────────────
+// 重要升级线 / 最低支持版本（不再支持下线线）可视化维护：管理后台可随时设置/取消，
+// 写入 upgrade-config.json 持久化。设置后立即向所有在线电脑端广播 upgrade:notify
+// （客户端秒级检查；低于下线线的新客户端弹强制升级窗）。
+
+// 查询升级/支持策略状态
+app.get('/api/admin/upgrade', requireAdmin, (req, res) => {
+  res.json({
+    ok: true,
+    desktopLatest: DESKTOP_VERSION,
+    androidLatest: ANDROID_VERSION,
+    desktopUrgentVersion: desktopUrgentVersion || null,
+    desktopMinVersion: desktopMinVersion || null,
+    androidMinVersion: androidMinVersion || null,
+    desktopBlockedVersions: desktopBlockedVersions,
+    androidBlockedVersions: androidBlockedVersions,
+    urgentActive: !!desktopUrgentVersion,
+  });
+});
+
+// 设置/取消升级策略：三个字段均可传，空串表示取消对应设置；
+// 停用版本列表传数组 = 整体替换（不传 = 保持不变）
+app.post('/api/admin/upgrade', requireAdmin, (req, res) => {
+  const parse = (v) => {
+    const s = String(v ?? '').trim();
+    return s === '' ? null : s;
+  };
+  const parseList = (v) => {
+    if (!Array.isArray(v)) return null; // 未传 = 不修改
+    return [...new Set(v.map((x) => String(x).trim()).filter((x) => x !== ''))];
+  };
+  const urgent = parse(req.body?.desktopUrgentVersion);
+  const dMin = parse(req.body?.desktopMinVersion);
+  const aMin = parse(req.body?.androidMinVersion);
+  const dBlocked = parseList(req.body?.desktopBlockedVersions);
+  const aBlocked = parseList(req.body?.androidBlockedVersions);
+  // 校验：版本号 X.Y 格式；最低支持/紧急线/停用版本不能高于对应平台最新版（否则永远升不上去）
+  const fieldErr = (name, v, max) => {
+    if (v === null) return null;
+    if (!/^\d+\.\d+$/.test(v)) return `${name} 版本号格式应为 X.Y（例如 6.24）`;
+    if (verNum(v) > verNum(max)) return `${name} 不能高于最新版本 v${max}`;
+    return null;
+  };
+  const listErr = (name, list, max) => {
+    if (list === null) return null;
+    for (const v of list) {
+      const e = fieldErr(name, v, max);
+      if (e) return e;
+    }
+    return null;
+  };
+  const err = fieldErr('重要升级线', urgent, DESKTOP_VERSION)
+      || fieldErr('电脑端最低支持版本', dMin, DESKTOP_VERSION)
+      || fieldErr('手机端最低支持版本', aMin, ANDROID_VERSION)
+      || listErr('电脑端停用版本', dBlocked, DESKTOP_VERSION)
+      || listErr('手机端停用版本', aBlocked, ANDROID_VERSION);
+  if (err) return res.json({ ok: false, error: err });
+  const changed = urgent !== desktopUrgentVersion
+      || dMin !== desktopMinVersion
+      || aMin !== androidMinVersion
+      || (dBlocked !== null && JSON.stringify(dBlocked) !== JSON.stringify(desktopBlockedVersions))
+      || (aBlocked !== null && JSON.stringify(aBlocked) !== JSON.stringify(androidBlockedVersions));
+  if (dBlocked !== null) desktopBlockedVersions = dBlocked;
+  if (aBlocked !== null) androidBlockedVersions = aBlocked;
+  desktopUrgentVersion = urgent || '';
+  desktopMinVersion = dMin || '';
+  androidMinVersion = aMin || '';
+  saveJson(UPGRADE_CONFIG_FILE, {
+    desktopUrgentVersion: desktopUrgentVersion || null,
+    desktopMinVersion: desktopMinVersion || null,
+    androidMinVersion: androidMinVersion || null,
+    desktopBlockedVersions: desktopBlockedVersions.length ? desktopBlockedVersions : null,
+    androidBlockedVersions: androidBlockedVersions.length ? androidBlockedVersions : null,
+  });
+  log(`[管理] 升级策略更新: 重要升级线=${desktopUrgentVersion || '无'} `
+      + `电脑端最低支持=${desktopMinVersion || '无'} 手机端最低支持=${androidMinVersion || '无'} `
+      + `电脑端停用=${desktopBlockedVersions.join(',') || '无'} 手机端停用=${androidBlockedVersions.join(',') || '无'}`);
+  if (!changed) return res.json({ ok: true, changed: false, pushed: 0 });
+  // 有变更时立即广播给所有在线电脑端：收到后马上检查并弹窗，秒级生效
+  let pushed = 0;
+  for (const s of io.sockets.sockets.values()) {
+    if (s.role === 'host' && s.connected) {
+      s.emit('upgrade:notify', { platform: 'desktop', latest: DESKTOP_VERSION });
+      pushed++;
+    }
+  }
+  if (pushed > 0) log(`[管理] 已向 ${pushed} 台在线电脑端推送升级通知`);
+  // v2.19+：策略变更后同时通知各电脑的管理员手机端（可远程确认升级）
+  let adminPushed = 0;
+  for (const pairCode of sessions.keys()) adminPushed += notifyAdminUpgrade(pairCode);
+  if (adminPushed > 0) log(`[管理] 已向 ${adminPushed} 个管理员手机端推送电脑端升级提示`);
+  res.json({ ok: true, changed: true, pushed });
 });
 
 // ── 静态文件 ─────────────────────────────────────────────────
@@ -926,6 +1144,34 @@ function issueTurnCredential() {
 }
 
 // ── Socket.IO 信令 ───────────────────────────────────────────
+// v2.19+ 电脑端升级提示推送：发布新版/策略变更/电脑注册时，向该电脑的
+// 管理员手机端推送升级提示（手机端可远程确认升级）。actDevices 记录
+// 激活设备与配对码的绑定关系，type='admin' 才推送
+function notifyAdminUpgrade(pairCode) {
+  const session = sessions.get(pairCode);
+  if (!session?.hostInfo) return 0;
+  const current = session.hostInfo.version || '';
+  const latest = DESKTOP_VERSION;
+  if (!current || verNum(current) >= verNum(latest)) return 0; // 已最新不推
+  const urgent = !!desktopUrgentVersion && verNum(current) < verNum(desktopUrgentVersion);
+  const payload = {
+    latest,
+    current,
+    urgent,
+    hostName: session.hostInfo.name || '电脑',
+  };
+  let pushed = 0;
+  for (const s of io.sockets.sockets.values()) {
+    if (s.role !== 'client' || !s.connected || !s.deviceId) continue;
+    if (s.pairCode !== pairCode) continue;
+    const rec = actDevices[s.deviceId];
+    if (!rec || rec.type !== 'admin' || rec.pairCode !== pairCode) continue;
+    s.emit('upgrade:desktop-notify', payload);
+    pushed++;
+  }
+  return pushed;
+}
+
 io.on('connection', (socket) => {
   log(`[连接] ${socket.id} 新连接`);
 
@@ -935,6 +1181,20 @@ io.on('connection', (socket) => {
   // 空消息防御：恶意/异常客户端发空 body 会触发解构崩溃，必须先判空
   socket.on('host:register', (msg) => {
     const { deviceName, desktop, version, deviceId, hostToken, activationCodes } = msg || {};
+    // v2.17+/v2.18+ 不再支持：命中停用版本列表（VERSION_BLOCKED）或低于最低支持线
+    // （VERSION_NOT_SUPPORTED）时拒绝注册并断开连接。新客户端（v6.24+）收到
+    // host:error 弹强制升级窗；旧客户端表现为连接被断开（无法获取配对码/信令转发），
+    // 由管理后台设置，立即生效
+    const blk = checkVersionBlocked('desktop', version);
+    if (blk.blocked) {
+      log(`[拒绝] 电脑端${blk.reason === 'VERSION_BLOCKED' ? '版本已停用' : '版本已不再支持'}: ${deviceName || '电脑'} v${version || '未知'}（最低 v${blk.minVersion || '未限制'}）`);
+      socket.emit('host:error', {
+        reason: blk.reason,
+        minVersion: blk.minVersion,
+        latest: DESKTOP_VERSION,
+      });
+      return socket.disconnect(true);
+    }
     // v2.4+：绑定主机令牌（电脑端本地生成并持久化，供共享同步接口认证）
     if (deviceId && hostToken) {
       const ht = loadHostTokens();
@@ -983,6 +1243,18 @@ io.on('connection', (socket) => {
     // 同步该电脑的未用激活码（生成/撤销后也走 host:sync-codes 增量同步）
     syncActivationCodes(deviceId, pairCode, activationCodes);
     socket.emit('host:registered', { pairCode });
+    // v2.15+ 及时升级：注册上报版本落后于最新版时主动推送升级通知。
+    // 服务重启/发布后客户端 Socket.IO 自动重连并重新注册，秒级收到通知，
+    // 无需等待客户端自身的定时检查（常开主机也能及时收到新版提示）
+    if (version && String(version) &&
+        verNum(String(version)) < verNum(DESKTOP_VERSION) &&
+        upgradeFileExists('p2p_desktop.zip')) {
+      socket.emit('upgrade:notify', {
+        platform: 'desktop',
+        latest: DESKTOP_VERSION
+      });
+      log(`[推送] 电脑端 v${version} 落后于最新 v${DESKTOP_VERSION}，已推送升级通知`);
+    }
     // 手机端已在等待（注册前 join 成功）：补发 joined 给两端，
     // 电脑端立即发起 offer，手机端确认配对——避免双方互相等待的死锁
     if (clients.size > 0) {
@@ -1009,6 +1281,11 @@ io.on('connection', (socket) => {
       }
     }
     log(`[注册] ${deviceName || '电脑'}${version ? ' v' + version : ''} → 配对码 ${pairCode} (socket=${socket.id})`);
+    // v2.19+ 电脑端注册后若有新版：通知其管理员手机端（发布新版/重启后即时提醒）
+    if (version && verNum(String(version)) < verNum(DESKTOP_VERSION)) {
+      const n = notifyAdminUpgrade(pairCode);
+      if (n > 0) log(`[升级] 已向 ${n} 个管理员手机端推送电脑端升级提示 (${pairCode})`);
+    }
   });
 
   // 电脑端同步激活码（v2.6+）：生成/撤销激活码后增量同步，幂等覆盖该设备码表
@@ -1018,6 +1295,59 @@ io.on('connection', (socket) => {
     if (socket.role !== 'host' || !socket.pairCode) return;
     syncActivationCodes(socket.deviceId, socket.pairCode, codes);
     socket.emit('host:codes-synced', { ok: true });
+  });
+
+  // 管理员手机端确认电脑端升级（v2.19+）：仅管理员手机端可确认
+  // （校验激活设备身份 type='admin' 且配对码一致，双重防冒用），
+  // 确认后通知电脑端静默升级，结果即时回执；电脑端不在线则失败
+  socket.on('upgrade:confirm', () => {
+    if (socket.role !== 'client' || !socket.pairCode || !socket.deviceId) return;
+    const rec = actDevices[socket.deviceId];
+    const isAdmin = rec && rec.type === 'admin' && rec.pairCode === socket.pairCode;
+    if (!isAdmin) {
+      socket.emit('upgrade:desktop-result', {
+        ok: false,
+        error: '无权限：仅管理员可确认电脑端升级',
+      });
+      return;
+    }
+    const hostId = sessions.get(socket.pairCode)?.hostSocketId;
+    if (!hostId || !io.sockets.sockets.has(hostId)) {
+      socket.emit('upgrade:desktop-result', {
+        ok: false,
+        error: '电脑端不在线，请稍后再试',
+      });
+      return;
+    }
+    io.to(hostId).emit('upgrade:confirmed', { latest: DESKTOP_VERSION });
+    log(`[升级] 管理员手机端 ${socket.deviceId} 已确认电脑端升级 (${socket.pairCode})`);
+    socket.emit('upgrade:desktop-result', {
+      ok: true,
+      message: '已通知电脑端升级',
+    });
+  });
+
+  // 电脑端上报升级结果（v2.19+）：静默升级失败时上报，服务器转发给
+  // 该配对码下的管理员手机端（成功时电脑端会重启退出，无需上报）
+  socket.on('upgrade:desktop-result', (msg) => {
+    if (socket.role !== 'host' || !socket.pairCode) return;
+    const { ok, error } = msg || {};
+    if (ok) return;
+    let pushed = 0;
+    for (const s of io.sockets.sockets.values()) {
+      if (s.role !== 'client' || !s.connected || !s.deviceId) continue;
+      if (s.pairCode !== socket.pairCode) continue;
+      const rec = actDevices[s.deviceId];
+      if (!rec || rec.type !== 'admin' || rec.pairCode !== socket.pairCode) continue;
+      s.emit('upgrade:desktop-result', {
+        ok: false,
+        error: error || '电脑端自动升级失败，请到电脑前手动处理',
+      });
+      pushed++;
+    }
+    if (pushed > 0) {
+      log(`[升级] 电脑端升级失败已通知 ${pushed} 个管理员手机端 (${socket.pairCode})`);
+    }
   });
 
   // 电脑端主动离线（v2.5+）：删除会话并通知手机端断开——与意外断线
@@ -1075,9 +1405,9 @@ io.on('connection', (socket) => {
     // 手机端加入公共流程：配对码（client:join）与共享码（client:join-by-share）
   // 两种入口复用同一路由逻辑（免配对码连接由服务器按共享注册表解析出 pairCode）
   function joinClient(socket, { pairCode, deviceName, deviceId, shareToken, activationCode, version }) {
-    // v2.7+ 强制升级：旧版手机端（低于最低可用版本）拒绝连接
-    if (!version || verNum(version) < verNum(MIN_ANDROID_VERSION)) {
-      log(`[强制升级] 拒绝旧版手机端连接: ${deviceName || '手机'} v${version || '未知'}（最低 v${MIN_ANDROID_VERSION}）`);
+    // v2.7+/v2.17+ 强制升级：旧版手机端（低于最低支持版本，配置可调）拒绝连接
+    if (!version || verNum(version) < verNum(androidMinVersion)) {
+      log(`[强制升级] 拒绝旧版手机端连接: ${deviceName || '手机'} v${version || '未知'}（最低 v${androidMinVersion || '未限制'}）`);
       return socket.emit('client:error', { reason: 'APP_VERSION_REQUIRED', latest: ANDROID_VERSION });
     }
     let session = sessions.get(pairCode);
@@ -1123,6 +1453,9 @@ io.on('connection', (socket) => {
     });
     socket.pairCode = pairCode;
     socket.role = 'client';
+    // v2.19+：socket 上标记设备标识，供升级确认/结果转发的管理员身份校验
+    // （notifyAdminUpgrade 遍历时按 actDevices[socket.deviceId] 判定管理员）
+    socket.deviceId = deviceId || null;
     socket.hostSocketId = session.hostSocketId;
 
     socket.emit('client:joined', {
@@ -1142,6 +1475,27 @@ io.on('connection', (socket) => {
     });
     console.log(`[配对] ${deviceName || '手机'}${version ? ' v' + version : ''} → ${pairCode} → ${session.hostInfo.name}${session.hostInfo.version ? ' v' + session.hostInfo.version : ''}`);
     log(`[配对] 成功: ${deviceName || '手机'}${version ? ' v' + version : ''} (socket=${socket.id}, deviceId=${deviceId || '无'}, activationCode=${activationCode ? '有' : '无'}) → 电脑=${session.hostInfo.name}${session.hostInfo.version ? ' v' + session.hostInfo.version : ''} (socket=${session.hostSocketId})`);
+    // v2.21+ 补登记激活设备：旧设备（act-devices 持久化启用前激活、重启后
+    // 记录丢失）携带激活码 join 时自动恢复管理员身份，使升级推送/远程确认
+    // 恢复可用；幂等：已有记录不覆盖（保留原 token/type/pairCode）
+    // token 置 null：服务器已无旧 token，绑定设备凭 join 记录仍可拉取共享
+    if (deviceId && activationCode && !actDevices[deviceId]) {
+      actDevices[deviceId] = {
+        token: null,
+        pairCode,
+        type: 'admin',
+        createdAt: Date.now(),
+      };
+      saveActDevices();
+      log(`[激活] 补登记管理员设备: ${deviceId} → 配对码 ${pairCode}`);
+    }
+    // v2.20+ 手机端配对成功后补推：电脑端先在线、手机端后上线时也能收到升级提示
+    // （notifyAdminUpgrade 内部按 actDevices 判定，仅推给 type='admin' 且配对码一致的手机端）
+    const hv = session.hostInfo.version || '';
+    if (hv && verNum(hv) < verNum(DESKTOP_VERSION)) {
+      const n = notifyAdminUpgrade(pairCode);
+      if (n > 0) log(`[升级] 已向 ${n} 个管理员手机端补推电脑端升级提示 (${pairCode})`);
+    }
   }
 
   socket.on('client:join', (msg) => {
@@ -1170,8 +1524,8 @@ io.on('connection', (socket) => {
   // 空消息防御：恶意/异常客户端发空 body 会触发解构崩溃，必须先判空
   socket.on('client:join-by-share', (msg) => {
     const { token, deviceId, deviceToken, version, deviceName } = msg || {};
-    // v2.7+ 强制升级：旧版手机端（低于最低可用版本）拒绝免配对码连接
-    if (!version || verNum(version) < verNum(MIN_ANDROID_VERSION)) {
+    // v2.7+/v2.17+ 强制升级：旧版手机端（低于最低支持版本，配置可调）拒绝免配对码连接
+    if (!version || verNum(version) < verNum(androidMinVersion)) {
       log(`[强制升级] 拒绝旧版手机端免配对码连接: ${deviceName || '手机'} v${version || '未知'}`);
       return socket.emit('client:error', { reason: 'APP_VERSION_REQUIRED', latest: ANDROID_VERSION });
     }

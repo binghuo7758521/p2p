@@ -510,7 +510,8 @@ class _ShareFolderDialogState extends State<_ShareFolderDialog> {
                   scrollDirection: Axis.horizontal,
                   children: [
                     ActionChip(
-                      label: const Text('远程电脑'),
+                      label: Text(controller.hostName ?? '远程电脑',
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
                       onPressed: () => controller.navigatePick(-1),
                     ),
                     for (var i = 0; i < segments.length; i++)

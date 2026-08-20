@@ -12,6 +12,7 @@ import 'auto_login.dart';
 import 'host_service.dart';
 import 'models.dart';
 import 'protocol.dart';
+import 'update_service.dart';
 
 /// 电脑端连接状态
 enum HostState {
@@ -269,6 +270,23 @@ class HostController extends ChangeNotifier {
     // 每 30 秒扫描一次活跃接收：无进展超时后置错并回包，避免永久卡「正在发送」
     _recvTimeoutTimer = Timer.periodic(
         const Duration(seconds: 30), (_) => _checkRecvTimeouts());
+    // v6.23+ 及时升级：服务器推送新版通知 → 立即检查升级（不等 6 小时定时）
+    _service.onUpgradeNotify = () => UpdateService.instance.checkNow();
+    // v6.24+ 服务器拒绝注册：版本已不再支持 → 触发检查弹强制升级窗（force）
+    _service.onVersionNotSupported = (minVersion) {
+      AppLog.i('host', '版本已不再支持（最低 v$minVersion），触发强制升级检查');
+      UpdateService.instance.checkNow();
+    };
+    // v6.26+ 管理员手机端确认升级：跳过确认窗直接静默升级，
+    // 失败时上报服务器转发给管理员手机端（成功时进程重启退出）
+    _service.onUpgradeConfirmed = (latest) {
+      AppLog.i('host', '管理员已确认升级到 v$latest，开始静默升级');
+      unawaited(UpdateService.instance.upgradeNow(
+        onResult: (ok, error) {
+          if (!ok) _service.reportUpgradeResult(false, error);
+        },
+      ));
+    };
     _service.onRegistered = (code) {
       pairCode = code;
       state = HostState.registered;

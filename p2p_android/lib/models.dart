@@ -106,6 +106,10 @@ class TransferItem {
   final String? localPath;
   /// 下载：电脑端文件路径（断点续传用）
   final String? remotePath;
+  /// 传输对象电脑端名称（创建时快照，v5.37+；旧数据为空）
+  final String peerName;
+  /// 完成/失败时间（进行中为 null，v5.37+；旧数据为空）
+  DateTime? endTime;
 
   TransferItem({
     required this.id,
@@ -119,6 +123,8 @@ class TransferItem {
     this.connType = 'unknown',
     this.localPath,
     this.remotePath,
+    this.peerName = '',
+    this.endTime,
   });
 
   double get progress => total > 0 ? (transferred / total).clamp(0.0, 1.0) : 0.0;
@@ -136,6 +142,8 @@ class TransferItem {
         'connType': connType,
         if (localPath != null) 'localPath': localPath,
         if (remotePath != null) 'remotePath': remotePath,
+        if (peerName.isNotEmpty) 'peerName': peerName,
+        if (endTime != null) 'endTime': endTime!.toIso8601String(),
       };
 
   factory TransferItem.fromJson(Map<String, dynamic> j) => TransferItem(
@@ -151,6 +159,8 @@ class TransferItem {
         connType: j['connType']?.toString() ?? 'unknown',
         localPath: j['localPath']?.toString(),
         remotePath: j['remotePath']?.toString(),
+        peerName: j['peerName']?.toString() ?? '',
+        endTime: DateTime.tryParse(j['endTime']?.toString() ?? ''),
       );
 
   void update(int transferredBytes, int elapsedMs) {
@@ -161,5 +171,11 @@ class TransferItem {
           ? '${(bps / (1024 * 1024)).toStringAsFixed(1)} MB/s'
           : '${(bps / 1024).toStringAsFixed(0)} KB/s';
     }
+  }
+
+  /// 传输结束（v5.37+）：设置终态并定格完成时间（历史记录显示固定不再变）
+  void finish(String status) {
+    this.status = status;
+    endTime ??= DateTime.now();
   }
 }

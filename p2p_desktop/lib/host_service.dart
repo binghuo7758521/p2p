@@ -217,6 +217,7 @@ class HostService {
   Timer? _reconnectTimer;
   int _reconnectAttempts = 0;
   bool _disposed = false;
+  bool _stopReconnect = false; // v6.24+ 服务器拒绝（版本不再支持）后停止重连
 
   /// 网络类型变化监听（A方案）：WiFi↔以太网切换时重启 ICE 重新选路，
   /// 期望中转会话切回直连（重选失败则维持中转，不影响连接）
@@ -235,6 +236,12 @@ class HostService {
   void Function(String reason)? onKicked;
   /// 激活码被手机端兑换（服务器通知，电脑端管理页标记已用）
   void Function(String code)? onCodeUsed;
+  /// 服务器推送升级通知（v6.23+）：发布新版后主动推送，客户端立即检查升级
+  void Function()? onUpgradeNotify;
+  /// 服务器拒绝注册：版本已不再支持（v6.24+），停止重连并触发强制升级检查
+  void Function(String minVersion)? onVersionNotSupported;
+  /// 管理员手机端已确认升级（v6.26+）：收到后立即静默升级，不再弹确认窗
+  void Function(String latest)? onUpgradeConfirmed;
 
   /// 当前在线手机端会话列表（clientId -> session）
   Map<String, PeerSession> get sessions => _sessions;
@@ -263,6 +270,7 @@ class HostService {
     await dispose();
     _disposed = false;
     _reconnectAttempts = 0;
+    _stopReconnect = false;
     _serverUrl = serverUrl.replaceAll(RegExp(r'/$'), '');
     _socket = io.io(
       serverUrl,
@@ -318,6 +326,39 @@ class HostService {
       if (code.isNotEmpty) {
         AppLog.i('host', '激活码已被手机端使用: $code');
         onCodeUsed?.call(code);
+      }
+    });
+
+    // 服务器推送升级通知（v6.23+）：发布新版后 Socket.IO 秒级推送，
+    // 无需等待 6 小时定时检查；由 HostController 转发给 UpdateService 立即弹窗
+    _socket!.on('upgrade:notify', (data) {
+      final latest = data is Map ? data['latest']?.toString() ?? '' : '';
+      AppLog.i('host', '收到服务器升级通知: 最新 v$latest');
+      onUpgradeNotify?.call();
+    });
+
+    // 管理员手机端确认升级（v6.26+）：服务器已校验管理员身份，
+    // 由 HostController 转发给 UpdateService 跳过确认窗直接静默升级
+    _socket!.on('upgrade:confirmed', (data) {
+      final latest = data is Map ? data['latest']?.toString() ?? '' : '';
+      AppLog.i('host', '管理员已确认升级，开始静默升级: 最新 v$latest');
+      onUpgradeConfirmed?.call(latest);
+    });
+
+    // v6.24+/v6.25+ 服务器拒绝注册：命中停用版本列表（VERSION_BLOCKED）或低于
+    // 最低支持线（VERSION_NOT_SUPPORTED）。停止自动重连（重连也会被拒），
+    // 由 HostController 触发强制升级检查
+    _socket!.on('host:error', (data) {
+      final reason = data is Map ? data['reason']?.toString() ?? '' : '';
+      final minVersion =
+          data is Map ? data['minVersion']?.toString() ?? '' : '';
+      if (reason == 'VERSION_NOT_SUPPORTED' || reason == 'VERSION_BLOCKED') {
+        AppLog.w('host', '服务器拒绝注册: ${reason == 'VERSION_BLOCKED' ? '版本已停用' : '版本已不再支持'}（最低 v$minVersion）');
+        _stopReconnect = true;
+        onVersionNotSupported?.call(minVersion);
+      } else {
+        AppLog.w('host', '服务器错误: $reason');
+        onError?.call(reason);
       }
     });
 
@@ -403,7 +444,7 @@ class HostService {
 
   /// 调度 socket 自动重连（断开后保持等待手机状态）
   void _scheduleReconnect() {
-    if (_disposed) return;
+    if (_disposed || _stopReconnect) return; // v6.24+ 被服务器拒绝后不再重连
     _reconnectTimer?.cancel();
     final backoff = _reconnectAttempts >= 5 ? 30 : (1 << _reconnectAttempts);
     _reconnectAttempts++;
@@ -610,6 +651,14 @@ class HostService {
     if (!isConnected) return;
     _socket!.emit('host:sync-codes', {'codes': codes});
     AppLog.i('host', '激活码已同步服务器: ${codes.length} 个');
+  }
+
+  /// 上报升级结果到服务器（v6.26+）：静默升级失败时上报，服务器转发给
+  /// 管理员手机端；成功时电脑端会重启退出，无需上报
+  void reportUpgradeResult(bool ok, String error) {
+    if (!isConnected) return;
+    _socket!.emit('upgrade:desktop-result', {'ok': ok, 'error': error});
+    AppLog.i('host', '升级结果已上报: ok=$ok ${error.isEmpty ? '' : error}');
   }
 
   /// 全量同步共享配置到服务器（v5.0+）：创建/删除/改权限/启动注册后调用，

@@ -101,7 +101,8 @@ class _ShareBrowsePageState extends State<ShareBrowsePage> {
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
         children: [
           ActionChip(
-            label: const Text('远程电脑'),
+            label: Text(controller.hostName ?? '远程电脑',
+                maxLines: 1, overflow: TextOverflow.ellipsis),
             onPressed: () => controller.navigateShareTo(-1),
           ),
           for (var i = 0; i < controller.shareCrumbs.length; i++)
