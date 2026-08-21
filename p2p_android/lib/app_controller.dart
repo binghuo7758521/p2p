@@ -7,10 +7,13 @@ import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'ads_service.dart';
 import 'app_log.dart';
 import 'auth_service.dart';
 import 'models.dart';
@@ -168,8 +171,31 @@ class DesktopUpgradeInfo {
   });
 }
 
+/// 后台横幅通知（v5.45+）：服务器管理后台通过 /api/admin/notify 推送，
+/// 仅内存展示（服务器无持久化，App 重启后清空）
+class AdminNotice {
+  /// 服务器生成的通知唯一 id（去重用）
+  final String id;
+
+  /// 标题（≤50 字）
+  final String title;
+
+  /// 内容（≤500 字）
+  final String message;
+
+  /// 收到时间
+  final DateTime ts;
+
+  const AdminNotice({
+    required this.id,
+    required this.title,
+    required this.message,
+    required this.ts,
+  });
+}
+
 /// 全局控制器：编排信令、WebRTC 数据通道与文件传输
-class AppController extends ChangeNotifier {
+class AppController extends ChangeNotifier with WidgetsBindingObserver {
   final SignalingService _signaling = SignalingService();
   final RtcService _rtc = RtcService();
 
@@ -224,6 +250,30 @@ class AppController extends ChangeNotifier {
   // ── 电脑端升级提示（v5.42+）────────────────────────────
   DesktopUpgradeInfo? _desktopUpgrade;
   DesktopUpgradeInfo? get desktopUpgrade => _desktopUpgrade;
+
+  // ── 广告位（v5.46+）───────────────────────────────────
+  AdInfo? _ad;
+  AdInfo? get ad => _ad;
+
+  /// 本次运行内用户已手动关闭广告（重启后恢复显示）
+  bool _adDismissed = false;
+
+  /// 当前时间是否在广告投放期内（v5.47+；每分钟定时刷新）
+  bool _adInSchedule = true;
+
+  /// 投放期定时检查（App 长挂时到点自动显示/隐藏）
+  Timer? _adScheduleTimer;
+
+  /// 是否显示广告：已拉到配置、在投放期内且本次运行未关闭
+  bool get showAd => _ad != null && !_adDismissed && _adInSchedule;
+
+  // ── 后台横幅通知（v5.45+）──
+  /// 通知队列：最新的在最前，最多保留 5 条，关一条自动显示下一条
+  final List<AdminNotice> adminNotices = [];
+
+  /// 当前应展示的横幅（无则 null）
+  AdminNotice? get currentAdminNotice =>
+      adminNotices.isEmpty ? null : adminNotices.first;
   AdminClaimRequest? _adminClaimRequest; // 已有其他管理员：更换确认请求
   bool _adminClaimDismissed = false; // 本会话已拒绝更换，不再重复弹窗
   AdminClaimRequest? get adminClaimRequest => _adminClaimRequest;
@@ -331,6 +381,7 @@ class AppController extends ChangeNotifier {
   Timer? _reconnectTimer;
   Timer? _connectTimer; // 连接超时兜底（避免无限“正在连接”）
   int _reconnectAttempts = 0;
+  bool _reconnectRunning = false; // 重连循环是否在运行（v5.43+ 防重复启动/计数重置）
   final List<ResumeUpload> _resumeUploads = []; // 断线时中断的上传队列
   ResumeDownload? _resumeDownload; // 断线时中断的下载
   bool _resuming = false; // 防止重连恢复逻辑重复执行
@@ -341,6 +392,7 @@ class AppController extends ChangeNotifier {
     _loadTransfers();
     _loadRememberedUploadDir();
     _initDeviceId();
+    refreshAd(); // v5.46+ 广告位：启动拉取一次（失败静默，下次广播/重启重试）
     _rtc.sendSignal = _signaling.sendSignal;
     // 连接方式探测完成：及时刷新 UI（直连/服务器中转徽标），
     // 否则探测结果要等下次其他刷新事件才能显示（如下拉刷新）
@@ -396,6 +448,8 @@ class AppController extends ChangeNotifier {
     _signaling.onPeerDisconnected = _onPeerLost;
     _signaling.onDesktopUpgradeNotify = _onDesktopUpgradeNotify;
     _signaling.onDesktopUpgradeResult = _onDesktopUpgradeResult;
+    _signaling.onAdminNotice = _onAdminNotice; // v5.45+ 后台横幅通知
+    _signaling.onAdsUpdate = refreshAd; // v5.46+ 广告位变更广播
     _rtc.messages.listen(_onChannelMessage);
     _rtc.stateChanges.listen((open) {
       AppLog.i('rtc', '数据通道状态变化: ${open ? 'OPEN' : 'CLOSED'} (当前state=$state)');
@@ -416,11 +470,57 @@ class AppController extends ChangeNotifier {
         _maybeAuthVerify();
         // 自动重连成功（数据通道恢复）：续传断线时中断的传输
         _resumePendingTransfers();
+        // v5.43+：连接成功启动后台保活前台服务（退后台不中断自动重连）
+        unawaited(_startKeepAlive());
       } else if (!open && state == ConnectState.peerConnected) {
         _onPeerLost();
       }
     });
     AppLog.i('app', 'AppController 初始化完成');
+    // v5.43+：监听 App 生命周期，回前台时若处于断线重连中立即重试
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  /// v5.43+：连接成功后启动后台保活前台服务（Android 13+ 顺带请求通知权限）
+  Future<void> _startKeepAlive() async {
+    try {
+      await FlutterForegroundTask.requestNotificationPermission();
+      await FlutterForegroundTask.startService(
+        serviceTypes: const [ForegroundServiceTypes.dataSync],
+        notificationTitle: '无限大盘',
+        notificationText: '保持与电脑端的连接，电脑端上线时自动重连',
+        notificationIcon: const NotificationIcon(
+          metaDataName: 'p2p_notification_icon',
+        ),
+      );
+      AppLog.i('connect', '前台保活服务已启动');
+    } catch (e) {
+      AppLog.w('connect', '前台保活服务启动失败（不影响连接）', e);
+    }
+  }
+
+  /// v5.43+：用户主动断开时停止前台保活服务
+  void _stopKeepAlive() {
+    try {
+      FlutterForegroundTask.stopService();
+      AppLog.i('connect', '前台保活服务已停止');
+    } catch (_) {
+      // 服务未启动时 stop 会抛异常，忽略即可
+    }
+  }
+
+  /// v5.43+：App 回到前台时若处于断线重连中，立即触发一轮重连，
+  /// 避免后台冻结导致重连长时间无动作（电脑端上线后仍需等退避）
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
+    if (lifecycle == AppLifecycleState.resumed &&
+        state == ConnectState.lost &&
+        !_manualDisconnect) {
+      AppLog.i('connect', 'App 回到前台，立即触发重连');
+      _reconnectTimer?.cancel();
+      _reconnectRunning = true;
+      _doReconnect();
+    }
   }
 
   /// 生成并持久化设备唯一标识（多用户身份，重新安装后变化）
@@ -595,6 +695,65 @@ class AppController extends ChangeNotifier {
     _startAutoReconnect();
   }
 
+  // ── 后台横幅通知（v5.45+）──
+  /// 收到服务器管理后台推送的横幅通知：去重后入队（最新在前），
+  /// 队列超过 5 条丢弃最旧；任何连接状态下都通知 UI 展示
+  void _onAdminNotice(Map<String, dynamic> info) {
+    final id = info['id']?.toString() ?? '';
+    final title = info['title']?.toString() ?? '';
+    final message = info['message']?.toString() ?? '';
+    if (title.isEmpty && message.isEmpty) return;
+    // 去重：同一 id 重复推送（网络重试等）不重复入队
+    if (id.isNotEmpty && adminNotices.any((n) => n.id == id)) return;
+    AppLog.i('notice', '收到后台横幅通知: $title');
+    adminNotices.insert(0, AdminNotice(
+      id: id,
+      title: title,
+      message: message,
+      ts: DateTime.now(),
+    ));
+    while (adminNotices.length > 5) {
+      adminNotices.removeLast();
+    }
+    notifyListeners();
+  }
+
+  /// 关闭当前横幅，自动显示下一条（如有）
+  void dismissAdminNotice() {
+    if (adminNotices.isEmpty) return;
+    adminNotices.removeAt(0);
+    notifyListeners();
+  }
+
+  // ── 广告位（v5.46+）──
+  /// 拉取广告配置（启动时调用；后台变更广播 ads:update 时也调用）
+  Future<void> refreshAd() async {
+    final ad = await fetchAd();
+    _ad = ad;
+    _adInSchedule = ad?.isInSchedule(DateTime.now()) ?? true;
+    _startAdScheduleTimer();
+    notifyListeners();
+  }
+
+  /// 每分钟检查一次投放期：进入/退出时段时刷新 UI（无广告则不启动）
+  void _startAdScheduleTimer() {
+    _adScheduleTimer?.cancel();
+    if (_ad == null) return;
+    _adScheduleTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      final inSchedule = _ad?.isInSchedule(DateTime.now()) ?? true;
+      if (inSchedule != _adInSchedule) {
+        _adInSchedule = inSchedule;
+        notifyListeners();
+      }
+    });
+  }
+
+  /// 关闭广告（本次运行内隐藏，重启后恢复显示）
+  void dismissAd() {
+    _adDismissed = true;
+    notifyListeners();
+  }
+
   // ── 电脑端升级提示（v5.42+）──────────────────────────
   /// 服务器推送电脑端升级提示：仅管理员手机端收到。
   /// 电脑端已是最新（推送时点过后已升级）则清除提示
@@ -710,40 +869,56 @@ class AppController extends ChangeNotifier {
 
   /// 自动重连循环：指数退避（1s→30s），重连成功后等待电脑端重新 offer
   void _startAutoReconnect() {
+    // v5.43+：已有活动重连循环时不再重复启动（旧实现每次重置退避计数，
+    // 双重重连叠加时导致无限从头重试）
+    if (_reconnectRunning) return;
     _reconnectAttempts = 0;
     _reconnectTimer?.cancel();
-    _reconnectLoop();
+    _reconnectRunning = true;
+    _scheduleReconnect(0);
   }
 
-  Future<void> _reconnectLoop() async {
+  /// 安排一轮重连（指数退避：1s,2s,4s...上限 30s）
+  void _scheduleReconnect(int attempt) {
+    _reconnectAttempts = attempt;
+    final delay = attempt == 0 ? 1 : (attempt > 5 ? 30 : 2 * attempt);
+    AppLog.i('reconnect', '第${attempt + 1}次重试，${delay}s后重建连接');
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(Duration(seconds: delay), _doReconnect);
+  }
+
+  /// 重建信令连接 + 重置 WebRTC（旧 PeerConnection 已失效，等待新 offer）
+  Future<void> _doReconnect() async {
     final server = _lastServer;
     final code = _lastCode;
-    if (server == null || code == null) return;
-    while (state == ConnectState.lost && !_manualDisconnect) {
-      final delay = _reconnectAttempts == 0
-          ? 1
-          : (_reconnectAttempts > 5 ? 30 : 2 * _reconnectAttempts);
-      _reconnectAttempts++;
-      AppLog.i('reconnect', '第$_reconnectAttempts次重试，${delay}s后重建连接');
-      await Future.delayed(Duration(seconds: delay));
-      if (state != ConnectState.lost || _manualDisconnect) return;
-      try {
-        // 重建信令连接 + 重置 WebRTC（旧 PeerConnection 已失效，等待新 offer）
-        await _rtc.init();
-        await _signaling.connect(
-          serverUrl: server,
-          pairCode: code,
-          deviceName: 'Android',
-          deviceId: deviceId,
-          shareToken: _pendingShareToken,
-          activationCode: AuthService.instance.activationCode,
-          joinByShare: _shareConnectMode,
-        );
-        // 连接成功后 onConnect 自动 client:join；joined → paired 后电脑端发 offer
-        // 若 join 失败（配对码暂不可用，如电脑端重连中）继续循环重试
-      } catch (e) {
-        AppLog.e('reconnect', '重建连接失败，继续下一轮', e);
-      }
+    if (server == null || code == null) {
+      _reconnectRunning = false;
+      return;
+    }
+    if (state != ConnectState.lost || _manualDisconnect) {
+      _reconnectRunning = false;
+      return;
+    }
+    try {
+      await _rtc.init();
+      await _signaling.connect(
+        serverUrl: server,
+        pairCode: code,
+        deviceName: 'Android',
+        deviceId: deviceId,
+        shareToken: _pendingShareToken,
+        activationCode: AuthService.instance.activationCode,
+        joinByShare: _shareConnectMode,
+      );
+      // 连接成功后 onConnect 自动 client:join；joined → paired 后电脑端发 offer
+      // 若 join 失败（配对码暂不可用，如电脑端重连中）继续定时重试
+    } catch (e) {
+      AppLog.e('reconnect', '重建连接失败，继续下一轮', e);
+    }
+    if (state == ConnectState.lost && !_manualDisconnect) {
+      _scheduleReconnect(_reconnectAttempts + 1);
+    } else {
+      _reconnectRunning = false;
     }
   }
 
@@ -958,7 +1133,9 @@ class AppController extends ChangeNotifier {
     AppLog.i('connect', '用户主动断开连接');
     _manualDisconnect = true;
     _reconnectTimer?.cancel();
+    _reconnectRunning = false;
     _connectTimer?.cancel();
+    _stopKeepAlive();
     _resumeUploads.clear();
     _resumeDownload = null;
     _cleanupReceive();
@@ -2927,6 +3104,7 @@ class AppController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _adScheduleTimer?.cancel();
     _cleanupReceive();
     _signaling.dispose();
     _rtc.dispose();

@@ -7,19 +7,22 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
-    .container { max-width: 900px; margin: 0 auto; padding: 16px; }
+    .container { max-width: 1080px; margin: 0 auto; padding: 16px; }
     h1 { text-align: center; color: #38bdf8; margin-bottom: 20px; font-size: 1.3em; }
     .card { background: #1e293b; border-radius: 12px; padding: 16px; margin: 12px 0; border: 1px solid #334155; }
     .card-title { font-weight: bold; color: #7dd3fc; margin-bottom: 12px; font-size: 0.95em; }
     label { display: block; margin: 8px 0 4px; color: #94a3b8; font-size: 0.85em; }
     input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: 1em; }
+    textarea { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-family: monospace; resize: vertical; }
     button { padding: 10px 20px; border-radius: 8px; border: none; font-weight: bold; cursor: pointer; font-size: 0.9em; transition: all 0.2s; }
     .btn-primary { background: #2563eb; color: white; width: 100%; }
     .btn-primary:hover { background: #3b82f6; }
     .btn-primary:disabled { background: #475569; cursor: not-allowed; }
     .btn-sm { padding: 6px 14px; font-size: 0.8em; }
     .btn-green { background: #16a34a; color: white; }
+    .btn-green:hover { background: #22c55e; }
     .btn-red { background: #dc2626; color: white; }
+    .btn-red:hover { background: #ef4444; }
     .btn-ghost { background: #334155; color: #e2e8f0; }
     .btn-ghost:hover { background: #475569; }
     .status { text-align: center; padding: 10px; border-radius: 8px; margin: 10px 0; font-weight: bold; font-size: 0.9em; }
@@ -44,12 +47,29 @@
     .badge-active { background: #166534; color: #bbf7d0; }
     .badge-disabled { background: #7f1d1d; color: #fecaca; }
     .empty-state { text-align: center; padding: 24px; color: #64748b; }
-    .header-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-    .header-bar .brand { font-weight: bold; color: #38bdf8; }
+    .header-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; gap: 10px; flex-wrap: wrap; }
+    .header-bar .brand { font-weight: bold; color: #38bdf8; font-size: 1.05em; }
+    .header-right { display: flex; align-items: center; gap: 12px; }
+    .hdr-status { font-size: 0.8em; color: #4ade80; }
+    .hdr-status.err { color: #f87171; }
     .refresh-note { font-size: 0.75em; color: #64748b; text-align: center; margin-top: 16px; }
     .logout { background: #334155; color: #e2e8f0; padding: 6px 14px; font-size: 0.8em; }
     .logout:hover { background: #dc2626; }
     .actions { display: flex; gap: 6px; }
+    /* ── 页签导航 ── */
+    .tab-bar { display: flex; gap: 8px; margin-bottom: 14px; overflow-x: auto; padding-bottom: 2px; }
+    .tab-btn { background: #1e293b; color: #94a3b8; border: 1px solid #334155; padding: 10px 18px; border-radius: 10px; font-weight: 600; cursor: pointer; white-space: nowrap; font-size: 0.9em; }
+    .tab-btn:hover { color: #e2e8f0; border-color: #475569; }
+    .tab-btn.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+    /* ── 概览页 ── */
+    .overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+    .ov-card { cursor: pointer; transition: border-color 0.2s, transform 0.2s; }
+    .ov-card:hover { border-color: #38bdf8; transform: translateY(-1px); }
+    .ov-title { font-size: 0.85em; color: #94a3b8; margin-bottom: 8px; }
+    .ov-value { font-size: 1.5em; font-weight: bold; color: #38bdf8; }
+    .ov-sub { font-size: 0.78em; color: #64748b; margin-top: 6px; }
+    .ov-sub.blue { color: #7dd3fc; }
+    .table-wrap { overflow-x: auto; }
   </style>
 </head>
 <body>
@@ -72,153 +92,273 @@
   <div id="mainView" class="hidden">
     <div class="header-bar">
       <span class="brand">🛠️ P2P 管理后台</span>
-      <button class="logout" id="logoutBtn">退出登录</button>
+      <div class="header-right">
+        <span class="hdr-status" id="hdrStatus">● 连接中...</span>
+        <button class="logout" id="logoutBtn">退出登录</button>
+      </div>
     </div>
 
-    <!-- 系统运行状态 -->
+    <!-- 页签导航 -->
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="overview" onclick="switchTab('overview')">📊 概览</button>
+      <button class="tab-btn" data-tab="hosts" onclick="switchTab('hosts')">💻 电脑端</button>
+      <button class="tab-btn" data-tab="usb" onclick="switchTab('usb')">🔑 U盘授权</button>
+      <button class="tab-btn" data-tab="upgrade" onclick="switchTab('upgrade')">⬆️ 升级管理</button>
+      <button class="tab-btn" data-tab="notice" onclick="switchTab('notice')">📣 横幅通知</button>
+      <button class="tab-btn" data-tab="ads" onclick="switchTab('ads')">📢 广告位</button>
+    </div>
+
+    <!-- ═══ 概览页 ═══ -->
+    <div id="tab-overview" class="tab-page">
+      <div class="card">
+        <div class="card-title">📊 系统运行状态</div>
+        <div class="stats-grid">
+          <div class="stat-item">
+            <div class="stat-value ok" id="stStatus">-</div>
+            <div class="stat-label">服务状态</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value" id="stSessions">-</div>
+            <div class="stat-label">当前配对</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value" id="stUsers">-</div>
+            <div class="stat-label">注册用户</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value warn" id="stActive">-</div>
+            <div class="stat-label">活跃用户</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value" id="stUptime">-</div>
+            <div class="stat-label">运行时长</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value" id="stMemory">-</div>
+            <div class="stat-label">内存占用</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value" id="stNode">-</div>
+            <div class="stat-label">Node 版本</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value" id="stTime">-</div>
+            <div class="stat-label">服务器时间</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="overview-grid">
+        <div class="card ov-card" onclick="switchTab('hosts')">
+          <div class="ov-title">💻 运行的电脑端</div>
+          <div class="ov-value" id="ovHostTxt">-</div>
+          <div class="ov-sub blue">点击查看设备列表 →</div>
+        </div>
+        <div class="card ov-card" onclick="switchTab('usb')">
+          <div class="ov-title">🔑 U盘授权</div>
+          <div class="ov-value" id="ovUsbTxt">-</div>
+          <div class="ov-sub blue">管理加密狗白名单 →</div>
+        </div>
+        <div class="card ov-card" onclick="switchTab('upgrade')">
+          <div class="ov-title">⬆️ 升级策略</div>
+          <div class="ov-value" id="ovUpgTxt" style="font-size:1.2em">-</div>
+          <div class="ov-sub" id="ovUpgSub">-</div>
+        </div>
+      </div>
+
+      <div class="refresh-note">状态每 10 秒自动刷新</div>
+    </div>
+
+    <!-- ═══ 电脑端页 ═══ -->
+    <div id="tab-hosts" class="tab-page hidden">
+      <div class="card">
+        <div class="card-title">💻 运行的电脑端
+          <span id="hostSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>设备名称</th>
+                <th>配对码</th>
+                <th>版本</th>
+                <th>状态</th>
+                <th>连接手机</th>
+                <th>最近注册</th>
+              </tr>
+            </thead>
+            <tbody id="hostTable"></tbody>
+          </table>
+        </div>
+        <div id="hostEmpty" class="empty-state">暂无电脑端在线（已注册设备也会显示在此）</div>
+      </div>
+    </div>
+
+    <!-- ═══ U盘授权页 ═══ -->
+    <div id="tab-usb" class="tab-page hidden">
+      <div class="card">
+        <div class="card-title">🔑 U盘授权管理
+          <span id="usbSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
+        </div>
+        <div class="status status-info">
+          电脑端启动时会校验插入的U盘 ID 是否在此白名单中，无匹配则无法使用。<br>
+          获取U盘 ID：插入U盘后运行 <a href="/downloads/usb_id_tool.zip" style="color:#38bdf8">U盘ID查看工具</a>（下载解压后双击 exe）。
+        </div>
+        <label>单个添加（格式 XXXX-XXXX）</label>
+        <div class="toolbar">
+          <input type="text" id="usbIdInput" placeholder="例如 1A2B-3C4D" style="flex:2">
+          <input type="text" id="usbNoteInput" placeholder="备注（可选，如客户名）" style="flex:3">
+          <button class="btn-green" id="usbAddBtn" style="width:auto">添加</button>
+        </div>
+        <label>批量添加（每行一个 ID，支持 TXT 文件导入）</label>
+        <textarea id="usbBatchText" rows="5" placeholder="1A2B-3C4D&#10;5E6F-7A8B&#10;..."></textarea>
+        <div class="toolbar" style="margin-top:8px">
+          <button class="btn-ghost" id="usbFileBtn" style="width:auto">📄 选择 TXT 文件</button>
+          <button class="btn-primary" id="usbBatchBtn" style="width:auto">批量添加</button>
+        </div>
+        <input type="file" id="usbFileInput" accept=".txt,.csv" style="display:none">
+        <div id="usbBatchResult" class="status status-info hidden"></div>
+        <div class="table-wrap" style="margin-top:12px">
+          <table>
+            <thead>
+              <tr>
+                <th>U盘 ID</th>
+                <th>备注</th>
+                <th>添加时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="usbTable"></tbody>
+          </table>
+        </div>
+        <div id="usbEmpty" class="empty-state">暂无授权 U盘</div>
+      </div>
+    </div>
+
+    <!-- ═══ 升级管理页 ═══ -->
+    <div id="tab-upgrade" class="tab-page hidden">
+      <div class="card">
+        <div class="card-title">⬆️ 升级管理
+          <span id="upgSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
+        </div>
+        <div class="status status-info" id="upgStatus">加载中...</div>
+        <label>① 重要升级版本（低于此版本的电脑端将立即弹窗提示升级）</label>
+        <div class="toolbar">
+          <input type="text" id="upgVersionInput" placeholder="例如 6.24" style="flex:2">
+          <button class="btn-green" id="upgSetBtn" style="width:auto">设为重要升级</button>
+          <button class="btn-ghost" id="upgClearBtn" style="width:auto">取消重要升级</button>
+        </div>
+        <label>② 最低支持版本（低于此版本 = 不再支持，强制升级 / 拒绝连接）</label>
+        <div class="toolbar">
+          <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">电脑端</span>
+          <input type="text" id="dMinInput" placeholder="例如 6.20（留空 = 不限制）" style="flex:2">
+          <button class="btn-green" id="dMinSetBtn" style="width:auto">设为</button>
+          <button class="btn-ghost" id="dMinClearBtn" style="width:auto">清除</button>
+        </div>
+        <div class="toolbar">
+          <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">手机端</span>
+          <input type="text" id="aMinInput" placeholder="例如 5.6（留空 = 不限制）" style="flex:2">
+          <button class="btn-green" id="aMinSetBtn" style="width:auto">设为</button>
+          <button class="btn-ghost" id="aMinClearBtn" style="width:auto">清除</button>
+        </div>
+        <label>③ 指定停用版本（有故障/有风险的版本精确下架，即使高于最低支持线也拒绝连接）</label>
+        <div class="toolbar">
+          <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">电脑端</span>
+          <input type="text" id="dBlockInput" placeholder="例如 6.18" style="flex:1">
+          <button class="btn-green" id="dBlockAddBtn" style="width:auto">下架此版本</button>
+          <div id="dBlockTags" style="flex:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>
+        </div>
+        <div class="toolbar">
+          <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">手机端</span>
+          <input type="text" id="aBlockInput" placeholder="例如 5.9" style="flex:1">
+          <button class="btn-green" id="aBlockAddBtn" style="width:auto">下架此版本</button>
+          <div id="aBlockTags" style="flex:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 横幅通知页（v2.23+）═══ -->
+  <div id="tab-notice" class="tab-page hidden">
     <div class="card">
-      <div class="card-title">📊 系统运行状态</div>
-      <div class="stats-grid">
-        <div class="stat-item">
-          <div class="stat-value ok" id="stStatus">-</div>
-          <div class="stat-label">服务状态</div>
-        </div>
-        <div class="stat-item">
-          <div class="stat-value" id="stSessions">-</div>
-          <div class="stat-label">当前配对</div>
-        </div>
-        <div class="stat-item">
-          <div class="stat-value" id="stUsers">-</div>
-          <div class="stat-label">注册用户</div>
-        </div>
-        <div class="stat-item">
-          <div class="stat-value warn" id="stActive">-</div>
-          <div class="stat-label">活跃用户</div>
-        </div>
-        <div class="stat-item">
-          <div class="stat-value" id="stUptime">-</div>
-          <div class="stat-label">运行时长</div>
-        </div>
-        <div class="stat-item">
-          <div class="stat-value" id="stMemory">-</div>
-          <div class="stat-label">内存占用</div>
-        </div>
-        <div class="stat-item">
-          <div class="stat-value" id="stNode">-</div>
-          <div class="stat-label">Node 版本</div>
-        </div>
-        <div class="stat-item">
-          <div class="stat-value" id="stTime">-</div>
-          <div class="stat-label">服务器时间</div>
-        </div>
+      <div class="card-title">📣 横幅通知
+        <span id="noticeSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
       </div>
+      <div class="status status-info" style="text-align:left">
+        向手机端发送 App 内横幅通知（顶部弹出，可关闭）。<br>
+        仅推送给<b>当前在线</b>的手机端；离线手机端上线后不补发。
+      </div>
+      <label>通知标题（≤50 字）</label>
+      <input type="text" id="ntTitle" maxlength="50" placeholder="例如 系统维护通知">
+      <label>通知内容（≤500 字）</label>
+      <textarea id="ntMessage" rows="4" maxlength="500" placeholder="例如 服务器将于今晚 23:00 进行维护，期间连接可能短暂中断..."></textarea>
+      <label>发送范围</label>
+      <div style="display:flex;flex-direction:column;gap:6px;margin:4px 0 8px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.9em;color:#e2e8f0;margin:0">
+          <input type="radio" name="ntScope" value="all" checked onchange="ntScopeChanged()"> 全部在线手机端
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.9em;color:#e2e8f0;margin:0">
+          <input type="radio" name="ntScope" value="pairCode" onchange="ntScopeChanged()"> 指定电脑（该电脑连接的所有手机端）
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.9em;color:#e2e8f0;margin:0">
+          <input type="radio" name="ntScope" value="deviceId" onchange="ntScopeChanged()"> 指定手机设备
+        </label>
+      </div>
+      <div id="ntHostRow" class="hidden">
+        <label>选择电脑</label>
+        <select id="ntHostSel" style="width:100%;padding:12px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#e2e8f0"></select>
+      </div>
+      <div id="ntDeviceRow" class="hidden">
+        <label>选择手机端</label>
+        <select id="ntDeviceSel" style="width:100%;padding:12px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#e2e8f0"></select>
+      </div>
+      <div style="margin-top:14px">
+        <button class="btn-primary" id="ntSendBtn" style="width:auto">📣 发送通知</button>
+      </div>
+      <div id="ntResult" class="status status-info hidden"></div>
     </div>
+  </div>
 
-    <!-- 运行的电脑端 -->
+  <!-- ═══ 广告位页（v2.24+）═══ -->
+  <div id="tab-ads" class="tab-page hidden">
     <div class="card">
-      <div class="card-title">💻 运行的电脑端
-        <span id="hostSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
+      <div class="card-title">📢 广告位</div>
+      <div class="status status-info" style="text-align:left">
+        手机端内容区顶部展示（所有页签可见，用户可关闭）。<br>
+        图片/链接为可选项：有图片显示图片卡，无图片显示文字卡；有链接点击打开，无链接仅展示。
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>设备名称</th>
-            <th>配对码</th>
-            <th>版本</th>
-            <th>状态</th>
-            <th>连接手机</th>
-            <th>最近注册</th>
-          </tr>
-        </thead>
-        <tbody id="hostTable"></tbody>
-      </table>
-      <div id="hostEmpty" class="empty-state">暂无电脑端在线（已注册设备也会显示在此）</div>
-    </div>
-
-    <!-- U盘授权管理（加密狗白名单） -->
-    <div class="card">
-      <div class="card-title">🔑 U盘授权管理
-        <span id="usbSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+        <input type="checkbox" id="adEnabled" style="width:18px;height:18px"> 启用广告位
+      </label>
+      <label>图片地址（可选，http(s):// 开头）</label>
+      <input type="text" id="adImageUrl" placeholder="https://...">
+      <label>标题（≤50 字，启用时必填）</label>
+      <input type="text" id="adTitle" maxlength="50" placeholder="例如 无限大盘 AiNas 了解一下">
+      <label>描述（≤200 字）</label>
+      <textarea id="adMessage" rows="3" maxlength="200" placeholder="例如 安全高效的点对点文件传输服务..."></textarea>
+      <label>链接地址（可选，点击广告时打开）</label>
+      <input type="text" id="adLinkUrl" placeholder="https://...">
+      <label>开始日期（可选，留空不限；未到日期自动不展示）</label>
+      <input type="date" id="adStartDate">
+      <label>结束日期（可选，留空不限；到期自动停止展示）</label>
+      <input type="date" id="adEndDate">
+      <div style="margin-top:14px">
+        <button class="btn-primary" id="adSaveBtn" style="width:auto">💾 保存广告</button>
+        <span id="adResult" class="status status-info hidden" style="display:inline-block;margin-left:10px"></span>
       </div>
-      <div class="status status-info">
-        电脑端启动时会校验插入的U盘 ID 是否在此白名单中，无匹配则无法使用。<br>
-        获取U盘 ID：插入U盘后运行 <a href="/downloads/usb_id_tool.zip" style="color:#38bdf8">U盘ID查看工具</a>（下载解压后双击 exe）。
-      </div>
-      <label>单个添加（格式 XXXX-XXXX）</label>
-      <div class="toolbar">
-        <input type="text" id="usbIdInput" placeholder="例如 1A2B-3C4D" style="flex:2">
-        <input type="text" id="usbNoteInput" placeholder="备注（可选，如客户名）" style="flex:3">
-        <button class="btn-green" id="usbAddBtn" style="width:auto">添加</button>
-      </div>
-      <label>批量添加（每行一个 ID，支持 TXT 文件导入）</label>
-      <textarea id="usbBatchText" rows="5" placeholder="1A2B-3C4D&#10;5E6F-7A8B&#10;..." style="width:100%;padding:12px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;font-family:monospace;resize:vertical"></textarea>
-      <div class="toolbar" style="margin-top:8px">
-        <button class="btn-ghost" id="usbFileBtn" style="width:auto">📄 选择 TXT 文件</button>
-        <button class="btn-primary" id="usbBatchBtn" style="width:auto">批量添加</button>
-      </div>
-      <input type="file" id="usbFileInput" accept=".txt,.csv" style="display:none">
-      <div id="usbBatchResult" class="status status-info hidden"></div>
-      <table style="margin-top:12px">
-        <thead>
-          <tr>
-            <th>U盘 ID</th>
-            <th>备注</th>
-            <th>添加时间</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="usbTable"></tbody>
-      </table>
-      <div id="usbEmpty" class="empty-state">暂无授权 U盘</div>
-    </div>
-
-    <!-- 升级管理（重要升级线 / 最低支持版本） -->
-    <div class="card">
-      <div class="card-title">⬆️ 升级管理
-        <span id="upgSummary" style="font-weight:normal;font-size:0.8em;color:#94a3b8"></span>
-      </div>
-      <div class="status status-info" id="upgStatus">加载中...</div>
-      <label>① 重要升级版本（低于此版本的电脑端将立即弹窗提示升级）</label>
-      <div class="toolbar">
-        <input type="text" id="upgVersionInput" placeholder="例如 6.24" style="flex:2">
-        <button class="btn-green" id="upgSetBtn" style="width:auto">设为重要升级</button>
-        <button class="btn-ghost" id="upgClearBtn" style="width:auto">取消重要升级</button>
-      </div>
-      <label>② 最低支持版本（低于此版本 = 不再支持，强制升级 / 拒绝连接）</label>
-      <div class="toolbar">
-        <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">电脑端</span>
-        <input type="text" id="dMinInput" placeholder="例如 6.20（留空 = 不限制）" style="flex:2">
-        <button class="btn-green" id="dMinSetBtn" style="width:auto">设为</button>
-        <button class="btn-ghost" id="dMinClearBtn" style="width:auto">清除</button>
-      </div>
-      <div class="toolbar">
-        <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">手机端</span>
-        <input type="text" id="aMinInput" placeholder="例如 5.6（留空 = 不限制）" style="flex:2">
-        <button class="btn-green" id="aMinSetBtn" style="width:auto">设为</button>
-        <button class="btn-ghost" id="aMinClearBtn" style="width:auto">清除</button>
-      </div>
-      <label>③ 指定停用版本（有故障/有风险的版本精确下架，即使高于最低支持线也拒绝连接）</label>
-      <div class="toolbar">
-        <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">电脑端</span>
-        <input type="text" id="dBlockInput" placeholder="例如 6.18" style="flex:1">
-        <button class="btn-green" id="dBlockAddBtn" style="width:auto">下架此版本</button>
-        <div id="dBlockTags" style="flex:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>
-      </div>
-      <div class="toolbar">
-        <span style="width:70px;color:#94a3b8;font-size:0.85em;line-height:40px">手机端</span>
-        <input type="text" id="aBlockInput" placeholder="例如 5.9" style="flex:1">
-        <button class="btn-green" id="aBlockAddBtn" style="width:auto">下架此版本</button>
-        <div id="aBlockTags" style="flex:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>
+      <div style="margin-top:14px">
+        <div style="font-weight:bold;margin-bottom:8px">预览</div>
+        <div id="adPreview"></div>
       </div>
     </div>
-
-    <div class="refresh-note">状态每 10 秒自动刷新</div>
   </div>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let adminToken = localStorage.getItem('p2p_admin_token') || '';
+// U盘列表在登录时加载一次（概览页摘要需要），进入 U盘页不再重复请求
+let usbLoaded = true;
 
 function fmtTime(ms) {
   if (!ms) return '-';
@@ -258,6 +398,15 @@ function logout() {
   $('loginView').classList.remove('hidden');
 }
 
+// ── 页签切换 ──
+function switchTab(name) {
+  document.querySelectorAll('.tab-page').forEach((p) => p.classList.add('hidden'));
+  document.querySelectorAll('.tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
+  $('tab-' + name).classList.remove('hidden');
+  if (name === 'usb' && !usbLoaded) { usbLoaded = true; loadUsbIds(); }
+  if (name === 'ads' && !adsLoaded) { adsLoaded = true; loadAdConfig(); }
+}
+
 async function doLogin() {
   const username = $('loginUser').value.trim();
   const password = $('loginPass').value;
@@ -274,8 +423,10 @@ async function doLogin() {
     $('mainView').classList.remove('hidden');
     refreshStats();
     loadHosts();
-    loadUsbIds();
     loadUpgrade();
+    loadUsbIds();
+    loadNoticeTargets();
+    loadAdConfig();
   } catch (e) {
     errBox.textContent = e.message;
     errBox.classList.remove('hidden');
@@ -286,8 +437,11 @@ async function refreshStats() {
   try {
     const data = await api('/api/admin/stats');
     const s = data.stats;
-    $('stStatus').textContent = s.status === 'ok' ? '运行中' : '异常';
-    $('stStatus').className = 'stat-value ' + (s.status === 'ok' ? 'ok' : 'warn');
+    const ok = s.status === 'ok';
+    $('stStatus').textContent = ok ? '运行中' : '异常';
+    $('stStatus').className = 'stat-value ' + (ok ? 'ok' : 'warn');
+    $('hdrStatus').textContent = ok ? '● 服务运行中' : '● 服务异常';
+    $('hdrStatus').className = 'hdr-status' + (ok ? '' : ' err');
     $('stSessions').textContent = s.sessions;
     $('stUsers').textContent = s.users;
     $('stActive').textContent = s.activeUsers;
@@ -306,6 +460,7 @@ async function loadHosts() {
     $('hostEmpty').classList.toggle('hidden', data.hosts.length > 0);
     $('hostSummary').textContent =
         `在线 ${data.onlineCount} 台 / 已注册 ${data.hosts.length} 台`;
+    $('ovHostTxt').textContent = `在线 ${data.onlineCount} / 注册 ${data.hosts.length}`;
     for (const h of data.hosts) {
       const tr = document.createElement('tr');
       const name = h.name
@@ -330,6 +485,7 @@ async function loadUsbIds() {
     tbody.innerHTML = '';
     $('usbEmpty').classList.toggle('hidden', data.count > 0);
     $('usbSummary').textContent = `共 ${data.count} 个授权`;
+    $('ovUsbTxt').textContent = `已授权 ${data.count} 个`;
     for (const x of data.list) {
       const tr = document.createElement('tr');
       tr.innerHTML = `
@@ -426,6 +582,13 @@ async function loadUpgrade() {
     const aBlockTxt = aBlocked.length ? `<b>手机端停用：v${aBlocked.join('、v')}</b>：该版本拒绝激活` : '';
     status.className = 'status ' + ((data.urgentActive || data.desktopMinVersion || dBlocked.length) ? 'status-err' : 'status-info');
     status.innerHTML = `${urgentTxt}<br>${dMinTxt}<br>${aMinTxt}${dBlockTxt ? '<br>' + dBlockTxt : ''}${aBlockTxt ? '<br>' + aBlockTxt : ''}`;
+    // 概览页升级策略摘要
+    $('ovUpgTxt').textContent = data.urgentActive
+        ? `重要升级 v${data.desktopUrgentVersion} 起`
+        : '普通升级策略';
+    const dMin2 = data.desktopMinVersion ? `电脑 v${data.desktopMinVersion}` : '电脑不限';
+    const aMin2 = data.androidMinVersion ? `手机 v${data.androidMinVersion}` : '手机不限';
+    $('ovUpgSub').textContent = `最低支持 ${dMin2} / ${aMin2} · 停用 ${dBlocked.length + aBlocked.length} 个版本`;
   } catch (e) { /* 忽略，下一轮重试 */ }
 }
 
@@ -524,6 +687,140 @@ async function clearAMin() {
   await saveUpgrade(p);
 }
 
+// ── 横幅通知（v2.23+）──
+let onlineHosts = [];
+let onlineClients = [];
+
+// 发送范围切换：仅显示对应目标选择行
+function ntScopeChanged() {
+  const v = document.querySelector('input[name="ntScope"]:checked').value;
+  $('ntHostRow').classList.toggle('hidden', v !== 'pairCode');
+  $('ntDeviceRow').classList.toggle('hidden', v !== 'deviceId');
+}
+
+// 加载在线电脑/手机列表填充下拉（登录后与 10 秒轮询时刷新）
+async function loadNoticeTargets() {
+  try {
+    const [hosts, clients] = await Promise.all([
+      api('/api/admin/hosts'),
+      api('/api/admin/clients'),
+    ]);
+    onlineHosts = hosts.hosts.filter((h) => h.online);
+    onlineClients = clients.clients;
+    $('noticeSummary').textContent =
+        `在线 ${onlineClients.length} 台手机端 / ${onlineHosts.length} 台电脑`;
+    $('ntHostSel').innerHTML = onlineHosts.length
+        ? onlineHosts.map((h) =>
+            `<option value="${h.pairCode}">${h.name || '电脑'}（${h.pairCode}，${h.clientCount} 台手机）</option>`).join('')
+        : '<option value="">暂无在线电脑</option>';
+    // 仅列出有设备标识的客户端（deviceId 为空的共享访客无法精确寻址）
+    const withId = onlineClients.filter((c) => c.deviceId);
+    $('ntDeviceSel').innerHTML = withId.length
+        ? withId.map((c) =>
+            `<option value="${c.deviceId}">${c.name}${c.isAdmin ? '（管理员）' : ''}（${c.pairCode} · ${c.deviceId.slice(0, 8)}${c.version ? ' · v' + c.version : ''}）</option>`).join('')
+        : '<option value="">暂无在线手机端（需设备标识）</option>';
+  } catch (e) { /* 忽略，下一轮重试 */ }
+}
+
+async function sendNotice() {
+  const title = $('ntTitle').value.trim();
+  const message = $('ntMessage').value.trim();
+  if (!title) { alert('请输入通知标题'); return; }
+  if (!message) { alert('请输入通知内容'); return; }
+  const scope = document.querySelector('input[name="ntScope"]:checked').value;
+  const payload = { scope, title, message };
+  const scopeTxt = { all: '全部在线手机端' };
+  if (scope === 'pairCode') {
+    payload.pairCode = $('ntHostSel').value;
+    if (!payload.pairCode) { alert('请选择目标电脑'); return; }
+    scopeTxt.all = `配对码 ${payload.pairCode} 的手机端`;
+  } else if (scope === 'deviceId') {
+    payload.deviceId = $('ntDeviceSel').value;
+    if (!payload.deviceId) { alert('请选择目标设备'); return; }
+    scopeTxt.all = `设备 ${payload.deviceId.slice(0, 8)}`;
+  }
+  if (!confirm(`确定向${scopeTxt.all}发送横幅通知吗？`)) return;
+  try {
+    const data = await api('/api/admin/notify', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    const box = $('ntResult');
+    box.textContent = data.pushed > 0
+        ? `✅ 已送达 ${data.pushed} 台手机端`
+        : '已发送（当前无匹配的在线手机端，离线手机上线后收不到）';
+    box.classList.remove('hidden');
+  } catch (e) { alert(e.message); }
+}
+
+// ── 广告位（v2.24+）──
+let adsLoaded = false;
+
+// 预览 HTML 转义（防用户输入注入）
+const escHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// 渲染预览卡片（有图显示图、无图显示文字）
+function renderAdPreview() {
+  const enabled = $('adEnabled').checked;
+  const imageUrl = $('adImageUrl').value.trim();
+  const title = escHtml($('adTitle').value.trim());
+  const message = escHtml($('adMessage').value.trim());
+  const linkUrl = $('adLinkUrl').value.trim();
+  const startDate = $('adStartDate').value;
+  const endDate = $('adEndDate').value;
+  if (!enabled) {
+    $('adPreview').innerHTML = '<div class="status status-info">广告未启用</div>';
+    return;
+  }
+  const titleHtml = `<b>${title || '（无标题）'}</b>`;
+  const msgHtml = message ? `<div style="font-size:0.85em;color:#94a3b8;margin-top:2px">${message}</div>` : '';
+  const linkHtml = linkUrl ? `<div style="font-size:0.8em;color:#38bdf8;margin-top:4px">🔗 ${escHtml(linkUrl)}</div>` : '';
+  // v2.25+：投放期（留空=不限）
+  const periodHtml = (startDate || endDate)
+      ? `<div style="font-size:0.8em;color:#94a3b8;margin-top:4px">📅 投放期：${startDate || '不限'} 至 ${endDate || '不限'}</div>`
+      : '';
+  const style = 'border:1px solid #475569;border-radius:8px;overflow:hidden;max-width:420px';
+  $('adPreview').innerHTML = imageUrl
+      ? `<div style="${style}"><img src="${escHtml(imageUrl)}" style="width:100%;display:block;max-height:140px;object-fit:cover" onerror="this.style.display='none'"><div style="padding:8px 12px">${titleHtml}${msgHtml}${linkHtml}${periodHtml}</div></div>`
+      : `<div style="${style};padding:12px;background:#1e3a5f">📢 ${titleHtml}${msgHtml}${linkHtml}${periodHtml}</div>`;
+}
+
+// 拉取当前广告配置回填表单（首次进入页签时调用）
+async function loadAdConfig() {
+  try {
+    const data = await api('/api/ads');
+    const ad = data.ad;
+    $('adEnabled').checked = !!ad;
+    $('adImageUrl').value = ad?.imageUrl || '';
+    $('adTitle').value = ad?.title || '';
+    $('adMessage').value = ad?.message || '';
+    $('adLinkUrl').value = ad?.linkUrl || '';
+    $('adStartDate').value = ad?.startDate || '';
+    $('adEndDate').value = ad?.endDate || '';
+    renderAdPreview();
+  } catch (e) { /* 忽略，下次进入页签重试 */ }
+}
+
+async function saveAd() {
+  const payload = {
+    enabled: $('adEnabled').checked,
+    imageUrl: $('adImageUrl').value.trim(),
+    title: $('adTitle').value.trim(),
+    message: $('adMessage').value.trim(),
+    linkUrl: $('adLinkUrl').value.trim(),
+    startDate: $('adStartDate').value,
+    endDate: $('adEndDate').value,
+  };
+  try {
+    const data = await api('/api/admin/ads', { method: 'POST', body: JSON.stringify(payload) });
+    const box = $('adResult');
+    box.textContent = '✅ 已保存' + (data.pushed > 0 ? `，已通知 ${data.pushed} 台在线手机端刷新` : '');
+    box.classList.remove('hidden');
+    setTimeout(() => box.classList.add('hidden'), 4000);
+  } catch (e) { alert(e.message); }
+}
+
 // ── 事件绑定 ──
 $('loginBtn').onclick = doLogin;
 $('loginPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
@@ -545,6 +842,15 @@ $('dBlockAddBtn').onclick = () => addBlocked('desktop');
 $('dBlockInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addBlocked('desktop'); });
 $('aBlockAddBtn').onclick = () => addBlocked('android');
 $('aBlockInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addBlocked('android'); });
+$('ntSendBtn').onclick = sendNotice;
+$('ntTitle').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendNotice(); });
+// 广告位：输入即刷新预览；保存后重绘
+$('adSaveBtn').onclick = saveAd;
+['adEnabled', 'adImageUrl', 'adTitle', 'adMessage', 'adLinkUrl', 'adStartDate', 'adEndDate'].forEach((id) => {
+  const el = $(id);
+  el.addEventListener('input', renderAdPreview);
+  el.addEventListener('change', renderAdPreview);
+});
 $('usbFileInput').addEventListener('change', (e) => {
   const f = e.target.files[0];
   if (!f) return;
@@ -563,6 +869,7 @@ setInterval(() => {
     refreshStats();
     loadHosts();
     loadUpgrade();
+    loadNoticeTargets();
   }
 }, 10000);
 
@@ -575,8 +882,10 @@ setInterval(() => {
       $('mainView').classList.remove('hidden');
       refreshStats();
       loadHosts();
-      loadUsbIds();
       loadUpgrade();
+      loadUsbIds();
+      loadNoticeTargets();
+      loadAdConfig();
       return;
     } catch (e) { logout(); }
   }

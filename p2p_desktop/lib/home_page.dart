@@ -442,29 +442,84 @@ class _DirPanel extends StatelessWidget {
 }
 
 /// 传输记录面板
-class _TransfersPanel extends StatelessWidget {
+class _TransfersPanel extends StatefulWidget {
   final HostController controller;
 
   const _TransfersPanel({required this.controller});
 
   @override
+  State<_TransfersPanel> createState() => _TransfersPanelState();
+}
+
+class _TransfersPanelState extends State<_TransfersPanel> {
+  /// v6.28+ 多选删除：是否处于选择模式
+  bool _selecting = false;
+  /// 已勾选的记录 id 集合
+  final Set<String> _selected = {};
+
+  @override
   Widget build(BuildContext context) {
-    final items = controller.transfers.reversed.toList();
+    final items = widget.controller.transfers.reversed.toList();
+    // 列表被删空时退出选择模式，避免残留选择栏
+    if (items.isEmpty && _selecting) {
+      _selecting = false;
+      _selected.clear();
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Padding(
-          padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 8, 4),
           child: Row(
             children: [
-              Icon(Icons.swap_vert, size: 18, color: Colors.blue),
-              SizedBox(width: 8),
-              Text('传输记录',
+              const Icon(Icons.swap_vert, size: 18, color: Colors.blue),
+              const SizedBox(width: 8),
+              const Text('传输记录',
                   style: TextStyle(
                       fontSize: 13, fontWeight: FontWeight.w600)),
+              const Spacer(),
+              // v6.28+ 清空入口：一键清除全部传输记录（确认后落盘）
+              IconButton(
+                tooltip: '清空传输记录',
+                icon: const Icon(Icons.delete_sweep, size: 18),
+                color: Colors.grey,
+                onPressed:
+                    items.isEmpty ? null : () => _confirmClear(context),
+              ),
             ],
           ),
         ),
+        // v6.28+ 选择模式操作栏：已选 n 项 + 全选/删除/取消
+        if (_selecting)
+          Material(
+            color: Colors.blue.withValues(alpha: 0.08),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text('已选 ${_selected.length} 项',
+                        style: const TextStyle(fontSize: 13)),
+                  ),
+                  TextButton(
+                    onPressed: _selectAll,
+                    child: const Text('全选'),
+                  ),
+                  TextButton(
+                    onPressed: _selected.isEmpty
+                        ? null
+                        : () => _confirmBatchDelete(context),
+                    child: const Text('删除',
+                        style: TextStyle(color: Colors.redAccent)),
+                  ),
+                  TextButton(
+                    onPressed: _exitSelect,
+                    child: const Text('取消'),
+                  ),
+                ],
+              ),
+            ),
+          ),
         const Divider(height: 1),
         Expanded(
           child: items.isEmpty
@@ -481,12 +536,112 @@ class _TransfersPanel extends StatelessWidget {
                 )
               : ListView.builder(
                   itemCount: items.length,
-                  itemBuilder: (context, i) =>
-                      _TransferTile(item: items[i], controller: controller),
+                  itemBuilder: (context, i) {
+                    final item = items[i];
+                    final selected = _selected.contains(item.id);
+                    return GestureDetector(
+                      // v6.28+ 选择模式点选切换；非选择模式长按进入选择并勾选该条
+                      onTap: _selecting ? () => _toggleSelect(item.id) : null,
+                      onLongPress:
+                          _selecting ? null : () => _enterSelect(item.id),
+                      child: _TransferTile(
+                        item: item,
+                        controller: widget.controller,
+                        selecting: _selecting,
+                        selected: selected,
+                      ),
+                    );
+                  },
                 ),
         ),
       ],
     );
+  }
+
+  /// 非选择模式长按：进入选择模式并勾选该条
+  void _enterSelect(String id) {
+    setState(() {
+      _selecting = true;
+      _selected.add(id);
+    });
+  }
+
+  /// 选择模式点选：切换勾选状态
+  void _toggleSelect(String id) {
+    setState(() {
+      if (!_selected.remove(id)) _selected.add(id);
+    });
+  }
+
+  /// 全选/取消全选（按当前列表全部记录）
+  void _selectAll() {
+    setState(() {
+      final all = widget.controller.transfers.map((t) => t.id).toSet();
+      if (_selected.length == all.length && _selected.containsAll(all)) {
+        _selected.clear(); // 已全选：再次点击取消全选
+      } else {
+        _selected
+          ..clear()
+          ..addAll(all);
+      }
+    });
+  }
+
+  void _exitSelect() {
+    setState(() {
+      _selecting = false;
+      _selected.clear();
+    });
+  }
+
+  /// 一键清空确认弹窗：确认后清除全部记录（含持久化）
+  Future<void> _confirmClear(BuildContext context) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('清空传输记录'),
+        content: const Text('确定清除全部传输记录吗？此操作不可恢复。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) widget.controller.clearTransfers();
+  }
+
+  /// 批量删除确认弹窗：确认后逐条删除（含持久化）并退出选择模式
+  Future<void> _confirmBatchDelete(BuildContext context) async {
+    final n = _selected.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除传输记录'),
+        content: Text('确定删除选中的 $n 条传输记录吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      for (final id in _selected.toList()) {
+        widget.controller.removeTransfer(id);
+      }
+      _exitSelect();
+    }
   }
 }
 
@@ -518,8 +673,15 @@ class _ConnBadge extends StatelessWidget {
 class _TransferTile extends StatelessWidget {
   final TransferItem item;
   final HostController controller;
+  final bool selecting; // v6.28+ 选择模式：leading 显示勾选圈
+  final bool selected; // v6.28+ 当前记录是否已勾选
 
-  const _TransferTile({required this.item, required this.controller});
+  const _TransferTile({
+    required this.item,
+    required this.controller,
+    this.selecting = false,
+    this.selected = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -540,14 +702,21 @@ class _TransferTile extends StatelessWidget {
             '${item.speed.isNotEmpty ? '  ${item.speed}' : ''}';
 
     return ListTile(
-      leading: Icon(
-        icon,
-        color: error
-            ? Colors.redAccent
-            : done
-                ? Colors.green
-                : Colors.blue,
-      ),
+      // v6.28+ 选择模式下勾选的行浅色高亮
+      tileColor: selected ? Colors.blue.withValues(alpha: 0.08) : null,
+      leading: selecting
+          ? Icon(
+              selected ? Icons.check_circle : Icons.radio_button_unchecked,
+              color: selected ? Colors.blue : Colors.grey,
+            )
+          : Icon(
+              icon,
+              color: error
+                  ? Colors.redAccent
+                  : done
+                      ? Colors.green
+                      : Colors.blue,
+            ),
       title: Text(item.fileName,
           maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: Column(

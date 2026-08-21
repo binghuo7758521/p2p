@@ -10,6 +10,7 @@ import 'package:flutter/foundation.dart';
 import 'app_log.dart';
 import 'auto_login.dart';
 import 'host_service.dart';
+import 'known_folder.dart';
 import 'models.dart';
 import 'protocol.dart';
 import 'update_service.dart';
@@ -188,6 +189,7 @@ class _RecvState {
 /// 电脑端控制器：编排信令、WebRTC、共享目录与文件传输（多用户）
 class HostController extends ChangeNotifier {
   final HostService _service = HostService();
+  bool _kfPathLogged = false; // 特殊文件夹路径解析日志只打一次（v6.30+）
 
   /// 接收超时检测：手机端异常（发送中断但通道未断）时，长时间无数据块则判定失败
   static const Duration _recvTimeout = Duration(minutes: 5);
@@ -724,6 +726,20 @@ class HostController extends ChangeNotifier {
     } catch (e) {
       AppLog.w('transfer', '加载传输记录失败', e);
     }
+  }
+
+  /// 删除单条传输记录（v6.28+ 手动删除，含持久化）
+  void removeTransfer(String id) {
+    transfers.removeWhere((x) => x.id == id);
+    notifyListeners();
+    unawaited(_saveTransfers());
+  }
+
+  /// 清除全部传输记录（v6.28+ 一键清空，含持久化）
+  void clearTransfers() {
+    transfers.clear();
+    notifyListeners();
+    unawaited(_saveTransfers());
   }
 
   HostUser? _userByClientId(String clientId) {
@@ -1328,13 +1344,21 @@ class HostController extends ChangeNotifier {
   List<FileEntry> _myComputerEntries() {
     final list = <FileEntry>[];
     final profile = Platform.environment['USERPROFILE'] ?? '';
+    // v6.30+：优先 Known Folder 真实路径（识别 OneDrive/文件夹重定向），
+    // 解析失败回退 USERPROFILE 硬拼，保证无重定向环境行为不变
+    final real = resolveKnownFolders();
+    if (real.isNotEmpty && !_kfPathLogged) {
+      _kfPathLogged = true;
+      AppLog.i('host', '特殊文件夹路径解析: '
+          '${real.entries.map((e) => '${e.key}=${e.value}').join(' | ')}');
+    }
     final specials = <String, String>{
-      '桌面': '$profile\\Desktop',
-      '文档': '$profile\\Documents',
-      '下载': '$profile\\Downloads',
-      '图片': '$profile\\Pictures',
-      '视频': '$profile\\Videos',
-      '音乐': '$profile\\Music',
+      '桌面': real['desktop'] ?? '$profile\\Desktop',
+      '文档': real['documents'] ?? '$profile\\Documents',
+      '下载': real['downloads'] ?? '$profile\\Downloads',
+      '图片': real['pictures'] ?? '$profile\\Pictures',
+      '视频': real['videos'] ?? '$profile\\Videos',
+      '音乐': real['music'] ?? '$profile\\Music',
     };
     for (final e in specials.entries) {
       try {
@@ -1381,8 +1405,14 @@ class HostController extends ChangeNotifier {
               type: 'directory',
               path: _childPath(localPath, e.path.split(Platform.pathSeparator).last)));
         } else if (e is File) {
-          final s = await e.length();
           final name = e.path.split(Platform.pathSeparator).last;
+          int s;
+          try {
+            // stat 不打开文件句柄，系统独占锁定的文件（hiberfil.sys 等）也能读大小
+            s = (await e.stat()).size;
+          } catch (_) {
+            continue; // 仍失败的锁定文件跳过，不拖垮整个目录浏览
+          }
           list.add(FileEntry(
               name: name,
               type: 'file',
@@ -2004,10 +2034,17 @@ class HostController extends ChangeNotifier {
                     path: _childPath(pathStr, name))
                 .toJson());
           } else if (e is File) {
+            int size;
+            try {
+              // stat 不打开文件句柄，系统独占锁定的文件（hiberfil.sys 等）也能读大小
+              size = (await e.stat()).size;
+            } catch (_) {
+              continue; // 仍失败的锁定文件跳过，不拖垮整个目录浏览
+            }
             list.add(FileEntry(
                     name: name,
                     type: 'file',
-                    size: await e.length(),
+                    size: size,
                     path: _childPath(pathStr, name))
                 .toJson());
           }
@@ -2084,10 +2121,17 @@ class HostController extends ChangeNotifier {
                   path: _childPath(pathStr, name))
               .toJson());
         } else if (e is File) {
+          int size;
+          try {
+            // stat 不打开文件句柄，系统独占锁定的文件（hiberfil.sys 等）也能读大小
+            size = (await e.stat()).size;
+          } catch (_) {
+            continue; // 仍失败的锁定文件跳过，不拖垮整个目录浏览
+          }
           list.add(FileEntry(
                   name: name,
                   type: 'file',
-                  size: await e.length(),
+                  size: size,
                   path: _childPath(pathStr, name))
               .toJson());
         }

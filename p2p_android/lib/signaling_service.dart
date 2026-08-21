@@ -31,6 +31,12 @@ class SignalingService {
   /// 电脑端升级结果（v5.42+）：确认回执 / 升级失败转发
   void Function(Map<String, dynamic> result)? onDesktopUpgradeResult;
 
+  /// 后台横幅通知（v5.45+）：服务器管理后台通过 /api/admin/notify 推送
+  void Function(Map<String, dynamic> info)? onAdminNotice;
+
+  /// 广告位更新（v5.46+）：后台修改广告配置后广播，收到后重新拉取 /api/ads
+  void Function()? onAdsUpdate;
+
   /// 连接服务器失败
   void Function(String message)? onConnectError;
 
@@ -59,6 +65,9 @@ class SignalingService {
       io.OptionBuilder()
           .setTransports(['websocket'])
           .disableAutoConnect()
+          // v5.43+：禁用 Socket.IO 层自动重连，由 AppController 的
+          // _reconnectLoop 统一管理（避免双重重连叠加导致重试计数重置/日志刷屏）
+          .disableReconnection()
           .build(),
     );
 
@@ -151,6 +160,20 @@ class SignalingService {
       if (data is Map) {
         onDesktopUpgradeResult?.call(Map<String, dynamic>.from(data));
       }
+    });
+
+    // 后台横幅通知（v5.45+）：管理后台推送，无需任何连接状态即可展示
+    _socket!.on('admin:notice', (data) {
+      AppLog.i('signal', '收到后台横幅通知');
+      if (data is Map) {
+        onAdminNotice?.call(Map<String, dynamic>.from(data));
+      }
+    });
+
+    // 广告位更新（v5.46+）：后台保存广告后广播，收到后重新拉取 /api/ads
+    _socket!.on('ads:update', (_) {
+      AppLog.i('signal', '收到广告位更新广播');
+      onAdsUpdate?.call();
     });
 
     _socket!.onConnectError((data) {

@@ -7,6 +7,11 @@
     <uses-permission android:name="android.permission.CAMERA"/>
     <!-- 安装升级包：Android 8+ 拉起系统安装器必需（v5.2 修复升级无法安装） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- v5.43+ 后台保活前台服务：保持 P2P 连接/自动重连不中断 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <application
         android:label="无限大盘"
         android:name="${applicationName}"
@@ -49,6 +54,25 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- v5.43+ 后台保活前台服务（dataSync：保持网络连接/自动重连） -->
+        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false">
+            <meta-data
+                android:name="p2p_notification_icon"
+                android:resource="@mipmap/ic_launcher" />
+        </service>
+        <receiver
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundServiceBroadcastReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.pravera.flutter_foreground_task.service.ACTION_START"/>
+                <action android:name="com.pravera.flutter_foreground_task.service.ACTION_STOP"/>
+                <action android:name="com.pravera.flutter_foreground_task.service.ACTION_PAUSE"/>
+                <action android:name="com.pravera.flutter_foreground_task.service.ACTION_RESUME"/>
+            </intent-filter>
+        </receiver>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

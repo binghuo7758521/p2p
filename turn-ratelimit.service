@@ -1,0 +1,12 @@
+[Unit]
+Description=TURN relay bandwidth limit (HTB shared pool 2MB/s, 降速共享并发不限)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/p2p-app/turn_ratelimit.sh apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

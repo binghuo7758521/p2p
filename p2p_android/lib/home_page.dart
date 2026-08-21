@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_file_dialog/flutter_file_dialog.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'about_page.dart';
 import 'app_controller.dart';
@@ -939,31 +940,42 @@ class _HomePageState extends State<HomePage> {
           _showDownloadDone(controller);
           _maybeShowAdminClaimDialog(controller);
           _maybeShowPasswordDialog(controller);
+          Widget body;
           if (controller.state == ConnectState.lost) {
-            return _LostView(controller: controller);
-          }
-          if (controller.state != ConnectState.peerConnected) {
+            body = _LostView(controller: controller);
+          } else if (controller.state != ConnectState.peerConnected) {
             // 未连接（idle/connecting/paired/error）：显示连接引导视图，
             // 不阻塞主页面使用（无电脑端权限的客户端也可浏览分享的共享文件夹）
-            return _NotConnectedView(controller: controller);
+            body = _NotConnectedView(controller: controller);
+          } else {
+            body = Column(
+              children: [
+                // v5.42+：电脑端升级横幅（管理员手机端收到服务器推送后显示，
+                // 可远程确认电脑端静默升级；三态：提示中/已通知/失败）
+                if (controller.desktopUpgrade != null)
+                  _DesktopUpgradeBanner(controller: controller),
+                Expanded(
+                  child: IndexedStack(
+                    // 共享访客模式隐藏「上传」页签（_tab==1）：显示浏览页
+                    index: controller.isShareGuest && _tab == 1 ? 0 : _tab,
+                    children: [
+                      _BrowseTab(controller: controller),
+                      _UploadTab(controller: controller),
+                      _TransfersTab(controller: controller),
+                    ],
+                  ),
+                ),
+              ],
+            );
           }
+          // v5.45+：后台横幅通知置顶于所有状态视图之上（连接引导/丢失重连/已连接）
           return Column(
             children: [
-              // v5.42+：电脑端升级横幅（管理员手机端收到服务器推送后显示，
-              // 可远程确认电脑端静默升级；三态：提示中/已通知/失败）
-              if (controller.desktopUpgrade != null)
-                _DesktopUpgradeBanner(controller: controller),
-              Expanded(
-                child: IndexedStack(
-                  // 共享访客模式隐藏「上传」页签（_tab==1）：显示浏览页
-                  index: controller.isShareGuest && _tab == 1 ? 0 : _tab,
-                  children: [
-                    _BrowseTab(controller: controller),
-                    _UploadTab(controller: controller),
-                    _TransfersTab(controller: controller),
-                  ],
-                ),
-              ),
+              if (controller.currentAdminNotice != null)
+                _AdminNoticeBanner(controller: controller),
+              // v5.46+：广告位（内容区顶部，所有状态/页签均可见；后台可配置）
+              if (controller.showAd) _AdBanner(controller: controller),
+              Expanded(child: body),
             ],
           );
         },
@@ -1046,6 +1058,166 @@ class _ConnBadge extends StatelessWidget {
           fontSize: 10,
           color: color,
         ),
+      ),
+    );
+  }
+}
+
+/// 后台横幅通知（v5.45+）：服务器管理后台推送，任何连接状态下均显示；
+/// 多条通知依次展示，关闭一条后自动显示下一条（内存队列最多 5 条）
+class _AdminNoticeBanner extends StatelessWidget {
+  final AppController controller;
+
+  const _AdminNoticeBanner({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final n = controller.currentAdminNotice;
+    if (n == null) return const SizedBox.shrink();
+    final color = Colors.blue;
+    return Material(
+      color: color.withValues(alpha: 0.10),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 4, 8),
+        child: Row(
+          children: [
+            const Icon(Icons.campaign_outlined, color: Colors.blue, size: 20),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(n.title,
+                      style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.blue)),
+                  if (n.message.isNotEmpty)
+                    Text(n.message,
+                        style: TextStyle(
+                            fontSize: 11,
+                            color: Colors.grey.shade700)),
+                ],
+              ),
+            ),
+            IconButton(
+              tooltip: '关闭通知',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.close, size: 18, color: Colors.blueGrey),
+              onPressed: () => controller.dismissAdminNotice(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 广告位（v5.46+）：管理后台配置（图片/文字/链接），内容区顶部展示；
+/// 有图片显示图片卡，无图片显示文字卡；有链接点击打开；右上角可关闭（本次运行内）
+class _AdBanner extends StatelessWidget {
+  final AppController controller;
+
+  const _AdBanner({required this.controller});
+
+  Future<void> _openLink(BuildContext context, String url) async {
+    final uri = Uri.parse(url);
+    try {
+      if (await launchUrl(uri, mode: LaunchMode.externalApplication)) return;
+    } catch (e) {
+      AppLog.w('ads', '打开广告链接失败: $url', e);
+    }
+    if (context.mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('无法打开链接: $url')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ad = controller.ad;
+    if (ad == null) return const SizedBox.shrink();
+    final orange = const Color(0xFFF59E0B);
+    final textCard = Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Row(
+        children: [
+          const Icon(Icons.campaign_outlined, size: 20, color: Colors.orange),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(ad.title,
+                          style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.orange),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis),
+                    ),
+                    if (ad.hasLink)
+                      const Icon(Icons.open_in_new,
+                          size: 13, color: Colors.blueGrey),
+                  ],
+                ),
+                if (ad.message.isNotEmpty)
+                  Text(ad.message,
+                      style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.grey.shade700,
+                          height: 1.3),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+    return Material(
+      color: orange.withValues(alpha: 0.08),
+      child: Stack(
+        children: [
+          InkWell(
+            onTap: ad.hasLink ? () => _openLink(context, ad.linkUrl) : null,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (ad.hasImage)
+                  SizedBox(
+                    height: 90,
+                    child: Image.network(
+                      ad.imageUrl,
+                      fit: BoxFit.cover,
+                      // 加载中显示灰色占位，加载失败降级为文字卡
+                      loadingBuilder: (c, child, progress) =>
+                          progress == null
+                              ? child
+                              : Container(color: Colors.grey.shade200),
+                      errorBuilder: (c, e, s) => textCard,
+                    ),
+                  ),
+                if (!ad.hasImage) textCard,
+              ],
+            ),
+          ),
+          Positioned(
+            top: 2,
+            right: 2,
+            child: IconButton(
+              tooltip: '关闭广告',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.close, size: 18, color: Colors.blueGrey),
+              onPressed: () => controller.dismissAd(),
+            ),
+          ),
+        ],
       ),
     );
   }

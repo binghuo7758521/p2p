@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'activate_page.dart';
 import 'app_controller.dart';
@@ -13,6 +14,26 @@ import 'version.dart';
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   AppLog.init();
+  // v5.43+：后台保活前台服务初始化。连接电脑后启动服务，
+  // App 退后台/息屏时进程与定时器不被冻结，自动重连可持续执行
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'p2p_keep_alive',
+      channelName: 'P2P 连接保活',
+      channelDescription: '保持与电脑端的连接，电脑端上线时自动重连',
+      channelImportance: NotificationChannelImportance.LOW,
+      priority: NotificationPriority.LOW,
+      onlyAlertOnce: true,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(
+      showNotification: false,
+    ),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.nothing(),
+      allowWakeLock: true,
+      allowWifiLock: true,
+    ),
+  );
   AppLog.i('app', '手机端启动 v$appVersion');
   runApp(const P2pApp());
 }

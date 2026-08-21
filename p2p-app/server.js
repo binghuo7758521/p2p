@@ -56,9 +56,9 @@ const PORT = process.env.PORT || 3000;
 // 规则: 手机端 / 电脑端 / 服务器端 三端版本互相独立（vX.Y）
 // - 只要某端代码有修改，该端版本号 +0.1（v1.0 → v1.1 → v1.2 ...）
 // - 本文件同时记录三端最新版本，便于 /version 统一核对
-const SERVER_VERSION = '2.21';  // 服务器端版本
-const DESKTOP_VERSION = '6.27';  // 电脑端版本（与电脑端 version.dart 保持一致）
-const ANDROID_VERSION = '5.42'; // 手机端版本
+const SERVER_VERSION = '2.25';  // 服务器端版本
+const DESKTOP_VERSION = '6.31';  // 电脑端版本（与电脑端 version.dart 保持一致）
+const ANDROID_VERSION = '5.47'; // 手机端版本
 // 手机端最低可用版本（v2.7+ 强制升级）：低于此版本的手机端一律拒绝
 // 激活与连接（update-check 返回 force；激活/信令返回 APP_VERSION_REQUIRED），
 // 必须升级到最新版才能正常使用。v2.17+ 改由 upgrade-config.json 配置接管，
@@ -70,6 +70,13 @@ const MIN_ANDROID_VERSION = '5.6';
 // 参数写入 upgrade-config.json 持久化（服务重启不丢失）；下方常量仅作初始默认值
 const DESKTOP_URGENT_VERSION_INIT = '';
 const UPGRADE_CONFIG_FILE = join(__dirname, 'upgrade-config.json');
+
+// v2.24+ 广告位配置：{ enabled, imageUrl, title, message, linkUrl, startDate, endDate }——
+// 明文存储（无敏感数据），手机端通过 /api/ads 公开接口拉取；
+// v2.25+ startDate/endDate 为投放期（YYYY-MM-DD，空=不限，判定在手机端）
+const ADS_CONFIG_FILE = join(__dirname, 'ads.json');
+let adConfig = loadJson(ADS_CONFIG_FILE, null);
+if (!adConfig || typeof adConfig !== 'object') adConfig = {};
 
 // v2.17+ 升级/支持策略配置：
 // { desktopUrgentVersion: 电脑端重要升级线, desktopMinVersion: 电脑端最低支持版本,
@@ -935,6 +942,29 @@ app.get('/api/admin/hosts', requireAdmin, (req, res) => {
   res.json({ ok: true, hosts, onlineCount: online.length });
 });
 
+// ── 在线手机端列表（v2.23+）：横幅通知选择发送目标用 ──────
+// 遍历所有会话的 clients，过滤已断开的死 socket，标注管理员身份
+app.get('/api/admin/clients', requireAdmin, (req, res) => {
+  const clients = [];
+  for (const [pairCode, session] of sessions) {
+    if (!session?.clients) continue;
+    for (const [cid, info] of session.clients) {
+      if (!io.sockets.sockets.has(cid)) continue;
+      const rec = info?.deviceId ? actDevices[info.deviceId] : null;
+      clients.push({
+        deviceId: info?.deviceId || null,
+        name: info?.name || '手机',
+        version: info?.version || null,
+        pairCode,
+        // 管理员身份判定与升级推送一致：actDevices 记录 + 配对码双重校验
+        isAdmin: !!(rec && rec.type === 'admin' && rec.pairCode === pairCode),
+      });
+    }
+  }
+  log(`[管理] 在线手机端列表: ${clients.length} 台`);
+  res.json({ ok: true, clients, onlineCount: clients.length });
+});
+
 // ── U盘授权 API（加密狗白名单） ────────────────────────────
 // 电脑端启动验证：任意一个U盘ID在白名单中即授权通过
 app.post('/api/usb/verify', (req, res) => {
@@ -1108,6 +1138,108 @@ app.post('/api/admin/upgrade', requireAdmin, (req, res) => {
   for (const pairCode of sessions.keys()) adminPushed += notifyAdminUpgrade(pairCode);
   if (adminPushed > 0) log(`[管理] 已向 ${adminPushed} 个管理员手机端推送电脑端升级提示`);
   res.json({ ok: true, changed: true, pushed });
+});
+
+// 后台向手机端推送横幅通知（v2.23+）：仅推送给当前在线手机端，
+// 无持久化/离线补发（架构无 FCM 通道），离线手机上线后收不到
+app.post('/api/admin/notify', requireAdmin, (req, res) => {
+  const { scope, title, message, pairCode, deviceId } = req.body || {};
+  const s = String(scope || 'all').trim();
+  const t = String(title || '').trim();
+  const m = String(message || '').trim();
+  if (!t) return res.json({ ok: false, error: '请输入通知标题' });
+  if (t.length > 50) return res.json({ ok: false, error: '标题不能超过 50 字' });
+  if (!m) return res.json({ ok: false, error: '请输入通知内容' });
+  if (m.length > 500) return res.json({ ok: false, error: '内容不能超过 500 字' });
+  if (!['all', 'pairCode', 'deviceId'].includes(s)) {
+    return res.json({ ok: false, error: '发送范围无效' });
+  }
+  if (s === 'pairCode' && !String(pairCode || '').trim()) {
+    return res.json({ ok: false, error: '请选择目标电脑' });
+  }
+  if (s === 'deviceId' && !String(deviceId || '').trim()) {
+    return res.json({ ok: false, error: '请选择目标设备' });
+  }
+  const notice = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    title: t,
+    message: m,
+    ts: Date.now()
+  };
+  let pushed = 0;
+  for (const c of io.sockets.sockets.values()) {
+    if (c.role !== 'client' || !c.connected) continue;
+    if (s === 'pairCode' && c.pairCode !== String(pairCode).trim()) continue;
+    if (s === 'deviceId' && c.deviceId !== String(deviceId).trim()) continue;
+    c.emit('admin:notice', notice);
+    pushed++;
+  }
+  const scopeTxt = s === 'all'
+      ? '全部手机端'
+      : (s === 'pairCode' ? `配对码 ${String(pairCode).trim()}` : `设备 ${String(deviceId).trim()}`);
+  log(`[通知] 后台推送横幅: "${t}" → ${scopeTxt} 送达 ${pushed} 台`);
+  res.json({ ok: true, pushed });
+});
+
+// 手机端广告位（v2.24+）：公开接口（无需登录），禁用或未配置时返回 null
+app.get('/api/ads', (req, res) => {
+  res.json({ ok: true, ad: adConfig && adConfig.enabled ? adConfig : null });
+});
+
+// 管理后台设置广告（v2.24+）：保存后立即广播 ads:update 给在线手机端，
+// 手机端收到后重新拉取 /api/ads，配置变更秒级生效
+app.post('/api/admin/ads', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const enabled = !!body.enabled;
+  const title = String(body.title || '').trim();
+  const message = String(body.message || '').trim();
+  const imageUrl = String(body.imageUrl || '').trim();
+  const linkUrl = String(body.linkUrl || '').trim();
+  const startDate = String(body.startDate || '').trim();
+  const endDate = String(body.endDate || '').trim();
+  const urlErr = (name, v) => {
+    if (v && !/^https?:\/\/.+/.test(v)) return `${name} 必须以 http(s):// 开头`;
+    return null;
+  };
+  // v2.25+：投放期日期校验（YYYY-MM-DD；空=不限；必须真实存在的日期）
+  const dateErr = (name, v) => {
+    if (!v) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return `${name} 格式应为 YYYY-MM-DD`;
+    const [y, m, d] = v.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) {
+      return `${name} 不是有效日期`;
+    }
+    return null;
+  };
+  if (enabled && !title) return res.json({ ok: false, error: '请输入广告标题' });
+  if (title.length > 50) return res.json({ ok: false, error: '标题不能超过 50 字' });
+  if (message.length > 200) return res.json({ ok: false, error: '描述不能超过 200 字' });
+  const err = urlErr('图片地址', imageUrl) || urlErr('链接地址', linkUrl)
+      || dateErr('开始日期', startDate) || dateErr('结束日期', endDate);
+  if (err) return res.json({ ok: false, error: err });
+  if (startDate && endDate && startDate > endDate) {
+    return res.json({ ok: false, error: '结束日期不能早于开始日期' });
+  }
+  adConfig = enabled
+      ? { enabled: true, imageUrl, title, message, linkUrl, startDate, endDate }
+      : { enabled: false };
+  saveJson(ADS_CONFIG_FILE, adConfig);
+  log(`[广告] 后台更新广告位: 启用=${enabled}`
+      + (title ? ` 标题="${title}"` : '')
+      + (imageUrl ? ` 图片=${imageUrl}` : '')
+      + (linkUrl ? ` 链接=${linkUrl}` : '')
+      + (startDate || endDate ? ` 投放期=${startDate || '不限'}~${endDate || '不限'}` : ''));
+  // 广播给在线手机端：收到后重新拉取最新广告
+  let pushed = 0;
+  for (const c of io.sockets.sockets.values()) {
+    if (c.role === 'client' && c.connected) {
+      c.emit('ads:update', { ts: Date.now() });
+      pushed++;
+    }
+  }
+  if (pushed > 0) log(`[广告] 已通知 ${pushed} 台在线手机端刷新广告`);
+  res.json({ ok: true, pushed });
 });
 
 // ── 静态文件 ─────────────────────────────────────────────────
@@ -1419,6 +1551,14 @@ io.on('connection', (socket) => {
         // 登记等待中的手机端（即使电脑端离线），电脑端注册时据此补发 joined
         session = session || { hostSocketId: null, clients: new Map(), createdAt: Date.now() };
         if (!session.clients) session.clients = new Map();
+        // v6.31+ 修复：等待者必须绑定身份（正常 join 分支 L1454-1458 已绑定），
+        // 否则电脑端注册补发 joined 后手机端回的 answer/candidate 在信令转发处
+        // sessions.get(socket.pairCode) 查不到会话被静默丢弃，电脑端永远等不到
+        // answer，手机端卡"正在连接电脑"只能重启 App 恢复（2026-08-21 实测）
+        socket.pairCode = pairCode;
+        socket.role = 'client';
+        socket.deviceId = deviceId || null;
+        socket.hostSocketId = null;
         session.clients.set(socket.id, {
           name: deviceName || '手机',
           deviceId: deviceId || null,

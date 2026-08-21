@@ -77,6 +77,12 @@ class PeerSession {
   /// 周期探测定时器：连接期间每 15s 复查一次连接方式，
   /// 避免首次探测失败/网络切换后一直停留在“探测中…”
   Timer? connProbeTimer;
+  /// offer 发出后 answer 等待超时（v6.31+）：服务器/网络异常导致 answer
+  /// 丢失时自动关闭并重建 PeerConnection 重试，避免协商永久悬挂
+  /// （手机端一直“正在连接电脑”只能重启 App 恢复）
+  Timer? answerTimer;
+  /// answer 重试次数（跨会话延续，最多重试 2 次后放弃）
+  int answerRetries = 0;
   /// 手机端请求中止发送（典型：接收写盘失败/存储空间不足）：
   /// 发送循环检查该标志后立即中止，避免电脑端发完报"完成"
   bool abortRequested = false;
@@ -166,6 +172,11 @@ class PeerSession {
   void cancelGraceTimer() {
     disconnectGraceTimer?.cancel();
     disconnectGraceTimer = null;
+  }
+
+  void cancelAnswerTimer() {
+    answerTimer?.cancel();
+    answerTimer = null;
   }
 
   void cancelConnProbe() {
@@ -548,6 +559,30 @@ class HostService {
     await session.pc!.setLocalDescription(offer);
     AppLog.i('host', '已创建并发送 offer [$clientId]');
     _sendSignal(clientId, {'type': 'offer', 'sdp': offer.sdp});
+    // v6.31+：offer 发出后 45 秒未收到 answer → 关闭并重建 PeerConnection
+    // 重试（最多 2 次）。服务器补发场景曾因等待者身份未绑定导致 answer 被
+    // 丢弃（v6.31 服务器已修复），此兜底保证任何异常下不永久悬挂
+    session.answerTimer?.cancel();
+    final s = session; // 闭包捕获非空引用（timer 触发时可能已 _closeSession，用 pc==null 保护）
+    session.answerTimer = Timer(const Duration(seconds: 45), () async {
+      s.answerTimer = null;
+      if (_disposed || s.pc == null) return;
+      final retries = s.answerRetries;
+      if (retries >= 2) {
+        AppLog.e('host', 'offer 发出后连续 3 次未收到 answer，放弃连接 [$clientId]');
+        s.answerRetries = 0;
+        onPeerDisconnected?.call(clientId, s.deviceId);
+        return;
+      }
+      AppLog.w('host', '45 秒未收到 answer（第 ${retries + 1} 次重试），重建 PeerConnection [$clientId]');
+      final deviceId = s.deviceId;
+      final clientName = s.clientName;
+      final shareToken = s.shareToken;
+      await _closeSession(clientId);
+      await createPeerConnectionAndOffer(clientId,
+          deviceId: deviceId, clientName: clientName, shareToken: shareToken);
+      _sessions[clientId]?.answerRetries = retries + 1;
+    });
   }
 
   void _setupChannel(PeerSession session) {
@@ -597,6 +632,10 @@ class HostService {
         }
         break;
       case 'answer':
+        // v6.31+：收到 answer 表示协商完成，取消超时重试
+        session.answerTimer?.cancel();
+        session.answerTimer = null;
+        session.answerRetries = 0;
         final sdp = signal['sdp'] as String?;
         if (sdp != null) {
           await pc.setRemoteDescription(RTCSessionDescription(sdp, 'answer'));
@@ -814,6 +853,7 @@ class HostService {
     if (session == null) return;
     session.cancelGraceTimer();
     session.cancelConnProbe();
+    session.cancelAnswerTimer();
     try {
       await session.channel?.close();
     } catch (_) {}

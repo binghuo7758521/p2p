@@ -12,6 +12,8 @@ import 'version.dart';
 /// 日志写入应用专属外部目录（文件管理器可直接访问）：
 ///   /storage/emulated/0/Android/data/<包名>/files/logs/app.log
 /// 超过 2MB 自动轮转（旧档保留为 app.log.1）。
+/// v5.44+：轮转不再仅限启动时，运行中写入累计超 2MB 也会轮转
+/// （避免长时间运行的 App 日志无限增长占满存储）
 ///
 /// 用法：
 ///   AppLog.i('upload', '开始上传: xxx.mp4 28.3MB');
@@ -24,6 +26,8 @@ class AppLog {
   File? _file;
   final List<Future<void> Function()> _pending = [];
   bool _draining = false;
+  /// 本会话累计写入字节（上次轮转后），超过 [_maxBytes] 触发运行中轮转
+  int _writtenBytes = 0;
 
   static const int _maxBytes = 2 * 1024 * 1024;
 
@@ -37,14 +41,7 @@ class AppLog {
       _instance._file = File('${dir.path}/app.log');
       if (await _instance._file!.exists() &&
           await _instance._file!.length() > _maxBytes) {
-        final old = File('${_instance._file!.path}.1');
-        try {
-          if (await old.exists()) await old.delete();
-        } catch (_) {}
-        try {
-          await _instance._file!.rename(old.path);
-        } catch (_) {}
-        _instance._file = File('${dir.path}/app.log');
+        await _instance._rotate();
       }
       i('log', '=== 日志系统启动: $_instance._file!.path ===');
       // 记录运行环境，便于定位版本差异问题
@@ -104,9 +101,34 @@ class AppLog {
         } finally {
           await raf.close();
         }
+        // v5.44+：运行中累计写入超限时轮转，防止日志无限增长
+        _writtenBytes += line.length + 1;
+        if (_writtenBytes > _maxBytes) {
+          _writtenBytes = 0;
+          await _rotate();
+        }
       } catch (_) {}
     });
     _drain();
+  }
+
+  /// 轮转日志：app.log → app.log.1（删除旧 .1），新建空 app.log
+  /// 启动时超限与运行中超限共用（v5.44+）
+  Future<void> _rotate() async {
+    final f = _file;
+    if (f == null || !await f.exists()) return;
+    final old = File('${f.path}.1');
+    try {
+      if (await old.exists()) await old.delete();
+    } catch (_) {}
+    try {
+      await f.rename(old.path);
+    } catch (_) {}
+    _file = File(f.path);
+    try {
+      final raf = await _file!.open(mode: FileMode.append);
+      await raf.close();
+    } catch (_) {}
   }
 
   void _drain() {
